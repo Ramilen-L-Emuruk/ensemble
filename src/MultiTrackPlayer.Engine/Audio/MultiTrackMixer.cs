@@ -7,8 +7,11 @@ public class MultiTrackMixer : IWaveProvider
     private readonly List<AudioTrackState> _tracks = new();
     private readonly WaveFormat _format;
     private float _masterVolume = 1.0f;
+    private long _playedSamples;
 
     public WaveFormat WaveFormat => _format;
+    public long PlayedSamples => Interlocked.Read(ref _playedSamples);
+    public void SetPlayedSamples(long value) => Interlocked.Exchange(ref _playedSamples, value);
 
     public MultiTrackMixer()
     {
@@ -45,6 +48,10 @@ public class MultiTrackMixer : IWaveProvider
             mixed[i] = Math.Clamp(mixed[i], -1f, 1f);
 
         Buffer.BlockCopy(mixed, 0, buffer, offset, count);
+
+        // WASAPIが実際に再生したサンプル数をカウント（これがマスタークロック）
+        Interlocked.Add(ref _playedSamples, count / sizeof(float) / _format.Channels);
+
         return count;
     }
 }

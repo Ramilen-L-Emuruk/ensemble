@@ -1,4 +1,4 @@
-﻿using MultiTrackPlayer.Core.Enums;
+using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.Core.Interfaces;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Audio;
@@ -27,7 +27,6 @@ public unsafe class MediaEngine : IMediaEngine
     private MediaInfo? _currentMedia;
     private CorePlaybackState _state = CorePlaybackState.Stopped;
     private double _playbackSpeed = 1.0;
-    private long _masterSamples;
     private List<ChapterInfo> _chapters = new();
 
     public MediaInfo? CurrentMedia => _currentMedia;
@@ -39,7 +38,7 @@ public unsafe class MediaEngine : IMediaEngine
         get
         {
             if (_wasapiOut == null) return TimeSpan.Zero;
-            return TimeSpan.FromSeconds(_masterSamples / (double)AudioDecoder.OutSampleRate / _playbackSpeed);
+            return TimeSpan.FromSeconds((_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate);
         }
     }
 
@@ -163,7 +162,6 @@ public unsafe class MediaEngine : IMediaEngine
         _cts?.Cancel();
         _state = CorePlaybackState.Stopped;
         _wasapiOut?.Stop();
-        _masterSamples = 0;
         foreach (var s in _audioStates) s.Buffer.ClearBuffer();
     }
 
@@ -177,7 +175,7 @@ public unsafe class MediaEngine : IMediaEngine
             _videoDecoder?.FlushBuffers();
             foreach (var d in _audioDecoders) d.FlushBuffers();
             foreach (var s in _audioStates) s.Buffer.ClearBuffer();
-            _masterSamples = (long)(position.TotalSeconds * AudioDecoder.OutSampleRate);
+            _mixer?.SetPlayedSamples((long)(position.TotalSeconds * AudioDecoder.OutSampleRate));
         }
     }
 
@@ -306,13 +304,11 @@ public unsafe class MediaEngine : IMediaEngine
                 var frame = _videoDecoder.DecodePacket(pkt.Packet);
                 if (frame != null)
                 {
-                    double masterClock = _masterSamples / (double)AudioDecoder.OutSampleRate;
+                    double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate;
                     double framePts = frame.Pts.TotalSeconds;
-                    double diff = framePts / _playbackSpeed - masterClock;
-                    if (diff > 0.04)
-                        Thread.Sleep((int)(diff * 1000));
-
-                    _masterSamples = (long)(framePts * AudioDecoder.OutSampleRate);
+                    double diff = framePts - masterClock;
+                    if (diff > 0.002)
+                        Thread.Sleep((int)(Math.Min(diff, 0.1) * 1000));
                     VideoFrameReady?.Invoke(this, frame);
                     PositionChanged?.Invoke(this, frame.Pts);
                 }
@@ -325,10 +321,7 @@ public unsafe class MediaEngine : IMediaEngine
                     {
                         var pcm = _audioDecoders[i].DecodePacket(pkt.Packet);
                         if (pcm != null)
-                        {
                             _audioStates[i].Buffer.AddSamples(pcm, 0, pcm.Length);
-                            _masterSamples += pcm.Length / (sizeof(float) * AudioDecoder.OutChannels);
-                        }
                         break;
                     }
                 }
