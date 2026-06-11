@@ -28,6 +28,8 @@ public unsafe class MediaEngine : IMediaEngine
     private CorePlaybackState _state = CorePlaybackState.Stopped;
     private double _playbackSpeed = 1.0;
     private List<ChapterInfo> _chapters = new();
+    // 最初のビデオフレームのPTSを基準として正規化（OBS Replay Bufferなど大きなPTSに対応）
+    private double _ptsSyncOffset = double.NaN;
 
     public MediaInfo? CurrentMedia => _currentMedia;
     public CorePlaybackState State => _state;
@@ -50,6 +52,7 @@ public unsafe class MediaEngine : IMediaEngine
     {
         Stop();
         DisposeDecoders();
+        _ptsSyncOffset = double.NaN;
 
         fixed (AVFormatContext** fmtCtxPtr = &_fmtCtx)
         {
@@ -176,6 +179,7 @@ public unsafe class MediaEngine : IMediaEngine
             foreach (var d in _audioDecoders) d.FlushBuffers();
             foreach (var s in _audioStates) s.Buffer.ClearBuffer();
             _mixer?.SetPlayedSamples((long)(position.TotalSeconds * AudioDecoder.OutSampleRate));
+            // シーク後もPTSオフセットは保持（最初のフレームで確定した相対オフセットは変わらない）
         }
     }
 
@@ -279,55 +283,74 @@ public unsafe class MediaEngine : IMediaEngine
         if (_fmtCtx == null) return;
         using var pkt = new PacketHolder();
 
-        while (!ct.IsCancellationRequested)
+        try
         {
-            if (_state == CorePlaybackState.Paused) { Thread.Sleep(10); continue; }
-
-            bool bufferFull = _audioStates.Count > 0 &&
-                              _audioStates.All(s => s.Buffer.BufferedDuration > TimeSpan.FromSeconds(1));
-            if (bufferFull) { Thread.Sleep(5); continue; }
-
-            lock (_seekLock) { }
-
-            int ret = av_read_frame(_fmtCtx, pkt.Packet);
-            if (ret < 0)
+            while (!ct.IsCancellationRequested)
             {
-                Thread.Sleep(200);
-                PlaybackEnded?.Invoke(this, EventArgs.Empty);
-                return;
-            }
+                if (_state == CorePlaybackState.Paused) { Thread.Sleep(10); continue; }
 
-            int idx = pkt.Packet->stream_index;
+                bool bufferFull = _audioStates.Count > 0 &&
+                                  _audioStates.All(s => s.Buffer.BufferedDuration > TimeSpan.FromSeconds(1));
+                if (bufferFull) { Thread.Sleep(5); continue; }
 
-            if (_videoDecoder != null && idx == _videoDecoder.StreamIndex)
-            {
-                var frame = _videoDecoder.DecodePacket(pkt.Packet);
-                if (frame != null)
+                lock (_seekLock) { }
+
+                int ret = av_read_frame(_fmtCtx, pkt.Packet);
+                if (ret < 0)
                 {
-                    double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate;
-                    double framePts = frame.Pts.TotalSeconds;
-                    double diff = framePts - masterClock;
-                    if (diff > 0.002)
-                        Thread.Sleep((int)(Math.Min(diff, 0.1) * 1000));
-                    VideoFrameReady?.Invoke(this, frame);
-                    PositionChanged?.Invoke(this, frame.Pts);
+                    Thread.Sleep(200);
+                    PlaybackEnded?.Invoke(this, EventArgs.Empty);
+                    return;
                 }
-            }
-            else
-            {
-                for (int i = 0; i < _audioDecoders.Count; i++)
+
+                int idx = pkt.Packet->stream_index;
+
+                if (_videoDecoder != null && idx == _videoDecoder.StreamIndex)
                 {
-                    if (_audioDecoders[i].StreamIndex == idx)
+                    var frame = _videoDecoder.DecodePacket(pkt.Packet);
+                    if (frame != null)
                     {
-                        var pcm = _audioDecoders[i].DecodePacket(pkt.Packet);
-                        if (pcm != null)
-                            _audioStates[i].Buffer.AddSamples(pcm, 0, pcm.Length);
-                        break;
+                        double absFramePts = frame.Pts.TotalSeconds;
+
+                        // 初回フレームでPTSオフセットを確定（OBS Replay Bufferなど非ゼロ開始PTSに対応）
+                        if (double.IsNaN(_ptsSyncOffset))
+                            _ptsSyncOffset = absFramePts;
+
+                        double normalizedPts = absFramePts - _ptsSyncOffset;
+                        double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate;
+                        double diff = normalizedPts - masterClock;
+                        if (diff > 0.002)
+                            Thread.Sleep((int)(Math.Min(diff, 0.1) * 1000));
+
+                        VideoFrameReady?.Invoke(this, frame);
+                        PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
                     }
                 }
-            }
+                else
+                {
+                    for (int i = 0; i < _audioDecoders.Count; i++)
+                    {
+                        if (_audioDecoders[i].StreamIndex == idx)
+                        {
+                            var pcm = _audioDecoders[i].DecodePacket(pkt.Packet);
+                            if (pcm != null)
+                                _audioStates[i].Buffer.AddSamples(pcm, 0, pcm.Length);
+                            break;
+                        }
+                    }
+                }
 
-            av_packet_unref(pkt.Packet);
+                av_packet_unref(pkt.Packet);
+            }
+        }
+        catch (Exception)
+        {
+            // デコードスレッドの例外でアプリがクラッシュしないよう捕捉
+            // （D3D11VAの失敗、ネイティブクラッシュなどへの安全網）
+        }
+        finally
+        {
+            _decodeThread = null;
         }
     }
 
