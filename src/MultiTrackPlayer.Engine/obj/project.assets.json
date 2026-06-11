@@ -564,11 +564,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Engine\\MultiTrackPlayer.Engine.csproj",
+      "projectUniqueName": "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Engine\\MultiTrackPlayer.Engine.csproj",
       "projectName": "MultiTrackPlayer.Engine",
-      "projectPath": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Engine\\MultiTrackPlayer.Engine.csproj",
+      "projectPath": "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Engine\\MultiTrackPlayer.Engine.csproj",
       "packagesPath": "C:\\Users\\Ramilen\\.nuget\\packages\\",
-      "outputPath": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Engine\\obj\\",
+      "outputPath": "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Engine\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "C:\\Users\\Ramilen\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -583,8 +583,8 @@
         "net6.0": {
           "targetAlias": "net6.0",
           "projectReferences": {
-            "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj": {
-              "projectPath": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj"
+            "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj": {
+              "projectPath": "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj"
             }
           }
         }

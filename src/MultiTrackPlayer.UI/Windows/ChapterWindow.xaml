@@ -1,0 +1,34 @@
+﻿<Window x:Class="MultiTrackPlayer.UI.Windows.ChapterWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="チャプター" Width="380" Height="400"
+        WindowStyle="ToolWindow" ShowInTaskbar="False">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <ListBox x:Name="ChapterList" Grid.Row="0"
+                 ItemsSource="{Binding Chapters}"
+                 MouseDoubleClick="ChapterList_MouseDoubleClick">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="60"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="60"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="{Binding TimeLabel}" FontFamily="Consolas"/>
+                        <TextBlock Grid.Column="1" Text="{Binding Title}" Margin="4,0" TextTrimming="CharacterEllipsis"/>
+                        <Button Grid.Column="2" Content="削除" FontSize="10" Padding="4,2"
+                                Visibility="{Binding IsUserDefined, Converter={StaticResource BoolToVis}}"
+                                Click="Delete_Click" Tag="{Binding}"/>
+                    </Grid>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+        <Button Grid.Row="1" Content="＋ 現在位置にチャプター追加" Click="Add_Click"
+                Margin="8" Padding="8,6"/>
+    </Grid>
+</Window>
