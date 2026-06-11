@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj": {}
+    "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj": {}
   },
   "projects": {
-    "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj": {
+    "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj",
+        "projectUniqueName": "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj",
         "projectName": "MultiTrackPlayer.Core",
-        "projectPath": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj",
+        "projectPath": "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Core\\MultiTrackPlayer.Core.csproj",
         "packagesPath": "C:\\Users\\Ramilen\\.nuget\\packages\\",
-        "outputPath": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Core\\obj\\",
+        "outputPath": "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Core\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\Ramilen\\AppData\\Roaming\\NuGet\\NuGet.Config"

@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "iccyaZUP4+R+rDw+oWhCEMoz1lF8ZOCea0AmD2g9QPLgH4ThDKRZ3y1v4vuIx1xx+dhwr3T4AmBQllgJ86+gsg==",
+  "dgSpecHash": "FXVph4GS38nHEXfz6jMgkepCRLr9JoJgtbdZd4K48u8NcJOSeF8QG1tHEUhbYjoOJ/in+D/gJNvAnxPV2A3eDw==",
   "success": true,
-  "projectFilePath": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.Engine\\MultiTrackPlayer.Engine.csproj",
+  "projectFilePath": "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.Engine\\MultiTrackPlayer.Engine.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\Ramilen\\.nuget\\packages\\microsoft.netcore.platforms\\3.1.0\\microsoft.netcore.platforms.3.1.0.nupkg.sha512",
     "C:\\Users\\Ramilen\\.nuget\\packages\\microsoft.win32.registry\\4.7.0\\microsoft.win32.registry.4.7.0.nupkg.sha512",

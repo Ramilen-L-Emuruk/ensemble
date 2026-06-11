@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "hkDKOgSqu7knuMEOwbVw7ZNARf8BIE/z814Du+XgUKdvKhoVr+SxE+N+H60HU/aMSAkF7Tc3bn5Yd5RsyGQs6A==",
+  "dgSpecHash": "xSwhy0a4KNfgs9QR98t1itxkrWMn0+FoIfAh8N3w/BVmjYUZz8+7GTS7BYc+8X801HtJhMhBQVm4k0cQfMZ5bA==",
   "success": true,
-  "projectFilePath": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.UI\\MultiTrackPlayer.UI.csproj",
+  "projectFilePath": "D:\\Documents\\002.dev\\ensemble\\.claude\\worktrees\\feat+initial-implementation\\src\\MultiTrackPlayer.UI\\MultiTrackPlayer.UI.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\Ramilen\\.nuget\\packages\\communitytoolkit.mvvm\\8.2.2\\communitytoolkit.mvvm.8.2.2.nupkg.sha512",
     "C:\\Users\\Ramilen\\.nuget\\packages\\microsoft.netcore.platforms\\3.1.0\\microsoft.netcore.platforms.3.1.0.nupkg.sha512",
