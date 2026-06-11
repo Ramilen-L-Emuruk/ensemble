@@ -1,0 +1,44 @@
+{
+  "version": 2,
+  "dgSpecHash": "hkDKOgSqu7knuMEOwbVw7ZNARf8BIE/z814Du+XgUKdvKhoVr+SxE+N+H60HU/aMSAkF7Tc3bn5Yd5RsyGQs6A==",
+  "success": true,
+  "projectFilePath": "D:\\Documents\\002.dev\\ensemble\\src\\MultiTrackPlayer.UI\\MultiTrackPlayer.UI.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Ramilen\\.nuget\\packages\\communitytoolkit.mvvm\\8.2.2\\communitytoolkit.mvvm.8.2.2.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\microsoft.netcore.platforms\\3.1.0\\microsoft.netcore.platforms.3.1.0.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\microsoft.win32.registry\\4.7.0\\microsoft.win32.registry.4.7.0.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\naudio\\2.2.1\\naudio.2.2.1.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\naudio.asio\\2.2.1\\naudio.asio.2.2.1.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\naudio.core\\2.2.1\\naudio.core.2.2.1.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\naudio.midi\\2.2.1\\naudio.midi.2.2.1.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\naudio.wasapi\\2.2.1\\naudio.wasapi.2.2.1.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\naudio.winforms\\2.2.1\\naudio.winforms.2.2.1.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\naudio.winmm\\2.2.1\\naudio.winmm.2.2.1.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\sdcb.ffmpeg\\6.0.26\\sdcb.ffmpeg.6.0.26.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\sdcb.ffmpeg.runtime.windows-x64\\6.0.26\\sdcb.ffmpeg.runtime.windows-x64.6.0.26.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\system.security.accesscontrol\\4.7.0\\system.security.accesscontrol.4.7.0.nupkg.sha512",
+    "C:\\Users\\Ramilen\\.nuget\\packages\\system.security.principal.windows\\4.7.0\\system.security.principal.windows.4.7.0.nupkg.sha512"
+  ],
+  "logs": [
+    {
+      "code": "NU1603",
+      "level": "Warning",
+      "warningLevel": 1,
+      "message": "MultiTrackPlayer.Engine は Sdcb.FFmpeg (>= 6.0.0) に依存していますが、Sdcb.FFmpeg 6.0.0 が見つかりませんでした。Sdcb.FFmpeg 6.0.26 の概算の最適な一致が解決されました。",
+      "libraryId": "Sdcb.FFmpeg",
+      "targetGraphs": [
+        "net6.0-windows7.0"
+      ]
+    },
+    {
+      "code": "NU1603",
+      "level": "Warning",
+      "warningLevel": 1,
+      "message": "MultiTrackPlayer.Engine は Sdcb.FFmpeg.runtime.windows-x64 (>= 6.0.0) に依存していますが、Sdcb.FFmpeg.runtime.windows-x64 6.0.0 が見つかりませんでした。Sdcb.FFmpeg.runtime.windows-x64 6.0.26 の概算の最適な一致が解決されました。",
+      "libraryId": "Sdcb.FFmpeg.runtime.windows-x64",
+      "targetGraphs": [
+        "net6.0-windows7.0"
+      ]
+    }
+  ]
+}
