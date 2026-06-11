@@ -4,17 +4,17 @@
 winexe
 C#
 .cs
-D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.UI\obj\Debug\net6.0-windows\
+D:\Documents\002.dev\ensemble\.claude\worktrees\feat+initial-implementation\src\MultiTrackPlayer.UI\obj\Debug\net6.0-windows\
 MultiTrackPlayer.UI
 none
 false
 TRACE;DEBUG;NET;NET6_0;NETCOREAPP
-D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.UI\App.xaml
-11407045341
+D:\Documents\002.dev\ensemble\.claude\worktrees\feat+initial-implementation\src\MultiTrackPlayer.UI\App.xaml
+51825460096
 
-3-1233169557
-213-1420117545
-MainWindow.xaml;
+141300657872
+213-1447171269
+Controls\SeekBarControl.xaml;MainWindow.xaml;Windows\ChapterWindow.xaml;Windows\MixerWindow.xaml;Windows\PlaylistWindow.xaml;
 
 False
 
