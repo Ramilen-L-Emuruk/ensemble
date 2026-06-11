@@ -1,0 +1,12 @@
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\bin\Debug\net6.0\MultiTrackPlayer.Core.deps.json
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\bin\Debug\net6.0\MultiTrackPlayer.Core.dll
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\bin\Debug\net6.0\MultiTrackPlayer.Core.pdb
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\obj\Debug\net6.0\MultiTrackPlayer.Core.csproj.AssemblyReference.cache
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\obj\Debug\net6.0\MultiTrackPlayer.Core.GeneratedMSBuildEditorConfig.editorconfig
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\obj\Debug\net6.0\MultiTrackPlayer.Core.AssemblyInfoInputs.cache
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\obj\Debug\net6.0\MultiTrackPlayer.Core.AssemblyInfo.cs
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\obj\Debug\net6.0\MultiTrackPlayer.Core.csproj.CoreCompileInputs.cache
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\obj\Debug\net6.0\MultiTrackPlayer.Core.dll
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\obj\Debug\net6.0\refint\MultiTrackPlayer.Core.dll
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\obj\Debug\net6.0\MultiTrackPlayer.Core.pdb
+D:\Documents\002.dev\ensemble\src\MultiTrackPlayer.Core\obj\Debug\net6.0\ref\MultiTrackPlayer.Core.dll
