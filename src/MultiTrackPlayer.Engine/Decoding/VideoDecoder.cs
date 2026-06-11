@@ -57,23 +57,32 @@ public unsafe class VideoDecoder : IDisposable
         AVFrame* swFrame = null;
         try
         {
-            if (_useHw && frame->format == (int)AVPixelFormat.D3d11)
+            if (_useHw)
             {
-                swFrame = av_frame_alloc();
-                swFrame->format = (int)AVPixelFormat.Nv12;
-                int ret = av_hwframe_transfer_data(swFrame, frame, 0);
-                if (ret < 0) return null;
-                frame = swFrame;
+                var fmt = (AVPixelFormat)frame->format;
+                // D3D11VAのハードウェアサーフェス形式はCPUから直接アクセスできないため転送が必要
+                if (fmt == AVPixelFormat.D3d11 || fmt == AVPixelFormat.D3d11vaVld)
+                {
+                    swFrame = av_frame_alloc();
+                    int ret = av_hwframe_transfer_data(swFrame, frame, 0);
+                    if (ret < 0) return null;
+                    frame = swFrame;
+                }
+                // else: コーデックがソフトウェアデコードにフォールバック済みのため直接使用
             }
 
             int w = frame->width;
             int h = frame->height;
+            if (w <= 0 || h <= 0) return null;
+
             var srcFmt = (AVPixelFormat)frame->format;
 
             _swsCtx = sws_getCachedContext(
                 _swsCtx, w, h, srcFmt,
                 w, h, AVPixelFormat.Bgra,
                 2, null, null, null); // 2 = SWS_BILINEAR
+
+            if (_swsCtx == null) return null;
 
             var pixels = new byte[w * h * 4];
 
@@ -94,7 +103,9 @@ public unsafe class VideoDecoder : IDisposable
             }
 
             long pts = srcFrame->best_effort_timestamp;
-            double seconds = pts * av_q2d(_timeBase);
+            // AV_NOPTS_VALUE (long.MinValue) の場合は 0 で代替
+            if (pts == long.MinValue) pts = 0;
+            double seconds = Math.Max(0.0, pts * av_q2d(_timeBase));
             return new VideoFrameData(pixels, w, h, TimeSpan.FromSeconds(seconds));
         }
         finally
