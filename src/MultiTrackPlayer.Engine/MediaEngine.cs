@@ -30,6 +30,10 @@ public unsafe class MediaEngine : IMediaEngine
     private List<ChapterInfo> _chapters = new();
     // 最初のビデオフレームのPTSを基準として正規化（OBS Replay Bufferなど大きなPTSに対応）
     private double _ptsSyncOffset = double.NaN;
+    // WASAPI 出力バッファ遅延（秒）: Init() 後に取得し masterClock から引いて実出力タイミングに補正
+    private double _wasapiLatencySec;
+    // 映像の1フレーム時間（秒）: フレームドロップ閾値の動的計算に使用
+    private double _videoFrameDuration = 1.0 / 30.0;
 
     public MediaInfo? CurrentMedia => _currentMedia;
     public CorePlaybackState State => _state;
@@ -131,6 +135,12 @@ public unsafe class MediaEngine : IMediaEngine
         double durationSec = _fmtCtx->duration / (double)AV_TIME_BASE;
         var videoStream = _videoDecoder != null ? _fmtCtx->streams[_videoDecoder.StreamIndex] : null;
 
+        if (videoStream != null)
+        {
+            double fps = av_q2d(videoStream->avg_frame_rate);
+            _videoFrameDuration = fps > 0 ? 1.0 / fps : 1.0 / 30.0;
+        }
+
         _currentMedia = new MediaInfo
         {
             FilePath = filePath,
@@ -156,8 +166,11 @@ public unsafe class MediaEngine : IMediaEngine
             _audioStates.Add(state);
             _mixer.AddTrack(state);
         }
-        _wasapiOut = new WasapiOut();
+        // WasapiOut の要求レイテンシ（デフォルト 200ms）を記録し、masterClock 補正に使う
+        const int WasapiLatencyMs = 200;
+        _wasapiOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, WasapiLatencyMs);
         _wasapiOut.Init(_mixer);
+        _wasapiLatencySec = WasapiLatencyMs / 1000.0;
     }
 
     public void Play()
@@ -311,7 +324,7 @@ public unsafe class MediaEngine : IMediaEngine
                 if (_state == CorePlaybackState.Paused) { Thread.Sleep(10); continue; }
 
                 bool bufferFull = _audioStates.Count > 0 &&
-                                  _audioStates.All(s => s.Buffer.BufferedDuration > TimeSpan.FromSeconds(1));
+                                  _audioStates.Any(s => s.Buffer.BufferedDuration > TimeSpan.FromSeconds(1));
                 if (bufferFull) { Thread.Sleep(5); continue; }
 
                 lock (_seekLock) { }
@@ -338,15 +351,17 @@ public unsafe class MediaEngine : IMediaEngine
                             _ptsSyncOffset = absFramePts;
 
                         double normalizedPts = absFramePts - _ptsSyncOffset;
-                        double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate;
+                        // PlayedSamples はWASAPIバッファへの書き込み数のため、実際の出力は _wasapiLatencySec 分遅れる
+                        double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate
+                                            - _wasapiLatencySec;
                         double diff = normalizedPts - masterClock;
 
-                        // 映像が音声より先行している場合は待つ
+                        // 映像が音声より先行している場合は待つ（最大100ms）
                         if (diff > 0.002)
                             Thread.Sleep((int)(Math.Min(diff, 0.1) * 1000));
 
-                        // 映像が音声より100ms以上遅れている場合はフレームをスキップして追いつかせる
-                        if (diff >= -0.1)
+                        // 映像が2フレーム以上遅れている場合はスキップして追いつかせる（VLC の VOUT_DISPLAY_LATE_THRESHOLD 相当）
+                        if (diff >= -_videoFrameDuration * 2)
                         {
                             VideoFrameReady?.Invoke(this, frame);
                             PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
