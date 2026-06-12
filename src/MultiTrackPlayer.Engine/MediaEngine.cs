@@ -74,10 +74,14 @@ public unsafe class MediaEngine : IMediaEngine
                 _audioDecoders.Add(decoder);
 
                 var titleTag = av_dict_get(stream->metadata, "title", null, 0);
+                if (titleTag == null)
+                    titleTag = av_dict_get(stream->metadata, "handler_name", null, 0);
                 var langTag = av_dict_get(stream->metadata, "language", null, 0);
-                string name = titleTag != null
-                    ? Marshal.PtrToStringUTF8((IntPtr)titleTag->value) ?? string.Empty
-                    : $"Audio #{_audioDecoders.Count} ({avcodec_get_name(stream->codecpar->codec_id)})";
+                string rawName = titleTag != null ? Marshal.PtrToStringUTF8((IntPtr)titleTag->value) ?? string.Empty : string.Empty;
+                // FFmpeg が既定で付ける汎用ハンドラ名は除外する
+                if (rawName is "SoundHandler" or "AudioHandler" or "Sound Media Handler")
+                    rawName = string.Empty;
+                string name = !string.IsNullOrEmpty(rawName) ? rawName : avcodec_get_name(stream->codecpar->codec_id);
                 string lang = langTag != null ? Marshal.PtrToStringUTF8((IntPtr)langTag->value) ?? string.Empty : "";
 
                 audioTracks.Add(new AudioTrackInfo(

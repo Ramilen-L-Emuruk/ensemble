@@ -19,7 +19,8 @@ public partial class AudioTrackViewModel : ObservableObject
         _setVolume = setVolume;
         _setMute = setMute;
         TrackNumber = info.TrackNumber;
-        Name = $"#{info.TrackNumber} {info.Name}";
+        var langSuffix = string.IsNullOrEmpty(info.Language) ? "" : $" [{info.Language.ToUpperInvariant()}]";
+        Name = $"#{info.TrackNumber} {info.Name}{langSuffix}";
     }
 
     partial void OnVolumeChanged(double value) => _setVolume(TrackNumber, (float)(value / 100.0));
