@@ -20,5 +20,8 @@ Desktop.ini
 # Claude directories
 .claude/
 
+# Release output
+publish/
+
 # Logs
 *.log
