@@ -340,11 +340,17 @@ public unsafe class MediaEngine : IMediaEngine
                         double normalizedPts = absFramePts - _ptsSyncOffset;
                         double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate;
                         double diff = normalizedPts - masterClock;
+
+                        // 映像が音声より先行している場合は待つ
                         if (diff > 0.002)
                             Thread.Sleep((int)(Math.Min(diff, 0.1) * 1000));
 
-                        VideoFrameReady?.Invoke(this, frame);
-                        PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
+                        // 映像が音声より100ms以上遅れている場合はフレームをスキップして追いつかせる
+                        if (diff >= -0.1)
+                        {
+                            VideoFrameReady?.Invoke(this, frame);
+                            PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
+                        }
                     }
                 }
                 else
