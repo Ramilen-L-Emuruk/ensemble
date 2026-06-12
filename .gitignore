@@ -23,5 +23,8 @@ Desktop.ini
 # Release output
 publish/
 
+# Local dev tools
+tools/
+
 # Logs
 *.log
