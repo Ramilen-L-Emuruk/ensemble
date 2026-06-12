@@ -32,10 +32,32 @@ public unsafe class AudioDecoder : IDisposable
     {
         int ret = avcodec_send_packet(_ctx, pkt);
         if (ret < 0) return null;
-        using var frame = new FrameHolder();
-        ret = avcodec_receive_frame(_ctx, frame.Frame);
-        if (ret < 0) return null;
-        return Resample(frame.Frame);
+
+        // 1パケットから複数フレームが出るコーデックに対応するためループで受け取る
+        var segments = new List<byte[]>();
+        AVFrame* frame = av_frame_alloc();
+        try
+        {
+            while (avcodec_receive_frame(_ctx, frame) == 0)
+            {
+                var pcm = Resample(frame);
+                if (pcm != null) segments.Add(pcm);
+                av_frame_unref(frame);
+            }
+        }
+        finally
+        {
+            av_frame_free(&frame);
+        }
+
+        if (segments.Count == 0) return null;
+        if (segments.Count == 1) return segments[0];
+
+        int total = segments.Sum(s => s.Length);
+        var result = new byte[total];
+        int offset = 0;
+        foreach (var seg in segments) { Buffer.BlockCopy(seg, 0, result, offset, seg.Length); offset += seg.Length; }
+        return result;
     }
 
     private byte[]? Resample(AVFrame* frame)
