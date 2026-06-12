@@ -61,6 +61,9 @@ public unsafe class MediaEngine : IMediaEngine
         var audioTracks = new List<AudioTrackInfo>();
         var chapters = new List<ChapterInfo>();
 
+        // moov/trak/udta/name ボックスから OBS 等が書き込むトラック名を取得
+        var mp4TrackNames = Mp4TrackNameReader.Read(filePath);
+
         for (int i = 0; i < (int)_fmtCtx->nb_streams; i++)
         {
             var stream = _fmtCtx->streams[i];
@@ -73,16 +76,30 @@ public unsafe class MediaEngine : IMediaEngine
                 var decoder = new AudioDecoder(stream);
                 _audioDecoders.Add(decoder);
 
-                var titleTag = av_dict_get(stream->metadata, "title", null, 0);
-                if (titleTag == null)
-                    titleTag = av_dict_get(stream->metadata, "handler_name", null, 0);
                 var langTag = av_dict_get(stream->metadata, "language", null, 0);
-                string rawName = titleTag != null ? Marshal.PtrToStringUTF8((IntPtr)titleTag->value) ?? string.Empty : string.Empty;
-                // FFmpeg が既定で付ける汎用ハンドラ名は除外する
-                if (rawName is "SoundHandler" or "AudioHandler" or "Sound Media Handler")
-                    rawName = string.Empty;
-                string name = !string.IsNullOrEmpty(rawName) ? rawName : avcodec_get_name(stream->codecpar->codec_id);
                 string lang = langTag != null ? Marshal.PtrToStringUTF8((IntPtr)langTag->value) ?? string.Empty : "";
+                if (lang == "und") lang = string.Empty;
+
+                // 1. moov/trak/udta/name ボックス（OBS 等が書き込む）を最優先
+                mp4TrackNames.TryGetValue(stream->id, out string? udataName);
+
+                // 2. FFmpeg stream metadata の title タグ
+                var titleTag = av_dict_get(stream->metadata, "title", null, 0);
+                string metaTitle = titleTag != null ? Marshal.PtrToStringUTF8((IntPtr)titleTag->value) ?? string.Empty : string.Empty;
+
+                // 3. handler_name（汎用名は除外）
+                var handlerTag = av_dict_get(stream->metadata, "handler_name", null, 0);
+                string handlerName = handlerTag != null ? Marshal.PtrToStringUTF8((IntPtr)handlerTag->value) ?? string.Empty : string.Empty;
+                if (handlerName is "SoundHandler" or "AudioHandler" or "Sound Media Handler")
+                    handlerName = string.Empty;
+
+                int ch = stream->codecpar->ch_layout.nb_channels;
+                int sr = stream->codecpar->sample_rate;
+                string codecName = avcodec_get_name(stream->codecpar->codec_id);
+                string name = !string.IsNullOrEmpty(udataName) ? udataName!
+                    : !string.IsNullOrEmpty(metaTitle) ? metaTitle
+                    : !string.IsNullOrEmpty(handlerName) ? handlerName
+                    : $"{codecName} {ch}ch {sr / 1000}kHz";
 
                 audioTracks.Add(new AudioTrackInfo(
                     stream->index,
