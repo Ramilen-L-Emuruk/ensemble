@@ -378,6 +378,7 @@ public unsafe class MediaEngine : IMediaEngine
                                             - _wasapiLatencySec;
                         double diff = normalizedPts - masterClock;
                         _driftAverage.Update(diff);
+                        ApplyDriftCorrection(_driftAverage.Get());
 
                         // シーク後グレース期間中はドロップ判定をスキップして即座に表示（VLC プリロール相当）
                         if (_seekGraceFrames > 0)
@@ -434,6 +435,28 @@ public unsafe class MediaEngine : IMediaEngine
         _driftAverage.Reset();
         foreach (var s in _audioStates)
             s.Buffer.ClearBuffer();
+    }
+
+    // VLC stream_HandleDrift / aout_FiltersAdjustResampling 相当
+    // swr_set_compensation で微量のサンプル追加/削除を行い、音声クロックを映像に追従させる
+    private void ApplyDriftCorrection(double avgDriftSec)
+    {
+        const double kThreshold = 0.04;      // 40ms 超で補正開始
+        const double kResetThreshold = 0.01; // 10ms 未満で補正終了
+        const int kCompensationDistance = AudioDecoder.OutSampleRate / 2; // 500ms ウィンドウ
+        const int kCorrectionSamples = 44;   // ≈ 0.1% of OutSampleRate (≈1ms per 500ms)
+
+        if (Math.Abs(avgDriftSec) > kThreshold)
+        {
+            int sampleDelta = Math.Sign(avgDriftSec) * kCorrectionSamples;
+            foreach (var d in _audioDecoders)
+                d.SetDriftCompensation(sampleDelta, kCompensationDistance);
+        }
+        else if (Math.Abs(avgDriftSec) < kResetThreshold)
+        {
+            foreach (var d in _audioDecoders)
+                d.SetDriftCompensation(0, AudioDecoder.OutSampleRate);
+        }
     }
 
     private void DisposeDecoders()
