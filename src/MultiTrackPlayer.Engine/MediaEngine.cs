@@ -3,6 +3,7 @@ using MultiTrackPlayer.Core.Interfaces;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Audio;
 using MultiTrackPlayer.Engine.Decoding;
+using MultiTrackPlayer.Engine.Sync;
 using NAudio.Wave;
 using Sdcb.FFmpeg.Raw;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
@@ -34,6 +35,14 @@ public unsafe class MediaEngine : IMediaEngine
     private double _wasapiLatencySec;
     // 映像の1フレーム時間（秒）: フレームドロップ閾値の動的計算に使用
     private double _videoFrameDuration = 1.0 / 30.0;
+    // ドリフト移動平均（VLC average_t range=10 相当）: 瞬間ドリフトを平滑化して補正判定に使用
+    private readonly DriftAverage _driftAverage = new(range: 10);
+    // 直前フレームの正規化PTS: 不連続検出に使用（VLC CR_MAX_GAP = 300ms 相当）
+    private double _lastNormalizedPts = double.NaN;
+    private const double DiscontinuityThresholdSec = 0.3;
+    // シーク後グレース期間: シーク直後の数フレームはドロップ判定をスキップ（VLC プリロール相当）
+    private int _seekGraceFrames;
+    private const int SeekGraceFrameCount = 5;
 
     public MediaInfo? CurrentMedia => _currentMedia;
     public CorePlaybackState State => _state;
@@ -214,6 +223,9 @@ public unsafe class MediaEngine : IMediaEngine
             foreach (var s in _audioStates) s.Buffer.ClearBuffer();
             _mixer?.SetPlayedSamples((long)(position.TotalSeconds * AudioDecoder.OutSampleRate));
             // シーク後もPTSオフセットは保持（最初のフレームで確定した相対オフセットは変わらない）
+            _seekGraceFrames = SeekGraceFrameCount;
+            _driftAverage.Reset();
+            _lastNormalizedPts = double.NaN;
         }
     }
 
@@ -351,10 +363,31 @@ public unsafe class MediaEngine : IMediaEngine
                             _ptsSyncOffset = absFramePts;
 
                         double normalizedPts = absFramePts - _ptsSyncOffset;
+
+                        // 不連続検出: PTS が 300ms 以上ジャンプするか逆行した場合にバッファをフラッシュ（VLC CR_MAX_GAP 相当）
+                        if (!double.IsNaN(_lastNormalizedPts))
+                        {
+                            double ptsDiff = normalizedPts - _lastNormalizedPts;
+                            if (ptsDiff < 0 || ptsDiff > DiscontinuityThresholdSec)
+                                HandleDiscontinuity();
+                        }
+                        _lastNormalizedPts = normalizedPts;
+
                         // PlayedSamples はWASAPIバッファへの書き込み数のため、実際の出力は _wasapiLatencySec 分遅れる
                         double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate
                                             - _wasapiLatencySec;
                         double diff = normalizedPts - masterClock;
+                        _driftAverage.Update(diff);
+
+                        // シーク後グレース期間中はドロップ判定をスキップして即座に表示（VLC プリロール相当）
+                        if (_seekGraceFrames > 0)
+                        {
+                            _seekGraceFrames--;
+                            VideoFrameReady?.Invoke(this, frame);
+                            PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
+                            av_packet_unref(pkt.Packet);
+                            continue;
+                        }
 
                         // 映像が音声より先行している場合は待つ（最大100ms）
                         if (diff > 0.002)
@@ -394,6 +427,13 @@ public unsafe class MediaEngine : IMediaEngine
         {
             _decodeThread = null;
         }
+    }
+
+    private void HandleDiscontinuity()
+    {
+        _driftAverage.Reset();
+        foreach (var s in _audioStates)
+            s.Buffer.ClearBuffer();
     }
 
     private void DisposeDecoders()
