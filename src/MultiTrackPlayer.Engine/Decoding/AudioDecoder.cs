@@ -109,7 +109,21 @@ public unsafe class AudioDecoder : IDisposable
         av_channel_layout_uninit(&outLayout);
     }
 
-    public void FlushBuffers() => avcodec_flush_buffers(_ctx);
+    public void FlushBuffers()
+    {
+        avcodec_flush_buffers(_ctx);
+        if (_swrCtx != null)
+            swr_set_compensation(_swrCtx, 0, OutSampleRate); // フラッシュ時はドリフト補正をリセット
+    }
+
+    // swr_set_compensation を使ったソフト補正（VLC aout_FiltersAdjustResampling 相当）
+    // sampleDelta > 0 → サンプル追加（masterClock 前進を速める）→ 映像先行ドリフト補正
+    // sampleDelta < 0 → サンプル削除（masterClock 前進を遅らせる）→ 映像遅延ドリフト補正
+    public void SetDriftCompensation(int sampleDelta, int compensationDistance)
+    {
+        if (_swrCtx == null) return;
+        swr_set_compensation(_swrCtx, sampleDelta, compensationDistance);
+    }
 
     public void Dispose()
     {
