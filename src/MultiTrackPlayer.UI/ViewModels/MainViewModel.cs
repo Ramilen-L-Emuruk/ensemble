@@ -17,6 +17,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private PlaybackState _playbackState = PlaybackState.Stopped;
     [ObservableProperty] private TimeSpan _position;
     [ObservableProperty] private TimeSpan _duration;
+    [ObservableProperty] private MediaInfo? _currentMedia;
     [ObservableProperty] private double _playbackSpeed = 1.0;
     [ObservableProperty] private double _masterVolume = 80.0;
     [ObservableProperty] private string _title = "MultiTrackPlayer";
@@ -48,6 +49,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         Engine.Open(path);
         var info = Engine.CurrentMedia!;
+        CurrentMedia = info;
         Duration = info.Duration;
         Title = System.IO.Path.GetFileName(path) + " - MultiTrackPlayer";
         Playlist.SetCurrentByPath(path);
