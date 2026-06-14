@@ -166,11 +166,11 @@ public unsafe class MediaEngine : IMediaEngine
             _audioStates.Add(state);
             _mixer.AddTrack(state);
         }
-        // WasapiOut の要求レイテンシ（デフォルト 200ms）を記録し、masterClock 補正に使う
-        const int WasapiLatencyMs = 200;
-        _wasapiOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, WasapiLatencyMs);
+        // WasapiOut の要求レイテンシ。この値が masterClock 補正にも使われるため一か所で定義する
+        int wasapiLatencyMs = 200;
+        _wasapiOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, wasapiLatencyMs);
         _wasapiOut.Init(_mixer);
-        _wasapiLatencySec = WasapiLatencyMs / 1000.0;
+        _wasapiLatencySec = wasapiLatencyMs / 1000.0;
     }
 
     public void Play()
