@@ -43,6 +43,10 @@ public unsafe class MediaEngine : IMediaEngine
     // シーク後グレース期間: シーク直後の数フレームはドロップ判定をスキップ（VLC プリロール相当）
     private int _seekGraceFrames;
     private const int SeekGraceFrameCount = 5;
+    // フレームドロップ統計（100フレームごとに StatisticsUpdated イベントで通知）
+    private int _droppedFrames;
+    private int _displayedFrames;
+    private const int StatisticsIntervalFrames = 100;
 
     public MediaInfo? CurrentMedia => _currentMedia;
     public CorePlaybackState State => _state;
@@ -60,6 +64,7 @@ public unsafe class MediaEngine : IMediaEngine
     public event EventHandler<VideoFrameData>? VideoFrameReady;
     public event EventHandler<TimeSpan>? PositionChanged;
     public event EventHandler? PlaybackEnded;
+    public event EventHandler<PlaybackStatistics>? StatisticsUpdated;
 
     public void Open(string filePath)
     {
@@ -405,9 +410,18 @@ public unsafe class MediaEngine : IMediaEngine
                         // 映像が2フレーム以上遅れている場合はスキップして追いつかせる（VLC の VOUT_DISPLAY_LATE_THRESHOLD 相当）
                         if (diff >= -_videoFrameDuration * 2)
                         {
+                            _displayedFrames++;
                             VideoFrameReady?.Invoke(this, frame);
                             PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
                         }
+                        else
+                        {
+                            _droppedFrames++;
+                        }
+
+                        int totalFrames = _displayedFrames + _droppedFrames;
+                        if (totalFrames > 0 && totalFrames % StatisticsIntervalFrames == 0)
+                            StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _driftAverage.Get()));
                     }
                 }
                 else
@@ -418,7 +432,12 @@ public unsafe class MediaEngine : IMediaEngine
                         {
                             var pcm = _audioDecoders[i].DecodePacket(pkt.Packet);
                             if (pcm != null)
-                                _audioStates[i].Buffer.AddSamples(pcm, 0, pcm.Length);
+                            {
+                                var buf = _audioStates[i].Buffer;
+                                if (buf.BufferedDuration > buf.BufferDuration * 0.95)
+                                    System.Diagnostics.Debug.WriteLine($"[Audio] Track {i} buffer near overflow ({buf.BufferedDuration.TotalMilliseconds:F0}ms)");
+                                buf.AddSamples(pcm, 0, pcm.Length);
+                            }
                             break;
                         }
                     }

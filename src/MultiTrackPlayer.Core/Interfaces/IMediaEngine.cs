@@ -30,4 +30,7 @@ public interface IMediaEngine : IDisposable
     event EventHandler<VideoFrameData> VideoFrameReady;
     event EventHandler<TimeSpan> PositionChanged;
     event EventHandler PlaybackEnded;
+    event EventHandler<PlaybackStatistics>? StatisticsUpdated;
 }
+
+public record PlaybackStatistics(int DroppedFrames, int DisplayedFrames, double AverageDriftSec);
