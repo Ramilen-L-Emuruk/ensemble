@@ -14,6 +14,21 @@ public unsafe class AudioDecoder : IDisposable
     public const int OutChannels = 2;
     public static readonly AVSampleFormat OutFormat = AVSampleFormat.Flt;
 
+    private double _playbackSpeed = 1.0;
+    // 再生速度を変更すると SWR コンテキストを再初期化して有効出力レートを調整する
+    // speed 2.0 → effectiveOutRate = 22050 → 1 source秒あたり半数サンプル → WASAPI が 0.5 秒で消費 → 2x 速再生
+    public double PlaybackSpeed
+    {
+        get => _playbackSpeed;
+        set
+        {
+            double clamped = Math.Clamp(value, 0.1, 4.0);
+            if (_playbackSpeed == clamped) return;
+            _playbackSpeed = clamped;
+            if (_swrCtx != null) { SwrContext* s = _swrCtx; swr_free(&s); _swrCtx = null; }
+        }
+    }
+
     public AudioDecoder(AVStream* stream)
     {
         StreamIndex = stream->index;
@@ -98,9 +113,12 @@ public unsafe class AudioDecoder : IDisposable
         av_channel_layout_default(&outLayout, OutChannels);
         AVChannelLayout inLayout = frame->ch_layout;
 
+        // effectiveOutRate = OutSampleRate / speed で SWR に出力密度を伝える
+        // → WASAPI は OutSampleRate で消費するので speed 倍の速度で再生される
+        int effectiveOutRate = (int)(OutSampleRate / _playbackSpeed);
         SwrContext* ctx = null;
         swr_alloc_set_opts2(&ctx,
-            &outLayout, OutFormat, OutSampleRate,
+            &outLayout, OutFormat, effectiveOutRate,
             &inLayout, (AVSampleFormat)frame->format, frame->sample_rate,
             0, null);
         swr_init(ctx);

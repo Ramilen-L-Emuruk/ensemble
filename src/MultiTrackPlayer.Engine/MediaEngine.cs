@@ -221,7 +221,8 @@ public unsafe class MediaEngine : IMediaEngine
             _videoDecoder?.FlushBuffers();
             foreach (var d in _audioDecoders) d.FlushBuffers();
             foreach (var s in _audioStates) s.Buffer.ClearBuffer();
-            _mixer?.SetPlayedSamples((long)(position.TotalSeconds * AudioDecoder.OutSampleRate));
+            // 速度補正: masterClock = PlayedSamples / OutSampleRate * speed のため逆算
+            _mixer?.SetPlayedSamples((long)(position.TotalSeconds / _playbackSpeed * AudioDecoder.OutSampleRate));
             // シーク後もPTSオフセットは保持（最初のフレームで確定した相対オフセットは変わらない）
             _seekGraceFrames = SeekGraceFrameCount;
             _driftAverage.Reset();
@@ -229,7 +230,12 @@ public unsafe class MediaEngine : IMediaEngine
         }
     }
 
-    public void SetPlaybackSpeed(double speed) => _playbackSpeed = Math.Clamp(speed, 0.1, 2.0);
+    public void SetPlaybackSpeed(double speed)
+    {
+        _playbackSpeed = Math.Clamp(speed, 0.1, 4.0);
+        foreach (var d in _audioDecoders)
+            d.PlaybackSpeed = _playbackSpeed;
+    }
 
     public void StepForward()
     {
@@ -374,8 +380,10 @@ public unsafe class MediaEngine : IMediaEngine
                         _lastNormalizedPts = normalizedPts;
 
                         // PlayedSamples はWASAPIバッファへの書き込み数のため、実際の出力は _wasapiLatencySec 分遅れる
+                        // _playbackSpeed を乗算することでソースタイムライン上の現在位置を算出する
+                        // （例: 2x 速では PlayedSamples の増加が 2 倍遅いため、speed を掛けて補正）
                         double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate
-                                            - _wasapiLatencySec;
+                                            * _playbackSpeed - _wasapiLatencySec;
                         double diff = normalizedPts - masterClock;
                         _driftAverage.Update(diff);
                         ApplyDriftCorrection(_driftAverage.Get());
