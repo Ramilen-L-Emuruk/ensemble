@@ -22,10 +22,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private double _masterVolume = 80.0;
     [ObservableProperty] private string _title = "MultiTrackPlayer";
     [ObservableProperty] private bool _isFullscreen;
+    [ObservableProperty] private string _statusText = string.Empty;
 
     public MainViewModel()
     {
-        Engine.VideoFrameReady += (_, _) => { };
         Engine.PositionChanged += (_, pos) =>
         {
             Position = pos;
@@ -33,6 +33,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 PositionRatio = pos.TotalSeconds / Duration.TotalSeconds;
         };
         Engine.PlaybackEnded += (_, _) => OnPlaybackEnded();
+        Engine.StatisticsUpdated += (_, stats) =>
+        {
+            int total = stats.DroppedFrames + stats.DisplayedFrames;
+            double dropRate = total > 0 ? stats.DroppedFrames * 100.0 / total : 0.0;
+            StatusText = $"表示 {stats.DisplayedFrames} / ドロップ {stats.DroppedFrames} ({dropRate:F1}%)  映像遅延 {stats.VideoLagSec * 1000:F0}ms";
+        };
     }
 
     [ObservableProperty] private double _positionRatio;

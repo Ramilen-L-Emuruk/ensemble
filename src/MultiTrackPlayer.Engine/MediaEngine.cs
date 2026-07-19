@@ -34,10 +34,12 @@ public unsafe class MediaEngine : IMediaEngine
     private Thread? _demuxThreadHandle;
     private Thread? _videoDecodeThreadHandle;
     private Thread? _audioDecodeThreadHandle;
-    private Thread? _pacerThreadHandle;
-    private volatile bool _pacerStopRequested;
-    private VideoFrameData? _pendingFrame;
+    private Timer? _statusTimer;
     private volatile bool _playbackEndedFired;
+
+    // Paused 中に表示するフレーム（Step/Seek で更新）。Playing 中は使わず TryLeaseDue を直接使う
+    private VideoFrameLease? _heldLease;
+    private bool _heldFrameConsumed = true;
 
     // audio-master クロック: mixer が書いたサンプル軸のセグメントマップ + WASAPI 実位置の写像
     private readonly PlaybackClock _clock = new(AudioDecoder.OutSampleRate);
@@ -54,7 +56,6 @@ public unsafe class MediaEngine : IMediaEngine
     // フレームドロップ統計（100フレームごとに StatisticsUpdated イベントで通知）
     private int _droppedFrames;
     private int _displayedFrames;
-    private const int StatisticsIntervalFrames = 100;
 
     public MediaInfo? CurrentMedia => _currentMedia;
     public CorePlaybackState State => _state;
@@ -72,7 +73,6 @@ public unsafe class MediaEngine : IMediaEngine
     private double GetMasterClockSeconds()
         => _positionSource == null ? 0.0 : _clock.PositionAt(_positionSource.GetPositionFrames());
 
-    public event EventHandler<VideoFrameData>? VideoFrameReady;
     public event EventHandler<TimeSpan>? PositionChanged;
     public event EventHandler? PlaybackEnded;
     public event EventHandler<PlaybackStatistics>? StatisticsUpdated;
@@ -217,6 +217,7 @@ public unsafe class MediaEngine : IMediaEngine
         bool wasStopped = _state == CorePlaybackState.Stopped;
         _state = CorePlaybackState.Playing;
         _playbackEndedFired = false;
+        ReleaseHeldFrame();
         EnsurePipelineStarted();
         if (wasStopped)
             RequestAnchor(0.0);
@@ -232,6 +233,7 @@ public unsafe class MediaEngine : IMediaEngine
 
     public void Stop()
     {
+        ReleaseHeldFrame();
         TeardownPipeline();
         _state = CorePlaybackState.Stopped;
         _wasapiOut?.Stop();
@@ -246,8 +248,13 @@ public unsafe class MediaEngine : IMediaEngine
         if (_fmtCtx == null) return;
         _clock.BeginSeek(position.TotalSeconds);
         RequestAnchor(position.TotalSeconds);
+        ReleaseHeldFrame();
         _demuxThread?.RequestSeek(position.TotalSeconds);
         _playbackEndedFired = false;
+
+        // 一時停止中のシークは、着地後の最初のフレームを即座に1枚だけ表示する
+        if (_state == CorePlaybackState.Paused)
+            TryHoldNextFrame(TimeSpan.FromMilliseconds(500));
     }
 
     /// <summary>次に実音声が mixer へ書かれた瞬間、その書込カーソル位置を srcPts=target としてクロックを起点合わせする。</summary>
@@ -280,7 +287,8 @@ public unsafe class MediaEngine : IMediaEngine
     public void StepForward()
     {
         if (_state != CorePlaybackState.Paused) return;
-        _videoRing?.TakeOldest(TimeSpan.FromMilliseconds(500), EmitSteppedFrame);
+        ReleaseHeldFrame();
+        TryHoldNextFrame(TimeSpan.FromMilliseconds(500));
     }
 
     public void StepBackward()
@@ -288,17 +296,59 @@ public unsafe class MediaEngine : IMediaEngine
         if (_state != CorePlaybackState.Paused) return;
         var target = Position - TimeSpan.FromSeconds(_videoFrameDuration);
         if (target < TimeSpan.Zero) target = TimeSpan.Zero;
-        Seek(target);
-        _videoRing?.TakeOldest(TimeSpan.FromMilliseconds(500), EmitSteppedFrame);
+        Seek(target); // Paused 中なので Seek 内部で held フレームも更新される
     }
 
-    private void EmitSteppedFrame(IntPtr buffer, int width, int height, int stride, double ptsSeconds)
+    /// <summary>
+    /// 現在位置に表示すべき新しいフレームがあればリースして返す。Playing 中はクロック位置に対して
+    /// due なフレームをその場でリースする。Paused 中は Step/Seek で更新された保持フレームを一度だけ返す。
+    /// </summary>
+    public VideoFrameLease? TryGetFrame(TimeSpan position)
     {
-        var pixels = new byte[stride * height];
-        Marshal.Copy(buffer, pixels, 0, pixels.Length);
-        var frame = new VideoFrameData(pixels, width, height, TimeSpan.FromSeconds(ptsSeconds));
-        VideoFrameReady?.Invoke(this, frame);
-        PositionChanged?.Invoke(this, frame.Pts);
+        if (_videoRing == null) return null;
+
+        if (_state == CorePlaybackState.Playing)
+        {
+            bool got = _videoRing.TryLeaseDue(position.TotalSeconds, _videoFrameDuration, out var raw, out int dropped);
+            _droppedFrames += dropped;
+            if (!got) return null;
+
+            _displayedFrames++;
+            _lastVideoLagSec = raw.PtsSeconds - position.TotalSeconds;
+            return new VideoFrameLease(raw.SlotIndex, raw.Buffer, raw.Width, raw.Height, raw.Stride, TimeSpan.FromSeconds(raw.PtsSeconds));
+        }
+
+        if (_heldLease is { } held && !_heldFrameConsumed)
+        {
+            _heldFrameConsumed = true;
+            return held;
+        }
+        return null;
+    }
+
+    public void ReturnFrame(VideoFrameLease lease)
+    {
+        // Paused 中に保持しているフレームは Step/Seek/Play で明示的に入れ替えるまで手放さない
+        if (_state == CorePlaybackState.Playing)
+            _videoRing?.ReturnLease(lease.SlotIndex);
+    }
+
+    private void ReleaseHeldFrame()
+    {
+        if (_heldLease is { } held)
+            _videoRing?.ReturnLease(held.SlotIndex);
+        _heldLease = null;
+        _heldFrameConsumed = true;
+    }
+
+    private void TryHoldNextFrame(TimeSpan timeout)
+    {
+        if (_videoRing == null) return;
+        if (!_videoRing.TryLeaseOldest(timeout, out var raw)) return;
+
+        _heldLease = new VideoFrameLease(raw.SlotIndex, raw.Buffer, raw.Width, raw.Height, raw.Stride, TimeSpan.FromSeconds(raw.PtsSeconds));
+        _heldFrameConsumed = false;
+        PositionChanged?.Invoke(this, _heldLease.Pts);
     }
 
     public void SetTrackVolume(int trackNumber, float volume)
@@ -392,12 +442,11 @@ public unsafe class MediaEngine : IMediaEngine
             _mixer.OnRead = () => audioThread.Wake();
         }
 
-        _pacerStopRequested = false;
         _demuxThreadHandle = StartBackgroundThread(_demuxThread.Run);
         if (_videoDecodeThread != null)
             _videoDecodeThreadHandle = StartBackgroundThread(_videoDecodeThread.Run);
         _audioDecodeThreadHandle = StartBackgroundThread(_audioDecodeThread.Run);
-        _pacerThreadHandle = StartBackgroundThread(PacerLoop);
+        _statusTimer ??= new Timer(_ => StatusTick(), null, 100, 100);
     }
 
     private static Thread StartBackgroundThread(ThreadStart action)
@@ -418,7 +467,7 @@ public unsafe class MediaEngine : IMediaEngine
         _demuxThread?.RequestStop();
         _videoDecodeThread?.RequestStop();
         _audioDecodeThread?.RequestStop();
-        _pacerStopRequested = true;
+        _statusTimer?.Change(Timeout.Infinite, Timeout.Infinite);
 
         _videoQueue?.Close();
         _audioQueue?.Close();
@@ -428,11 +477,11 @@ public unsafe class MediaEngine : IMediaEngine
         _demuxThreadHandle?.Join(TimeSpan.FromSeconds(3));
         _videoDecodeThreadHandle?.Join(TimeSpan.FromSeconds(3));
         _audioDecodeThreadHandle?.Join(TimeSpan.FromSeconds(3));
-        _pacerThreadHandle?.Join(TimeSpan.FromSeconds(3));
 
         _videoQueue?.DrainAndDispose();
         _audioQueue?.DrainAndDispose();
         _videoRing?.Dispose();
+        _statusTimer?.Dispose();
 
         _demuxThread = null;
         _videoDecodeThread = null;
@@ -443,53 +492,20 @@ public unsafe class MediaEngine : IMediaEngine
         _demuxThreadHandle = null;
         _videoDecodeThreadHandle = null;
         _audioDecodeThreadHandle = null;
-        _pacerThreadHandle = null;
+        _statusTimer = null;
     }
 
-    // ── 暫定ペーサー（P5 で CompositionTarget.Rendering によるプル駆動へ置換）──
+    // ── ステータス通知（100ms 周期。映像フレーム配送は UI 側の CompositionTarget.Rendering がプルする）──
 
     private double _lastVideoLagSec;
 
-    private void PacerLoop()
+    private void StatusTick()
     {
-        while (!_pacerStopRequested)
-        {
-            if (_state == CorePlaybackState.Playing)
-                PumpOneTick();
+        if (_state == CorePlaybackState.Playing || _state == CorePlaybackState.Paused)
+            PositionChanged?.Invoke(this, Position);
 
-            CheckPlaybackEnded();
-            Thread.Sleep(4);
-        }
-    }
-
-    private void PumpOneTick()
-    {
-        if (_videoRing == null) return;
-
-        double masterClock = GetMasterClockSeconds();
-
-        bool got = _videoRing.TryConsumeDue(masterClock, _videoFrameDuration, (buf, w, h, stride, pts) =>
-        {
-            var pixels = new byte[stride * h];
-            Marshal.Copy(buf, pixels, 0, pixels.Length);
-            _pendingFrame = new VideoFrameData(pixels, w, h, TimeSpan.FromSeconds(pts));
-        }, out int dropped);
-
-        _droppedFrames += dropped;
-
-        if (got && _pendingFrame != null)
-        {
-            var frame = _pendingFrame;
-            _lastVideoLagSec = frame.Pts.TotalSeconds - masterClock;
-
-            _displayedFrames++;
-            VideoFrameReady?.Invoke(this, frame);
-            PositionChanged?.Invoke(this, frame.Pts);
-        }
-
-        int total = _displayedFrames + _droppedFrames;
-        if (total > 0 && total % StatisticsIntervalFrames == 0)
-            StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _lastVideoLagSec));
+        StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _lastVideoLagSec));
+        CheckPlaybackEnded();
     }
 
     private void CheckPlaybackEnded()

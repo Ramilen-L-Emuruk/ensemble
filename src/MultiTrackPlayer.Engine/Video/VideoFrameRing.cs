@@ -2,18 +2,37 @@ using System.Runtime.InteropServices;
 
 namespace MultiTrackPlayer.Engine.Video;
 
+/// <summary>リースされたフレームの生データ（エンジン内部用）。</summary>
+public readonly struct RingFrame
+{
+    public int SlotIndex { get; }
+    public IntPtr Buffer { get; }
+    public int Width { get; }
+    public int Height { get; }
+    public int Stride { get; }
+    public double PtsSeconds { get; }
+
+    public RingFrame(int slotIndex, IntPtr buffer, int width, int height, int stride, double ptsSeconds)
+    {
+        SlotIndex = slotIndex;
+        Buffer = buffer;
+        Width = width;
+        Height = height;
+        Stride = stride;
+        PtsSeconds = ptsSeconds;
+    }
+}
+
 /// <summary>
 /// GPU→CPU 転送後の BGRA フレームを保持するネイティブメモリの固定長リング。
-/// VideoDecodeThread（producer）が Free スロットへ書き込み、pacer/UI（consumer）が
-/// due なフレームを取り出す。毎フレームの byte[] 確保を避けるためスロットのバッファは使い回す。
+/// VideoDecodeThread（producer）が Free スロットへ書き込み、呼び出し側（consumer）が
+/// due なフレームをリースして直接読み取り、読み終えたら ReturnLease で返す（プル型・ゼロコピー）。
 /// </summary>
 public sealed class VideoFrameRing : IDisposable
 {
-    public delegate void FrameCopyCallback(IntPtr buffer, int width, int height, int stride, double ptsSeconds);
-
     private const int SlotCount = 4;
 
-    private enum SlotState { Free, Writing, Ready }
+    private enum SlotState { Free, Writing, Ready, Leased }
 
     private sealed class Slot
     {
@@ -22,6 +41,7 @@ public sealed class VideoFrameRing : IDisposable
         public int Capacity;
         public int Width, Height, Stride;
         public double PtsSeconds;
+        public bool PendingFreeOnReturn;
     }
 
     private readonly Slot[] _slots;
@@ -85,10 +105,10 @@ public sealed class VideoFrameRing : IDisposable
     }
 
     /// <summary>
-    /// クロック位置に対して due な最新フレームを1枚取り出す。選ばれなかった古い Ready は破棄され
-    /// droppedCount に計上される。何も due でなければ false（呼び出し側は次回ティックで再試行）。
+    /// クロック位置に対して due な最新フレームを1枚リースする。選ばれなかった古い Ready は破棄され
+    /// droppedCount に計上される。何も due でなければ false。呼び出し側は読み終えたら必ず ReturnLease すること。
     /// </summary>
-    public bool TryConsumeDue(double clockPositionSeconds, double frameDurationSeconds, FrameCopyCallback copy, out int droppedCount)
+    public bool TryLeaseDue(double clockPositionSeconds, double frameDurationSeconds, out RingFrame frame, out int droppedCount)
     {
         lock (_lock)
         {
@@ -101,7 +121,10 @@ public sealed class VideoFrameRing : IDisposable
             var selection = FrameSelector.SelectDue(candidates, clockPositionSeconds, frameDurationSeconds);
             droppedCount = selection.DroppedCount;
             if (selection.SlotIndex is not int chosen)
+            {
+                frame = default;
                 return false;
+            }
 
             double chosenPts = _slots[chosen].PtsSeconds;
             foreach (var c in candidates)
@@ -109,15 +132,14 @@ public sealed class VideoFrameRing : IDisposable
                     _slots[c.SlotIndex].State = SlotState.Free;
 
             var slot = _slots[chosen];
-            copy(slot.Buffer, slot.Width, slot.Height, slot.Stride, slot.PtsSeconds);
-            slot.State = SlotState.Free;
-            Monitor.PulseAll(_lock);
+            slot.State = SlotState.Leased;
+            frame = new RingFrame(chosen, slot.Buffer, slot.Width, slot.Height, slot.Stride, slot.PtsSeconds);
             return true;
         }
     }
 
-    /// <summary>最も古い Ready フレームを1枚取り出す（クロック非依存。StepForward 用）。timeout 内に無ければ false。</summary>
-    public bool TakeOldest(TimeSpan timeout, FrameCopyCallback copy)
+    /// <summary>最も古い Ready フレームを1枚リースする（クロック非依存。Step 用）。timeout 内に無ければ false。</summary>
+    public bool TryLeaseOldest(TimeSpan timeout, out RingFrame frame)
     {
         lock (_lock)
         {
@@ -126,26 +148,49 @@ public sealed class VideoFrameRing : IDisposable
             while ((chosen = FindOldestReadyLocked()) < 0 && !_closed)
             {
                 var remaining = deadline - DateTime.UtcNow;
-                if (remaining <= TimeSpan.Zero) return false;
+                if (remaining <= TimeSpan.Zero) { frame = default; return false; }
                 Monitor.Wait(_lock, remaining);
             }
-            if (chosen < 0) return false;
+            if (chosen < 0) { frame = default; return false; }
 
             var slot = _slots[chosen];
-            copy(slot.Buffer, slot.Width, slot.Height, slot.Stride, slot.PtsSeconds);
-            slot.State = SlotState.Free;
-            Monitor.PulseAll(_lock);
+            slot.State = SlotState.Leased;
+            frame = new RingFrame(chosen, slot.Buffer, slot.Width, slot.Height, slot.Stride, slot.PtsSeconds);
             return true;
         }
     }
 
-    /// <summary>シーク時: Writing/Ready を全て Free に戻し、EOF 状態も解除する。</summary>
+    /// <summary>リース中のスロットを Free に戻す。Close 済みで PendingFreeOnReturn なら、ここでネイティブバッファも解放する。</summary>
+    public void ReturnLease(int slotIndex)
+    {
+        lock (_lock)
+        {
+            var slot = _slots[slotIndex];
+            if (slot.State != SlotState.Leased) return;
+
+            if (slot.PendingFreeOnReturn)
+            {
+                if (slot.Buffer != IntPtr.Zero) Marshal.FreeHGlobal(slot.Buffer);
+                slot.Buffer = IntPtr.Zero;
+                slot.Capacity = 0;
+                slot.PendingFreeOnReturn = false;
+            }
+            slot.State = SlotState.Free;
+            Monitor.PulseAll(_lock);
+        }
+    }
+
+    /// <summary>
+    /// シーク時: Writing/Ready を Free に戻し、EOF 状態も解除する。
+    /// Leased スロットは呼び出し側（UI が保持中の一時停止フレーム等）がまだ参照している可能性があるため触らない。
+    /// </summary>
     public void Flush()
     {
         lock (_lock)
         {
             foreach (var slot in _slots)
-                if (slot.State != SlotState.Free) slot.State = SlotState.Free;
+                if (slot.State == SlotState.Writing || slot.State == SlotState.Ready)
+                    slot.State = SlotState.Free;
             _eofMarked = false;
             Monitor.PulseAll(_lock);
         }
@@ -157,7 +202,7 @@ public sealed class VideoFrameRing : IDisposable
         lock (_lock) { _eofMarked = true; Monitor.PulseAll(_lock); }
     }
 
-    /// <summary>EOF 済みかつ表示待ちフレームが残っていない（再生完了検出に使う）。</summary>
+    /// <summary>EOF 済みかつ表示待ち・リース中のフレームが残っていない（再生完了検出に使う）。</summary>
     public bool IsEofDrained
     {
         get { lock (_lock) return _eofMarked && AllFreeLocked(); }
@@ -202,6 +247,10 @@ public sealed class VideoFrameRing : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Close 後に解放する。Leased 中のスロットは UI がまだ参照している可能性があるため即座には解放せず、
+    /// PendingFreeOnReturn を立てて ReturnLease 時に解放する。
+    /// </summary>
     public void Dispose()
     {
         Close();
@@ -209,6 +258,11 @@ public sealed class VideoFrameRing : IDisposable
         {
             foreach (var slot in _slots)
             {
+                if (slot.State == SlotState.Leased)
+                {
+                    slot.PendingFreeOnReturn = true;
+                    continue;
+                }
                 if (slot.Buffer != IntPtr.Zero) Marshal.FreeHGlobal(slot.Buffer);
                 slot.Buffer = IntPtr.Zero;
                 slot.Capacity = 0;

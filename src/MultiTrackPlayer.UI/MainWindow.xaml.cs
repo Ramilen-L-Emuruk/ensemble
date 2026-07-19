@@ -4,7 +4,6 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Microsoft.Win32;
 using MultiTrackPlayer.Core.Enums;
-using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.UI.Settings;
 using MultiTrackPlayer.UI.ViewModels;
 using MultiTrackPlayer.UI.Windows;
@@ -19,6 +18,7 @@ public partial class MainWindow : Window
     private PlaylistWindow? _playlistWindow;
     private ChapterWindow? _chapterWindow;
     private WriteableBitmap? _bitmap;
+    private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
     private WindowState _prevWindowState;
     private WindowStyle _prevWindowStyle;
 
@@ -28,22 +28,37 @@ public partial class MainWindow : Window
         DataContext = _vm;
         _kb.Load();
 
-        _vm.Engine.VideoFrameReady += Engine_VideoFrameReady;
         _vm.Engine.PositionChanged += (_, _) => UpdateSeekBarChapters();
 
         SeekBar.Seeking += (_, ratio) =>
             _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
+
+        CompositionTarget.Rendering += OnRendering;
     }
 
-    private void Engine_VideoFrameReady(object? sender, VideoFrameData frame)
+    // 映像フレームをエンジンからプルする。VideoFrameLease は byte[] を経由せず
+    // ネイティブバッファから直接 WritePixels するため、毎フレームの確保が発生しない。
+    private void OnRendering(object? sender, EventArgs e)
     {
-        Dispatcher.BeginInvoke(() =>
+        var lease = _vm.Engine.TryGetFrame(_vm.Engine.Position);
+        if (lease == null) return;
+
+        if (lease.Pts == _lastRenderedPts)
         {
-            if (_bitmap is null || _bitmap.PixelWidth != frame.Width || _bitmap.PixelHeight != frame.Height)
-                _bitmap = new WriteableBitmap(frame.Width, frame.Height, 96, 96, PixelFormats.Bgra32, null);
-            _bitmap.WritePixels(new Int32Rect(0, 0, frame.Width, frame.Height), frame.Pixels, frame.Width * 4, 0);
-            VideoImage.Source = _bitmap;
-        });
+            _vm.Engine.ReturnFrame(lease);
+            return;
+        }
+
+        if (_bitmap is null || _bitmap.PixelWidth != lease.Width || _bitmap.PixelHeight != lease.Height)
+            _bitmap = new WriteableBitmap(lease.Width, lease.Height, 96, 96, PixelFormats.Bgra32, null);
+
+        _bitmap.WritePixels(
+            new Int32Rect(0, 0, lease.Width, lease.Height),
+            lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
+        VideoImage.Source = _bitmap;
+        _lastRenderedPts = lease.Pts;
+
+        _vm.Engine.ReturnFrame(lease);
     }
 
     private void UpdateSeekBarChapters()
@@ -190,6 +205,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        CompositionTarget.Rendering -= OnRendering;
         _vm.Dispose();
         base.OnClosed(e);
     }
