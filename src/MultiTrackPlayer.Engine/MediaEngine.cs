@@ -246,10 +246,17 @@ public unsafe class MediaEngine : IMediaEngine
     public void Seek(TimeSpan position)
     {
         if (_fmtCtx == null) return;
-        _clock.BeginSeek(position.TotalSeconds);
-        RequestAnchor(position.TotalSeconds);
+
+        // 目標を [0, duration) にクランプ（スキップ連打で負値や duration 超えの目標が来る）
+        double durationSec = _currentMedia?.Duration.TotalSeconds ?? 0.0;
+        double target = Math.Clamp(position.TotalSeconds, 0.0, Math.Max(0.0, durationSec - 0.1));
+
+        _clock.BeginSeek(target);
         ReleaseHeldFrame();
-        _demuxThread?.RequestSeek(position.TotalSeconds);
+        // ミキサーに残る旧位置の音声を即座に破棄する（シーク中に古い音が鳴り続けるのを防ぐ）。
+        // クロックの錨は AudioDecodeThread が新サンプルを投入する瞬間に要求される（早期消費バグの根治）
+        foreach (var s in _audioStates) s.Buffer.ClearBuffer();
+        _demuxThread?.RequestSeek(target);
         _playbackEndedFired = false;
 
         // 一時停止中のシークは、着地後の最初のフレームを即座に1枚だけ表示する
@@ -434,7 +441,8 @@ public unsafe class MediaEngine : IMediaEngine
                 () => _demuxThread!.PtsSyncOffset, _videoFrameDuration);
 
         _audioDecodeThread = new AudioDecodeThread(
-            _audioDecoders, _audioStates, _audioQueue, () => _demuxThread!.PtsSyncOffset);
+            _audioDecoders, _audioStates, _audioQueue, () => _demuxThread!.PtsSyncOffset,
+            onFirstSamplesAfterFlush: RequestAnchor);
 
         if (_mixer != null)
         {

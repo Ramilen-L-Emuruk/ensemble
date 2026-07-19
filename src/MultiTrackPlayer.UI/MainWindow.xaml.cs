@@ -34,6 +34,16 @@ public partial class MainWindow : Window
             _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
 
         CompositionTarget.Rendering += OnRendering;
+
+        // コマンドライン引数で渡された動画ファイルを起動時に開く
+        Loaded += (_, _) =>
+        {
+            var files = App.StartupArgs.Where(System.IO.File.Exists).ToArray();
+            if (files.Length == 0) return;
+            _vm.Playlist.AddFiles(files);
+            _vm.OpenFile(files[0]);
+            UpdateSeekBarChapters();
+        };
     }
 
     // 映像フレームをエンジンからプルする。VideoFrameLease は byte[] を経由せず
