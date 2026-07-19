@@ -18,6 +18,9 @@ public class MultiTrackMixer : IWaveProvider
     public long PlayedSamples => Interlocked.Read(ref _playedSamples);
     public void SetPlayedSamples(long value) => Interlocked.Exchange(ref _playedSamples, value);
 
+    /// <summary>Read() 完了ごとに呼ばれる。AudioDecodeThread の充填ゲート待ちを起こすためのフック。</summary>
+    public Action? OnRead;
+
     public MultiTrackMixer()
     {
         _format = WaveFormat.CreateIeeeFloatWaveFormat(
@@ -43,6 +46,7 @@ public class MultiTrackMixer : IWaveProvider
         // P4 で PlaybackClock の OnAudioWritten/OnSilenceWritten に置き換わり次第削除する。
         Interlocked.Add(ref _playedSamples, count / sizeof(float) / _format.Channels);
 
+        OnRead?.Invoke();
         return count;
     }
 

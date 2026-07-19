@@ -3,7 +3,9 @@ using MultiTrackPlayer.Core.Interfaces;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Audio;
 using MultiTrackPlayer.Engine.Decoding;
+using MultiTrackPlayer.Engine.Pipeline;
 using MultiTrackPlayer.Engine.Sync;
+using MultiTrackPlayer.Engine.Video;
 using NAudio.Wave;
 using Sdcb.FFmpeg.Raw;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
@@ -18,31 +20,36 @@ public unsafe class MediaEngine : IMediaEngine
     private VideoDecoder? _videoDecoder;
     private readonly List<AudioDecoder> _audioDecoders = new();
     private readonly List<AudioTrackState> _audioStates = new();
+    private readonly Dictionary<int, int> _audioStreamToTrack = new();
     private MultiTrackMixer? _mixer;
     private WasapiOut? _wasapiOut;
 
-    private Thread? _decodeThread;
-    private CancellationTokenSource? _cts;
-    private readonly object _seekLock = new();
+    // ffplay 型パイプライン: demux/デコードは各専用スレッドが担当し、AVFormatContext は DemuxThread が唯一専有する
+    private VideoPacketQueue? _videoQueue;
+    private AudioPacketQueue? _audioQueue;
+    private VideoFrameRing? _videoRing;
+    private DemuxThread? _demuxThread;
+    private VideoDecodeThread? _videoDecodeThread;
+    private AudioDecodeThread? _audioDecodeThread;
+    private Thread? _demuxThreadHandle;
+    private Thread? _videoDecodeThreadHandle;
+    private Thread? _audioDecodeThreadHandle;
+    private Thread? _pacerThreadHandle;
+    private volatile bool _pacerStopRequested;
+    private VideoFrameData? _pendingFrame;
+    private volatile bool _playbackEndedFired;
+    private int _driftResetPending;
 
     private MediaInfo? _currentMedia;
     private CorePlaybackState _state = CorePlaybackState.Stopped;
     private double _playbackSpeed = 1.0;
     private List<ChapterInfo> _chapters = new();
-    // 最初のビデオフレームのPTSを基準として正規化（OBS Replay Bufferなど大きなPTSに対応）
-    private double _ptsSyncOffset = double.NaN;
     // WASAPI 出力バッファ遅延（秒）: Init() 後に取得し masterClock から引いて実出力タイミングに補正
     private double _wasapiLatencySec;
-    // 映像の1フレーム時間（秒）: フレームドロップ閾値の動的計算に使用
+    // 映像の1フレーム時間（秒）: due 判定・プリロール猶予・フレームドロップ閾値に使用
     private double _videoFrameDuration = 1.0 / 30.0;
-    // ドリフト移動平均（VLC average_t range=10 相当）: 瞬間ドリフトを平滑化して補正判定に使用
+    // ドリフト移動平均（VLC average_t range=10 相当）: 瞬間ドリフトを平滑化して補正判定に使用。P4 で PlaybackClock 化に伴い削除予定
     private readonly DriftAverage _driftAverage = new(range: 10);
-    // 直前フレームの正規化PTS: 不連続検出に使用（VLC CR_MAX_GAP = 300ms 相当）
-    private double _lastNormalizedPts = double.NaN;
-    private const double DiscontinuityThresholdSec = 0.3;
-    // シーク後グレース期間: シーク直後の数フレームはドロップ判定をスキップ（VLC プリロール相当）
-    private int _seekGraceFrames;
-    private const int SeekGraceFrameCount = 5;
     // フレームドロップ統計（100フレームごとに StatisticsUpdated イベントで通知）
     private int _droppedFrames;
     private int _displayedFrames;
@@ -70,7 +77,6 @@ public unsafe class MediaEngine : IMediaEngine
     {
         Stop();
         DisposeDecoders();
-        _ptsSyncOffset = double.NaN;
 
         fixed (AVFormatContext** fmtCtxPtr = &_fmtCtx)
         {
@@ -96,6 +102,7 @@ public unsafe class MediaEngine : IMediaEngine
             {
                 var decoder = new AudioDecoder(stream);
                 _audioDecoders.Add(decoder);
+                _audioStreamToTrack[stream->index] = _audioDecoders.Count - 1;
 
                 var langTag = av_dict_get(stream->metadata, "language", null, 0);
                 string lang = langTag != null ? Marshal.PtrToStringUTF8((IntPtr)langTag->value) ?? string.Empty : "";
@@ -181,7 +188,7 @@ public unsafe class MediaEngine : IMediaEngine
             _mixer.AddTrack(state);
         }
         // WasapiOut の要求レイテンシ。この値が masterClock 補正にも使われるため一か所で定義する
-        int wasapiLatencyMs = 200;
+        int wasapiLatencyMs = 100;
         _wasapiOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, wasapiLatencyMs);
         _wasapiOut.Init(_mixer);
         _wasapiLatencySec = wasapiLatencyMs / 1000.0;
@@ -192,13 +199,9 @@ public unsafe class MediaEngine : IMediaEngine
         if (_fmtCtx == null) return;
         if (_state == CorePlaybackState.Playing) return;
         _state = CorePlaybackState.Playing;
+        _playbackEndedFired = false;
+        EnsurePipelineStarted();
         _wasapiOut?.Play();
-        if (_decodeThread == null || !_decodeThread.IsAlive)
-        {
-            _cts = new CancellationTokenSource();
-            _decodeThread = new Thread(() => DecodeLoop(_cts.Token)) { IsBackground = true };
-            _decodeThread.Start();
-        }
     }
 
     public void Pause()
@@ -210,29 +213,22 @@ public unsafe class MediaEngine : IMediaEngine
 
     public void Stop()
     {
-        _cts?.Cancel();
+        TeardownPipeline();
         _state = CorePlaybackState.Stopped;
         _wasapiOut?.Stop();
         foreach (var s in _audioStates) s.Buffer.ClearBuffer();
+        _driftAverage.Reset();
+        _playbackEndedFired = false;
     }
 
     public void Seek(TimeSpan position)
     {
         if (_fmtCtx == null) return;
-        lock (_seekLock)
-        {
-            long ts = (long)(position.TotalSeconds * AV_TIME_BASE);
-            av_seek_frame(_fmtCtx, -1, ts, (int)AVSEEK_FLAG.Backward);
-            _videoDecoder?.FlushBuffers();
-            foreach (var d in _audioDecoders) d.FlushBuffers();
-            foreach (var s in _audioStates) s.Buffer.ClearBuffer();
-            // 速度補正: masterClock = PlayedSamples / OutSampleRate * speed のため逆算
-            _mixer?.SetPlayedSamples((long)(position.TotalSeconds / _playbackSpeed * AudioDecoder.OutSampleRate));
-            // シーク後もPTSオフセットは保持（最初のフレームで確定した相対オフセットは変わらない）
-            _seekGraceFrames = SeekGraceFrameCount;
-            _driftAverage.Reset();
-            _lastNormalizedPts = double.NaN;
-        }
+        _demuxThread?.RequestSeek(position.TotalSeconds);
+        // 速度補正: masterClock = PlayedSamples / OutSampleRate * speed のため逆算（旧クロック。P4 で置換）
+        _mixer?.SetPlayedSamples((long)(position.TotalSeconds / _playbackSpeed * AudioDecoder.OutSampleRate));
+        Interlocked.Exchange(ref _driftResetPending, 1);
+        _playbackEndedFired = false;
     }
 
     public void SetPlaybackSpeed(double speed)
@@ -245,35 +241,25 @@ public unsafe class MediaEngine : IMediaEngine
     public void StepForward()
     {
         if (_state != CorePlaybackState.Paused) return;
-        var frame = DecodeOneVideoFrame();
-        if (frame != null) VideoFrameReady?.Invoke(this, frame);
+        _videoRing?.TakeOldest(TimeSpan.FromMilliseconds(500), EmitSteppedFrame);
     }
 
     public void StepBackward()
     {
         if (_state != CorePlaybackState.Paused) return;
-        var target = Position - TimeSpan.FromMilliseconds(40);
+        var target = Position - TimeSpan.FromSeconds(_videoFrameDuration);
         if (target < TimeSpan.Zero) target = TimeSpan.Zero;
         Seek(target);
-        var frame = DecodeOneVideoFrame();
-        if (frame != null) VideoFrameReady?.Invoke(this, frame);
+        _videoRing?.TakeOldest(TimeSpan.FromMilliseconds(500), EmitSteppedFrame);
     }
 
-    private VideoFrameData? DecodeOneVideoFrame()
+    private void EmitSteppedFrame(IntPtr buffer, int width, int height, int stride, double ptsSeconds)
     {
-        if (_fmtCtx == null || _videoDecoder == null) return null;
-        using var pkt = new PacketHolder();
-        while (av_read_frame(_fmtCtx, pkt.Packet) >= 0)
-        {
-            if (pkt.Packet->stream_index == _videoDecoder.StreamIndex)
-            {
-                var frame = _videoDecoder.DecodePacket(pkt.Packet);
-                av_packet_unref(pkt.Packet);
-                if (frame != null) return frame;
-            }
-            av_packet_unref(pkt.Packet);
-        }
-        return null;
+        var pixels = new byte[stride * height];
+        Marshal.Copy(buffer, pixels, 0, pixels.Length);
+        var frame = new VideoFrameData(pixels, width, height, TimeSpan.FromSeconds(ptsSeconds));
+        VideoFrameReady?.Invoke(this, frame);
+        PositionChanged?.Invoke(this, frame.Pts);
     }
 
     public void SetTrackVolume(int trackNumber, float volume)
@@ -335,143 +321,164 @@ public unsafe class MediaEngine : IMediaEngine
             c.IsUserDefined &&
             Math.Abs((c.StartTime - position).TotalSeconds) <= tolerance.TotalSeconds);
 
-    private void DecodeLoop(CancellationToken ct)
+    // ── パイプライン構築・分解 ──
+
+    private void EnsurePipelineStarted()
     {
+        if (_demuxThread != null) return; // 既に構築済み
         if (_fmtCtx == null) return;
-        using var pkt = new PacketHolder();
 
-        try
+        int videoStreamIndex = _videoDecoder?.StreamIndex ?? -1;
+        int trackCount = Math.Max(1, _audioDecoders.Count);
+
+        _videoQueue = new VideoPacketQueue(maxCount: 512, maxBytes: 40 * 1024 * 1024);
+        _audioQueue = new AudioPacketQueue(maxCount: 256 * trackCount, maxBytes: 4 * 1024 * 1024 * trackCount);
+        _videoRing = new VideoFrameRing();
+
+        _demuxThread = new DemuxThread(
+            _fmtCtx, videoStreamIndex, _audioStreamToTrack,
+            _videoQueue, _audioQueue, PublishSeekTarget);
+
+        if (_videoDecoder != null)
+            _videoDecodeThread = new VideoDecodeThread(
+                _videoDecoder, _videoQueue, _videoRing,
+                () => _demuxThread!.PtsSyncOffset, _videoFrameDuration);
+
+        _audioDecodeThread = new AudioDecodeThread(
+            _audioDecoders, _audioStates, _audioQueue, () => _demuxThread!.PtsSyncOffset);
+
+        if (_mixer != null)
         {
-            while (!ct.IsCancellationRequested)
-            {
-                if (_state == CorePlaybackState.Paused) { Thread.Sleep(10); continue; }
-
-                bool bufferFull = _audioStates.Count > 0 &&
-                                  _audioStates.Any(s => s.Buffer.BufferedDuration > TimeSpan.FromSeconds(1));
-                if (bufferFull) { Thread.Sleep(5); continue; }
-
-                lock (_seekLock) { }
-
-                int ret = av_read_frame(_fmtCtx, pkt.Packet);
-                if (ret < 0)
-                {
-                    Thread.Sleep(200);
-                    PlaybackEnded?.Invoke(this, EventArgs.Empty);
-                    return;
-                }
-
-                int idx = pkt.Packet->stream_index;
-
-                if (_videoDecoder != null && idx == _videoDecoder.StreamIndex)
-                {
-                    var frame = _videoDecoder.DecodePacket(pkt.Packet);
-                    if (frame != null)
-                    {
-                        double absFramePts = frame.Pts.TotalSeconds;
-
-                        // 初回フレームでPTSオフセットを確定（OBS Replay Bufferなど非ゼロ開始PTSに対応）
-                        if (double.IsNaN(_ptsSyncOffset))
-                            _ptsSyncOffset = absFramePts;
-
-                        double normalizedPts = absFramePts - _ptsSyncOffset;
-
-                        // 不連続検出: PTS が 300ms 以上ジャンプするか逆行した場合にバッファをフラッシュ（VLC CR_MAX_GAP 相当）
-                        if (!double.IsNaN(_lastNormalizedPts))
-                        {
-                            double ptsDiff = normalizedPts - _lastNormalizedPts;
-                            if (ptsDiff < 0 || ptsDiff > DiscontinuityThresholdSec)
-                                HandleDiscontinuity();
-                        }
-                        _lastNormalizedPts = normalizedPts;
-
-                        // PlayedSamples はWASAPIバッファへの書き込み数のため、実際の出力は _wasapiLatencySec 分遅れる
-                        // _playbackSpeed を乗算することでソースタイムライン上の現在位置を算出する
-                        // （例: 2x 速では PlayedSamples の増加が 2 倍遅いため、speed を掛けて補正）
-                        double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate
-                                            * _playbackSpeed - _wasapiLatencySec;
-                        double diff = normalizedPts - masterClock;
-                        _driftAverage.Update(diff);
-                        ApplyDriftCorrection(_driftAverage.Get());
-
-                        // シーク後グレース期間中はドロップ判定をスキップして即座に表示（VLC プリロール相当）
-                        if (_seekGraceFrames > 0)
-                        {
-                            _seekGraceFrames--;
-                            VideoFrameReady?.Invoke(this, frame);
-                            PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
-                            av_packet_unref(pkt.Packet);
-                            continue;
-                        }
-
-                        // 映像が音声より先行している場合は待つ（最大100ms）
-                        if (diff > 0.002)
-                            Thread.Sleep((int)(Math.Min(diff, 0.1) * 1000));
-
-                        // 映像が2フレーム以上遅れている場合はスキップして追いつかせる（VLC の VOUT_DISPLAY_LATE_THRESHOLD 相当）
-                        if (diff >= -_videoFrameDuration * 2)
-                        {
-                            _displayedFrames++;
-                            VideoFrameReady?.Invoke(this, frame);
-                            PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
-                        }
-                        else
-                        {
-                            _droppedFrames++;
-                        }
-
-                        int totalFrames = _displayedFrames + _droppedFrames;
-                        if (totalFrames > 0 && totalFrames % StatisticsIntervalFrames == 0)
-                            StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _driftAverage.Get()));
-                    }
-                }
-                else
-                {
-                    for (int i = 0; i < _audioDecoders.Count; i++)
-                    {
-                        if (_audioDecoders[i].StreamIndex == idx)
-                        {
-                            var pcm = _audioDecoders[i].DecodePacket(pkt.Packet);
-                            if (pcm != null)
-                            {
-                                var buf = _audioStates[i].Buffer;
-                                if (buf.BufferedDuration > buf.BufferDuration * 0.95)
-                                    System.Diagnostics.Debug.WriteLine($"[Audio] Track {i} buffer near overflow ({buf.BufferedDuration.TotalMilliseconds:F0}ms)");
-                                buf.AddSamples(pcm, 0, pcm.Length);
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                av_packet_unref(pkt.Packet);
-            }
+            var audioThread = _audioDecodeThread;
+            _mixer.OnRead = () => audioThread.Wake();
         }
-        catch (Exception)
+
+        _pacerStopRequested = false;
+        _demuxThreadHandle = StartBackgroundThread(_demuxThread.Run);
+        if (_videoDecodeThread != null)
+            _videoDecodeThreadHandle = StartBackgroundThread(_videoDecodeThread.Run);
+        _audioDecodeThreadHandle = StartBackgroundThread(_audioDecodeThread.Run);
+        _pacerThreadHandle = StartBackgroundThread(PacerLoop);
+    }
+
+    private static Thread StartBackgroundThread(ThreadStart action)
+    {
+        var thread = new Thread(action) { IsBackground = true };
+        thread.Start();
+        return thread;
+    }
+
+    private void PublishSeekTarget(double normalizedTargetSeconds)
+    {
+        _videoDecodeThread?.SetSeekTarget(normalizedTargetSeconds);
+        _audioDecodeThread?.SetSeekTarget(normalizedTargetSeconds);
+    }
+
+    private void TeardownPipeline()
+    {
+        _demuxThread?.RequestStop();
+        _videoDecodeThread?.RequestStop();
+        _audioDecodeThread?.RequestStop();
+        _pacerStopRequested = true;
+
+        _videoQueue?.Close();
+        _audioQueue?.Close();
+        _videoRing?.Close();
+        _audioDecodeThread?.Wake();
+
+        _demuxThreadHandle?.Join(TimeSpan.FromSeconds(3));
+        _videoDecodeThreadHandle?.Join(TimeSpan.FromSeconds(3));
+        _audioDecodeThreadHandle?.Join(TimeSpan.FromSeconds(3));
+        _pacerThreadHandle?.Join(TimeSpan.FromSeconds(3));
+
+        _videoQueue?.DrainAndDispose();
+        _audioQueue?.DrainAndDispose();
+        _videoRing?.Dispose();
+
+        _demuxThread = null;
+        _videoDecodeThread = null;
+        _audioDecodeThread = null;
+        _videoQueue = null;
+        _audioQueue = null;
+        _videoRing = null;
+        _demuxThreadHandle = null;
+        _videoDecodeThreadHandle = null;
+        _audioDecodeThreadHandle = null;
+        _pacerThreadHandle = null;
+    }
+
+    // ── 暫定ペーサー（P5 で CompositionTarget.Rendering によるプル駆動へ置換）──
+
+    private void PacerLoop()
+    {
+        while (!_pacerStopRequested)
         {
-            // デコードスレッドの例外でアプリがクラッシュしないよう捕捉
-            // （D3D11VAの失敗、ネイティブクラッシュなどへの安全網）
-        }
-        finally
-        {
-            _decodeThread = null;
+            if (Interlocked.Exchange(ref _driftResetPending, 0) == 1)
+                _driftAverage.Reset();
+
+            if (_state == CorePlaybackState.Playing)
+                PumpOneTick();
+
+            CheckPlaybackEnded();
+            Thread.Sleep(4);
         }
     }
 
-    private void HandleDiscontinuity()
+    private void PumpOneTick()
     {
-        _driftAverage.Reset();
+        if (_videoRing == null || _mixer == null) return;
+
+        double masterClock = (_mixer.PlayedSamples / (double)AudioDecoder.OutSampleRate)
+                            * _playbackSpeed - _wasapiLatencySec;
+
+        bool got = _videoRing.TryConsumeDue(masterClock, _videoFrameDuration, (buf, w, h, stride, pts) =>
+        {
+            var pixels = new byte[stride * h];
+            Marshal.Copy(buf, pixels, 0, pixels.Length);
+            _pendingFrame = new VideoFrameData(pixels, w, h, TimeSpan.FromSeconds(pts));
+        }, out int dropped);
+
+        _droppedFrames += dropped;
+
+        if (got && _pendingFrame != null)
+        {
+            var frame = _pendingFrame;
+            double diff = frame.Pts.TotalSeconds - masterClock;
+            _driftAverage.Update(diff);
+            ApplyDriftCorrection(_driftAverage.Get());
+
+            _displayedFrames++;
+            VideoFrameReady?.Invoke(this, frame);
+            PositionChanged?.Invoke(this, frame.Pts);
+        }
+
+        int total = _displayedFrames + _droppedFrames;
+        if (total > 0 && total % StatisticsIntervalFrames == 0)
+            StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _driftAverage.Get()));
+    }
+
+    private void CheckPlaybackEnded()
+    {
+        if (_playbackEndedFired) return;
+        if (_state != CorePlaybackState.Playing && _state != CorePlaybackState.Paused) return;
+        if (_demuxThread == null || !_demuxThread.EofReached) return;
+        if (_videoDecoder != null && (_videoRing == null || !_videoRing.IsEofDrained)) return;
         foreach (var s in _audioStates)
-            s.Buffer.ClearBuffer();
+            if (!s.IsEof || s.Buffer.BufferedBytes > 0) return;
+
+        _playbackEndedFired = true;
+        PlaybackEnded?.Invoke(this, EventArgs.Empty);
     }
 
     // VLC stream_HandleDrift / aout_FiltersAdjustResampling 相当
     // swr_set_compensation で微量のサンプル追加/削除を行い、音声クロックを映像に追従させる
+    // P4 で PlaybackClock（audio-master）へ置き換わり次第、ドリフト補正自体が不要になり削除予定
     private void ApplyDriftCorrection(double avgDriftSec)
     {
         const double kThreshold = 0.04;      // 40ms 超で補正開始
         const double kResetThreshold = 0.01; // 10ms 未満で補正終了
         const int kCompensationDistance = AudioDecoder.OutSampleRate / 2; // 500ms ウィンドウ
-        const int kCorrectionSamples = 44;   // ≈ 0.1% of OutSampleRate (≈1ms per 500ms)
+        const int kCorrectionSamples = 48;   // ≈ 0.1% of OutSampleRate (≈1ms per 500ms)
 
         if (Math.Abs(avgDriftSec) > kThreshold)
         {
@@ -492,6 +499,7 @@ public unsafe class MediaEngine : IMediaEngine
         foreach (var d in _audioDecoders) d.Dispose();
         _audioDecoders.Clear();
         _audioStates.Clear();
+        _audioStreamToTrack.Clear();
         _wasapiOut?.Dispose(); _wasapiOut = null;
         _mixer = null;
         if (_fmtCtx != null) { fixed (AVFormatContext** p = &_fmtCtx) avformat_close_input(p); }
@@ -499,10 +507,4 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     public void Dispose() { Stop(); DisposeDecoders(); }
-
-    private unsafe class PacketHolder : IDisposable
-    {
-        public AVPacket* Packet = av_packet_alloc();
-        public void Dispose() { if (Packet != null) { AVPacket* p = Packet; av_packet_free(&p); } Packet = null; }
-    }
 }
