@@ -33,4 +33,4 @@ public interface IMediaEngine : IDisposable
     event EventHandler<PlaybackStatistics>? StatisticsUpdated;
 }
 
-public record PlaybackStatistics(int DroppedFrames, int DisplayedFrames, double AverageDriftSec);
+public record PlaybackStatistics(int DroppedFrames, int DisplayedFrames, double VideoLagSec);

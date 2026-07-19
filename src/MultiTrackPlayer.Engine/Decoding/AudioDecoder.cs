@@ -118,19 +118,7 @@ public unsafe class AudioDecoder : IDisposable
         av_channel_layout_uninit(&outLayout);
     }
 
-    public void FlushBuffers()
-    {
-        avcodec_flush_buffers(_ctx);
-        if (_swrCtx != null)
-            swr_set_compensation(_swrCtx, 0, OutSampleRate); // フラッシュ時はドリフト補正をリセット
-    }
-
-    // VLC aout_FiltersAdjustResampling 相当。P4 で PlaybackClock に置き換わり次第削除予定。
-    public void SetDriftCompensation(int sampleDelta, int compensationDistance)
-    {
-        if (_swrCtx == null) return;
-        swr_set_compensation(_swrCtx, sampleDelta, compensationDistance);
-    }
+    public void FlushBuffers() => avcodec_flush_buffers(_ctx);
 
     public void Dispose()
     {

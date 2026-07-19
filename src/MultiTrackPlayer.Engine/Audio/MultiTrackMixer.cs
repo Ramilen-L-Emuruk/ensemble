@@ -9,15 +9,14 @@ public class MultiTrackMixer : IWaveProvider
     private readonly WaveFormat _format;
     private readonly int _blockAlign;
     private float _masterVolume = 1.0f;
-    private long _playedSamples;
     private byte[] _scratch = Array.Empty<byte>();
 
     public WaveFormat WaveFormat => _format;
 
-    // 旧クロック方式。P4 で PlaybackClock（IWavePosition ベース）に置き換えるまでの暫定併存。
-    public long PlayedSamples => Interlocked.Read(ref _playedSamples);
-    public void SetPlayedSamples(long value) => Interlocked.Exchange(ref _playedSamples, value);
-
+    /// <summary>実際に混合された音声のフレーム数（Read 完了ごと）。PlaybackClock.OnAudioWritten に配線する。</summary>
+    public Action<long>? OnAudioWritten;
+    /// <summary>無音で埋めたフレーム数（アンダーラン/バッファ待ち等）。PlaybackClock.OnSilenceWritten に配線する。</summary>
+    public Action<long>? OnSilenceWritten;
     /// <summary>Read() 完了ごとに呼ばれる。AudioDecodeThread の充填ゲート待ちを起こすためのフック。</summary>
     public Action? OnRead;
 
@@ -42,9 +41,10 @@ public class MultiTrackMixer : IWaveProvider
         if (common > 0)
             MixCommonBytes(common, outFloats);
 
-        // WASAPI へ書いたサンプル数（無音混入分も含め常に count 分進む＝旧クロックの既知の欠陥）。
-        // P4 で PlaybackClock の OnAudioWritten/OnSilenceWritten に置き換わり次第削除する。
-        Interlocked.Add(ref _playedSamples, count / sizeof(float) / _format.Channels);
+        long audioFrames = common / _blockAlign;
+        long silenceFrames = (count - common) / _blockAlign;
+        if (audioFrames > 0) OnAudioWritten?.Invoke(audioFrames);
+        if (silenceFrames > 0) OnSilenceWritten?.Invoke(silenceFrames);
 
         OnRead?.Invoke();
         return count;

@@ -38,18 +38,19 @@ public unsafe class MediaEngine : IMediaEngine
     private volatile bool _pacerStopRequested;
     private VideoFrameData? _pendingFrame;
     private volatile bool _playbackEndedFired;
-    private int _driftResetPending;
+
+    // audio-master クロック: mixer が書いたサンプル軸のセグメントマップ + WASAPI 実位置の写像
+    private readonly PlaybackClock _clock = new(AudioDecoder.OutSampleRate);
+    private IPlaybackPositionSource? _positionSource;
+    private double _pendingAnchorTarget;
+    private int _awaitingAnchor;
 
     private MediaInfo? _currentMedia;
     private CorePlaybackState _state = CorePlaybackState.Stopped;
     private double _playbackSpeed = 1.0;
     private List<ChapterInfo> _chapters = new();
-    // WASAPI 出力バッファ遅延（秒）: Init() 後に取得し masterClock から引いて実出力タイミングに補正
-    private double _wasapiLatencySec;
     // 映像の1フレーム時間（秒）: due 判定・プリロール猶予・フレームドロップ閾値に使用
     private double _videoFrameDuration = 1.0 / 30.0;
-    // ドリフト移動平均（VLC average_t range=10 相当）: 瞬間ドリフトを平滑化して補正判定に使用。P4 で PlaybackClock 化に伴い削除予定
-    private readonly DriftAverage _driftAverage = new(range: 10);
     // フレームドロップ統計（100フレームごとに StatisticsUpdated イベントで通知）
     private int _droppedFrames;
     private int _displayedFrames;
@@ -64,9 +65,12 @@ public unsafe class MediaEngine : IMediaEngine
         get
         {
             if (_wasapiOut == null) return TimeSpan.Zero;
-            return TimeSpan.FromSeconds((_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate);
+            return TimeSpan.FromSeconds(GetMasterClockSeconds());
         }
     }
+
+    private double GetMasterClockSeconds()
+        => _positionSource == null ? 0.0 : _clock.PositionAt(_positionSource.GetPositionFrames());
 
     public event EventHandler<VideoFrameData>? VideoFrameReady;
     public event EventHandler<TimeSpan>? PositionChanged;
@@ -187,20 +191,35 @@ public unsafe class MediaEngine : IMediaEngine
             _audioStates.Add(state);
             _mixer.AddTrack(state);
         }
-        // WasapiOut の要求レイテンシ。この値が masterClock 補正にも使われるため一か所で定義する
+
         int wasapiLatencyMs = 100;
         _wasapiOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, wasapiLatencyMs);
         _wasapiOut.Init(_mixer);
-        _wasapiLatencySec = wasapiLatencyMs / 1000.0;
+
+        _clock.Reset();
+        _positionSource = new WasapiPositionSource(
+            _wasapiOut, _wasapiOut.OutputWaveFormat, AudioDecoder.OutSampleRate,
+            () => _clock.WriteCursor, wasapiLatencyMs / 1000.0);
+
+        _mixer.OnAudioWritten = frames =>
+        {
+            if (Interlocked.Exchange(ref _awaitingAnchor, 0) == 1)
+                _clock.AnchorAt(_clock.WriteCursor, _pendingAnchorTarget);
+            _clock.OnAudioWritten(frames);
+        };
+        _mixer.OnSilenceWritten = frames => _clock.OnSilenceWritten(frames);
     }
 
     public void Play()
     {
         if (_fmtCtx == null) return;
         if (_state == CorePlaybackState.Playing) return;
+        bool wasStopped = _state == CorePlaybackState.Stopped;
         _state = CorePlaybackState.Playing;
         _playbackEndedFired = false;
         EnsurePipelineStarted();
+        if (wasStopped)
+            RequestAnchor(0.0);
         _wasapiOut?.Play();
     }
 
@@ -217,25 +236,45 @@ public unsafe class MediaEngine : IMediaEngine
         _state = CorePlaybackState.Stopped;
         _wasapiOut?.Stop();
         foreach (var s in _audioStates) s.Buffer.ClearBuffer();
-        _driftAverage.Reset();
+        _clock.Reset();
+        _positionSource?.Reset();
         _playbackEndedFired = false;
     }
 
     public void Seek(TimeSpan position)
     {
         if (_fmtCtx == null) return;
+        _clock.BeginSeek(position.TotalSeconds);
+        RequestAnchor(position.TotalSeconds);
         _demuxThread?.RequestSeek(position.TotalSeconds);
-        // 速度補正: masterClock = PlayedSamples / OutSampleRate * speed のため逆算（旧クロック。P4 で置換）
-        _mixer?.SetPlayedSamples((long)(position.TotalSeconds / _playbackSpeed * AudioDecoder.OutSampleRate));
-        Interlocked.Exchange(ref _driftResetPending, 1);
         _playbackEndedFired = false;
+    }
+
+    /// <summary>次に実音声が mixer へ書かれた瞬間、その書込カーソル位置を srcPts=target としてクロックを起点合わせする。</summary>
+    private void RequestAnchor(double targetSeconds)
+    {
+        _pendingAnchorTarget = targetSeconds;
+        Interlocked.Exchange(ref _awaitingAnchor, 1);
     }
 
     public void SetPlaybackSpeed(double speed)
     {
-        _playbackSpeed = Math.Clamp(speed, 0.1, 4.0);
+        double clamped = Math.Clamp(speed, 0.1, 4.0);
+        _playbackSpeed = clamped;
         foreach (var d in _audioDecoders)
-            d.PlaybackSpeed = _playbackSpeed;
+            d.PlaybackSpeed = clamped;
+
+        // 境界 = 現在の書込カーソル + バッファ残量。バッファ内の旧速度 PCM が掃けた地点から新レートを適用する
+        long boundary = _clock.WriteCursor + EstimateBufferedFramesAheadOfCursor();
+        _clock.SetSpeedAt(boundary, clamped);
+    }
+
+    private long EstimateBufferedFramesAheadOfCursor()
+    {
+        if (_audioStates.Count == 0 || _mixer == null) return 0;
+        int blockAlign = _mixer.WaveFormat.BlockAlign;
+        int maxBufferedBytes = _audioStates.Max(s => s.Buffer.BufferedBytes);
+        return maxBufferedBytes / blockAlign;
     }
 
     public void StepForward()
@@ -409,13 +448,12 @@ public unsafe class MediaEngine : IMediaEngine
 
     // ── 暫定ペーサー（P5 で CompositionTarget.Rendering によるプル駆動へ置換）──
 
+    private double _lastVideoLagSec;
+
     private void PacerLoop()
     {
         while (!_pacerStopRequested)
         {
-            if (Interlocked.Exchange(ref _driftResetPending, 0) == 1)
-                _driftAverage.Reset();
-
             if (_state == CorePlaybackState.Playing)
                 PumpOneTick();
 
@@ -426,10 +464,9 @@ public unsafe class MediaEngine : IMediaEngine
 
     private void PumpOneTick()
     {
-        if (_videoRing == null || _mixer == null) return;
+        if (_videoRing == null) return;
 
-        double masterClock = (_mixer.PlayedSamples / (double)AudioDecoder.OutSampleRate)
-                            * _playbackSpeed - _wasapiLatencySec;
+        double masterClock = GetMasterClockSeconds();
 
         bool got = _videoRing.TryConsumeDue(masterClock, _videoFrameDuration, (buf, w, h, stride, pts) =>
         {
@@ -443,9 +480,7 @@ public unsafe class MediaEngine : IMediaEngine
         if (got && _pendingFrame != null)
         {
             var frame = _pendingFrame;
-            double diff = frame.Pts.TotalSeconds - masterClock;
-            _driftAverage.Update(diff);
-            ApplyDriftCorrection(_driftAverage.Get());
+            _lastVideoLagSec = frame.Pts.TotalSeconds - masterClock;
 
             _displayedFrames++;
             VideoFrameReady?.Invoke(this, frame);
@@ -454,7 +489,7 @@ public unsafe class MediaEngine : IMediaEngine
 
         int total = _displayedFrames + _droppedFrames;
         if (total > 0 && total % StatisticsIntervalFrames == 0)
-            StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _driftAverage.Get()));
+            StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _lastVideoLagSec));
     }
 
     private void CheckPlaybackEnded()
@@ -470,29 +505,6 @@ public unsafe class MediaEngine : IMediaEngine
         PlaybackEnded?.Invoke(this, EventArgs.Empty);
     }
 
-    // VLC stream_HandleDrift / aout_FiltersAdjustResampling 相当
-    // swr_set_compensation で微量のサンプル追加/削除を行い、音声クロックを映像に追従させる
-    // P4 で PlaybackClock（audio-master）へ置き換わり次第、ドリフト補正自体が不要になり削除予定
-    private void ApplyDriftCorrection(double avgDriftSec)
-    {
-        const double kThreshold = 0.04;      // 40ms 超で補正開始
-        const double kResetThreshold = 0.01; // 10ms 未満で補正終了
-        const int kCompensationDistance = AudioDecoder.OutSampleRate / 2; // 500ms ウィンドウ
-        const int kCorrectionSamples = 48;   // ≈ 0.1% of OutSampleRate (≈1ms per 500ms)
-
-        if (Math.Abs(avgDriftSec) > kThreshold)
-        {
-            int sampleDelta = Math.Sign(avgDriftSec) * kCorrectionSamples;
-            foreach (var d in _audioDecoders)
-                d.SetDriftCompensation(sampleDelta, kCompensationDistance);
-        }
-        else if (Math.Abs(avgDriftSec) < kResetThreshold)
-        {
-            foreach (var d in _audioDecoders)
-                d.SetDriftCompensation(0, AudioDecoder.OutSampleRate);
-        }
-    }
-
     private void DisposeDecoders()
     {
         _videoDecoder?.Dispose(); _videoDecoder = null;
@@ -502,6 +514,7 @@ public unsafe class MediaEngine : IMediaEngine
         _audioStreamToTrack.Clear();
         _wasapiOut?.Dispose(); _wasapiOut = null;
         _mixer = null;
+        _positionSource = null;
         if (_fmtCtx != null) { fixed (AVFormatContext** p = &_fmtCtx) avformat_close_input(p); }
         _fmtCtx = null;
     }
