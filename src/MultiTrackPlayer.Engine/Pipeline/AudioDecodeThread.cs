@@ -15,6 +15,7 @@ public sealed unsafe class AudioDecodeThread
     private readonly IReadOnlyList<AudioTrackState> _states;
     private readonly AudioPacketQueue _queue;
     private readonly Func<double> _getPtsSyncOffset;
+    private readonly Action<double>? _onFirstSamplesAfterFlush;
     private readonly ManualResetEventSlim _wake = new(false);
 
     private volatile bool _stopRequested;
@@ -22,15 +23,19 @@ public sealed unsafe class AudioDecodeThread
     private double _nextSeekTarget = double.NaN;
     private bool _prerollActive;
     private double _prerollTarget;
+    private bool _anchorNotifyPending;
+    private double _anchorTarget;
 
     public AudioDecodeThread(
         IReadOnlyList<AudioDecoder> decoders, IReadOnlyList<AudioTrackState> states,
-        AudioPacketQueue queue, Func<double> getPtsSyncOffset)
+        AudioPacketQueue queue, Func<double> getPtsSyncOffset,
+        Action<double>? onFirstSamplesAfterFlush = null)
     {
         _decoders = decoders;
         _states = states;
         _queue = queue;
         _getPtsSyncOffset = getPtsSyncOffset;
+        _onFirstSamplesAfterFlush = onFirstSamplesAfterFlush;
     }
 
     /// <summary>DemuxThread のシーク処理から、Flush 番兵を投入する前に呼ぶこと。</summary>
@@ -90,6 +95,11 @@ public sealed unsafe class AudioDecodeThread
             _prerollTarget = _nextSeekTarget;
             _nextSeekTarget = double.NaN;
         }
+        // クロックの錨（anchor）はシーク後最初の「新しい」音声サンプル投入時に要求する。
+        // UI の Seek() 時点で要求すると、ミキサーに残る旧位置の音声で錨が早期消費されて
+        // クロックとA/Vが恒久的にズレる（実機検証で -56s のズレとして観測されたバグ）。
+        _anchorNotifyPending = _prerollActive;
+        _anchorTarget = _prerollTarget;
     }
 
     private void HandleEof(AVFrame* frame)
@@ -180,6 +190,11 @@ public sealed unsafe class AudioDecodeThread
             if (_stopRequested) return;
             _wake.Wait(FillGatePollInterval);
             _wake.Reset();
+        }
+        if (_anchorNotifyPending)
+        {
+            _anchorNotifyPending = false;
+            _onFirstSamplesAfterFlush?.Invoke(_anchorTarget);
         }
         track.Buffer.AddSamples(pcm, offset, count);
     }
