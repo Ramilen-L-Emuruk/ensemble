@@ -13,6 +13,13 @@ public unsafe class VideoDecoder : IDisposable
     private readonly AVRational _timeBase;
     private bool _useHw;
 
+    // sws_scale_frame + threads オプションによるマルチスレッド変換（P6）。
+    // 一度でも失敗したら以降は単スレッド sws_scale へ恒久的にフォールバックする。
+    private SwsContext* _mtSwsCtx;
+    private bool _mtSwsFailed;
+    private int _mtSwsW, _mtSwsH;
+    private AVPixelFormat _mtSwsSrcFmt;
+
     public int StreamIndex => _streamIndex;
 
     public VideoDecoder(AVStream* stream)
@@ -84,6 +91,13 @@ public unsafe class VideoDecoder : IDisposable
 
             var srcFmt = (AVPixelFormat)frame->format;
 
+            if (!_mtSwsFailed && TryConvertMultiThreaded(frame, w, h, srcFmt, dst, dstStride))
+            {
+                width = w;
+                height = h;
+                return true;
+            }
+
             _swsCtx = sws_getCachedContext(
                 _swsCtx, w, h, srcFmt,
                 w, h, AVPixelFormat.Bgra,
@@ -113,11 +127,70 @@ public unsafe class VideoDecoder : IDisposable
         }
     }
 
+    /// <summary>
+    /// sws_alloc_context + threads オプション + sws_scale_frame によるスライス並列変換を試みる。
+    /// dst フレームの data/linesize は呼び出し側プールバッファへ直接セットし、buf は未割当のままにする
+    /// （av_frame_free 時に data 側は解放されない＝プールバッファの所有権は移らない）。
+    /// FFmpeg 側がこの「外部バッファへの書き込み」を受け付けない環境では失敗を検知し、
+    /// 以降は恒久的に単スレッド sws_scale へフォールバックする。
+    /// </summary>
+    private bool TryConvertMultiThreaded(AVFrame* frame, int w, int h, AVPixelFormat srcFmt, IntPtr dst, int dstStride)
+    {
+        if (_mtSwsCtx == null || _mtSwsW != w || _mtSwsH != h || _mtSwsSrcFmt != srcFmt)
+        {
+            if (_mtSwsCtx != null) { sws_freeContext(_mtSwsCtx); _mtSwsCtx = null; }
+
+            _mtSwsCtx = sws_alloc_context();
+            if (_mtSwsCtx == null) { _mtSwsFailed = true; return false; }
+
+            void* ctxPtr = _mtSwsCtx;
+            av_opt_set_int(ctxPtr, "srcw", w, 0);
+            av_opt_set_int(ctxPtr, "srch", h, 0);
+            av_opt_set_int(ctxPtr, "src_format", (long)srcFmt, 0);
+            av_opt_set_int(ctxPtr, "dstw", w, 0);
+            av_opt_set_int(ctxPtr, "dsth", h, 0);
+            av_opt_set_int(ctxPtr, "dst_format", (long)AVPixelFormat.Bgra, 0);
+            av_opt_set_int(ctxPtr, "sws_flags", 2, 0); // SWS_BILINEAR
+            av_opt_set_int(ctxPtr, "threads", 0, 0);   // 0 = 自動（CPUコア数に応じてスライス分割）
+
+            if (sws_init_context(_mtSwsCtx, null, null) < 0)
+            {
+                sws_freeContext(_mtSwsCtx);
+                _mtSwsCtx = null;
+                _mtSwsFailed = true;
+                return false;
+            }
+            _mtSwsW = w;
+            _mtSwsH = h;
+            _mtSwsSrcFmt = srcFmt;
+        }
+
+        AVFrame* dstFrame = av_frame_alloc();
+        if (dstFrame == null) return false;
+        try
+        {
+            dstFrame->format = (int)AVPixelFormat.Bgra;
+            dstFrame->width = w;
+            dstFrame->height = h;
+            dstFrame->data[0] = dst;
+            dstFrame->linesize[0] = dstStride;
+
+            int ret = sws_scale_frame(_mtSwsCtx, dstFrame, frame);
+            if (ret < 0) { _mtSwsFailed = true; return false; }
+            return true;
+        }
+        finally
+        {
+            av_frame_free(&dstFrame);
+        }
+    }
+
     public void FlushBuffers() => avcodec_flush_buffers(_ctx);
 
     public void Dispose()
     {
         if (_swsCtx != null) { sws_freeContext(_swsCtx); _swsCtx = null; }
+        if (_mtSwsCtx != null) { sws_freeContext(_mtSwsCtx); _mtSwsCtx = null; }
         if (_hwCtx != null) { AVBufferRef* h = _hwCtx; av_buffer_unref(&h); _hwCtx = null; }
         if (_ctx != null) { AVCodecContext* c = _ctx; avcodec_free_context(&c); _ctx = null; }
     }
