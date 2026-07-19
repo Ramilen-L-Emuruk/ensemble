@@ -44,6 +44,11 @@
             </MenuItem>
         </Menu>
 
+        <!-- Status bar (drop-rate / video lag) -->
+        <TextBlock DockPanel.Dock="Bottom" Background="#FF1A1A1A" Foreground="Gray"
+                   FontFamily="Consolas" FontSize="10" Padding="8,2"
+                   Text="{Binding StatusText}"/>
+
         <!-- Transport bar bottom -->
         <StackPanel DockPanel.Dock="Bottom" Background="#FF1E1E1E">
             <!-- SeekBar -->
