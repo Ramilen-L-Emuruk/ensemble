@@ -10,7 +10,8 @@ public unsafe class AudioDecoder : IDisposable
     private readonly AVRational _timeBase;
 
     public int StreamIndex { get; }
-    public const int OutSampleRate = 44100;
+    // OBS 等の一般的なソースは 48kHz のため、無意味なリサンプルを避けるべく出力もネイティブに合わせる
+    public const int OutSampleRate = 48000;
     public const int OutChannels = 2;
     public static readonly AVSampleFormat OutFormat = AVSampleFormat.Flt;
 
