@@ -126,8 +126,8 @@ public partial class MainWindow : Window
         {
             case "PlayPause":     _vm.PlayPauseCommand.Execute(null); break;
             case "Stop":          _vm.StopCommand.Execute(null); break;
-            case "StepForward":   if (_vm.PlaybackState == PlaybackState.Paused) _vm.Engine.StepForward(); break;
-            case "StepBackward":  if (_vm.PlaybackState == PlaybackState.Paused) _vm.Engine.StepBackward(); break;
+            case "StepForward":   _vm.StepForwardCommand.Execute(null); break;
+            case "StepBackward":  _vm.StepBackwardCommand.Execute(null); break;
             case "Skip+10":       _vm.Skip(10); break;
             case "Skip-10":       _vm.Skip(-10); break;
             case "Skip+3":        _vm.Skip(3); break;
@@ -139,8 +139,8 @@ public partial class MainWindow : Window
             case "Mute":          _vm.ToggleMuteCommand.Execute(null); break;
             case "SpeedUp":       _vm.ChangeSpeed(0.25); break;
             case "SpeedDown":     _vm.ChangeSpeed(-0.25); break;
-            case "NextChapter":   _vm.Engine.JumpToNextChapter(); break;
-            case "PrevChapter":   _vm.Engine.JumpToPreviousChapter(); break;
+            case "NextChapter":   _vm.Engine.JumpToNextChapter(); _vm.ShowOsd("次のチャプター"); break;
+            case "PrevChapter":   _vm.Engine.JumpToPreviousChapter(); _vm.ShowOsd("前のチャプター"); break;
             case "NextFile":      _vm.PlayNext(); break;
             case "PrevFile":      _vm.PlayPrevious(); break;
             case "ToggleChapter": _vm.ToggleChapterAtCurrentPosition(); UpdateSeekBarChapters(); break;
@@ -176,6 +176,7 @@ public partial class MainWindow : Window
             TransportBar.Visibility = Visibility.Collapsed;
             _vm.IsFullscreen = true;
             ShowFullscreenOverlay(); // 切替直後は一旦見せて、無操作なら自動的に消える
+            _vm.ShowOsd("フルスクリーン");
         }
         else
         {
@@ -186,6 +187,7 @@ public partial class MainWindow : Window
             _vm.IsFullscreen = false;
             _overlayHideTimer.Stop();
             FullscreenOverlay.Visibility = Visibility.Collapsed;
+            _vm.ShowOsd("フルスクリーン解除");
         }
     }
 
@@ -206,8 +208,8 @@ public partial class MainWindow : Window
     private void MenuFullscreen_Click(object s, RoutedEventArgs e) => ToggleFullscreen();
     private void MenuPlayPause_Click(object s, RoutedEventArgs e) => _vm.PlayPauseCommand.Execute(null);
     private void MenuStop_Click(object s, RoutedEventArgs e) => _vm.StopCommand.Execute(null);
-    private void MenuStepFwd_Click(object s, RoutedEventArgs e) => _vm.Engine.StepForward();
-    private void MenuStepBwd_Click(object s, RoutedEventArgs e) => _vm.Engine.StepBackward();
+    private void MenuStepFwd_Click(object s, RoutedEventArgs e) => _vm.StepForwardCommand.Execute(null);
+    private void MenuStepBwd_Click(object s, RoutedEventArgs e) => _vm.StepBackwardCommand.Execute(null);
     private void MenuSaveDefaultMutes_Click(object s, RoutedEventArgs e) => _vm.SaveCurrentMutesAsDefault();
 
     // ── Transport ──
