@@ -32,6 +32,7 @@ public partial class ChapterWindow : Window
     private void ChapterList_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         if (ChapterList.SelectedItem is not ChapterViewModel cvm) return;
+        if (cvm.IsEditing) return; // 編集中は TitleEditBox_KeyDown 側の確定/キャンセル処理に譲る
 
         switch (e.Key)
         {
