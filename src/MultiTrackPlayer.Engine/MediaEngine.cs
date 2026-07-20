@@ -3,6 +3,7 @@ using MultiTrackPlayer.Core.Interfaces;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Audio;
 using MultiTrackPlayer.Engine.Decoding;
+using MultiTrackPlayer.Engine.Diagnostics;
 using MultiTrackPlayer.Engine.Pipeline;
 using MultiTrackPlayer.Engine.Sync;
 using MultiTrackPlayer.Engine.Video;
@@ -204,7 +205,10 @@ public unsafe class MediaEngine : IMediaEngine
         _mixer.OnAudioWritten = frames =>
         {
             if (Interlocked.Exchange(ref _awaitingAnchor, 0) == 1)
+            {
                 _clock.AnchorAt(_clock.WriteCursor, _pendingAnchorTarget);
+                DiagnosticLog.Write("clock", $"anchor 確定 cursor={_clock.WriteCursor} pts={_pendingAnchorTarget:F3}");
+            }
             _clock.OnAudioWritten(frames);
         };
         _mixer.OnSilenceWritten = frames => _clock.OnSilenceWritten(frames);
@@ -217,6 +221,8 @@ public unsafe class MediaEngine : IMediaEngine
         bool wasStopped = _state == CorePlaybackState.Stopped;
         _state = CorePlaybackState.Playing;
         _playbackEndedFired = false;
+        _lastFrameServedTicks = Environment.TickCount64;
+        DiagnosticLog.Write("engine", $"Play wasStopped={wasStopped}");
         ReleaseHeldFrame();
         EnsurePipelineStarted();
         if (wasStopped)
@@ -228,6 +234,7 @@ public unsafe class MediaEngine : IMediaEngine
     {
         if (_state != CorePlaybackState.Playing) return;
         _state = CorePlaybackState.Paused;
+        DiagnosticLog.Write("engine", $"Pause pos={Position.TotalSeconds:F3}");
         _wasapiOut?.Pause();
     }
 
@@ -250,18 +257,21 @@ public unsafe class MediaEngine : IMediaEngine
         // 目標を [0, duration) にクランプ（スキップ連打で負値や duration 超えの目標が来る）
         double durationSec = _currentMedia?.Duration.TotalSeconds ?? 0.0;
         double target = Math.Clamp(position.TotalSeconds, 0.0, Math.Max(0.0, durationSec - 0.1));
+        DiagnosticLog.Write("engine", $"Seek 要求 raw={position.TotalSeconds:F3} target={target:F3} state={_state}");
 
         _clock.BeginSeek(target);
         ReleaseHeldFrame();
         // ミキサーに残る旧位置の音声を即座に破棄する（シーク中に古い音が鳴り続けるのを防ぐ）。
         // クロックの錨は AudioDecodeThread が新サンプルを投入する瞬間に要求される（早期消費バグの根治）
         foreach (var s in _audioStates) s.Buffer.ClearBuffer();
+        int minSerial = (_videoRing?.CurrentSerial ?? 0) + 1; // これから demux が Flush で進める世代
         _demuxThread?.RequestSeek(target);
         _playbackEndedFired = false;
+        _lastFrameServedTicks = Environment.TickCount64;
 
-        // 一時停止中のシークは、着地後の最初のフレームを即座に1枚だけ表示する
+        // 一時停止中のシークは、着地後（＝新世代）の最初のフレームを即座に1枚だけ表示する
         if (_state == CorePlaybackState.Paused)
-            TryHoldNextFrame(TimeSpan.FromMilliseconds(500));
+            TryHoldNextFrame(TimeSpan.FromMilliseconds(500), minSerial);
     }
 
     /// <summary>次に実音声が mixer へ書かれた瞬間、その書込カーソル位置を srcPts=target としてクロックを起点合わせする。</summary>
@@ -269,6 +279,7 @@ public unsafe class MediaEngine : IMediaEngine
     {
         _pendingAnchorTarget = targetSeconds;
         Interlocked.Exchange(ref _awaitingAnchor, 1);
+        DiagnosticLog.Write("clock", $"anchor 要求 target={targetSeconds:F3}");
     }
 
     public void SetPlaybackSpeed(double speed)
@@ -295,7 +306,7 @@ public unsafe class MediaEngine : IMediaEngine
     {
         if (_state != CorePlaybackState.Paused) return;
         ReleaseHeldFrame();
-        TryHoldNextFrame(TimeSpan.FromMilliseconds(500));
+        TryHoldNextFrame(TimeSpan.FromMilliseconds(500), _videoRing?.CurrentSerial ?? 0);
     }
 
     public void StepBackward()
@@ -322,6 +333,7 @@ public unsafe class MediaEngine : IMediaEngine
 
             _displayedFrames++;
             _lastVideoLagSec = raw.PtsSeconds - position.TotalSeconds;
+            _lastFrameServedTicks = Environment.TickCount64;
             return new VideoFrameLease(raw.SlotIndex, raw.Buffer, raw.Width, raw.Height, raw.Stride, TimeSpan.FromSeconds(raw.PtsSeconds));
         }
 
@@ -335,9 +347,11 @@ public unsafe class MediaEngine : IMediaEngine
 
     public void ReturnFrame(VideoFrameLease lease)
     {
-        // Paused 中に保持しているフレームは Step/Seek/Play で明示的に入れ替えるまで手放さない
-        if (_state == CorePlaybackState.Playing)
-            _videoRing?.ReturnLease(lease.SlotIndex);
+        // Paused 中に保持しているフレーム（_heldLease）だけは Step/Seek/Play で入れ替えるまで手放さない。
+        // それ以外は必ず返却する。以前は「Playing 中のみ返却」だったため、TryGetFrame と
+        // ReturnFrame の間に Pause 等の状態遷移が挟まるとリースが漏れ、4スロット枯渇で映像が止まった
+        if (_heldLease != null && lease.SlotIndex == _heldLease.SlotIndex) return;
+        _videoRing?.ReturnLease(lease.SlotIndex);
     }
 
     private void ReleaseHeldFrame()
@@ -348,10 +362,10 @@ public unsafe class MediaEngine : IMediaEngine
         _heldFrameConsumed = true;
     }
 
-    private void TryHoldNextFrame(TimeSpan timeout)
+    private void TryHoldNextFrame(TimeSpan timeout, int minSerial)
     {
         if (_videoRing == null) return;
-        if (!_videoRing.TryLeaseOldest(timeout, out var raw)) return;
+        if (!_videoRing.TryLeaseOldest(timeout, minSerial, out var raw)) return;
 
         _heldLease = new VideoFrameLease(raw.SlotIndex, raw.Buffer, raw.Width, raw.Height, raw.Stride, TimeSpan.FromSeconds(raw.PtsSeconds));
         _heldFrameConsumed = false;
@@ -368,6 +382,7 @@ public unsafe class MediaEngine : IMediaEngine
     public void SetTrackMute(int trackNumber, bool muted)
     {
         int idx = trackNumber - 1;
+        DiagnosticLog.Write("engine", $"SetTrackMute track={trackNumber} muted={muted} state={_state}");
         if (idx >= 0 && idx < _audioStates.Count)
             _audioStates[idx].IsMuted = muted;
     }
@@ -464,10 +479,17 @@ public unsafe class MediaEngine : IMediaEngine
         return thread;
     }
 
+    // demux スレッドがシーク実行直後（各キューへ FlushMarker を入れる前）に呼ぶ
     private void PublishSeekTarget(double normalizedTargetSeconds)
     {
         _videoDecodeThread?.SetSeekTarget(normalizedTargetSeconds);
         _audioDecodeThread?.SetSeekTarget(normalizedTargetSeconds);
+        // リングを demux スレッド側から即時 Flush する。これが無いと、リング満杯で
+        // BeginWrite ブロック中の VideoDecodeThread が FlushMarker を処理できず、
+        // 後方シーク時（リング内フレームが全て「未来」になり誰も取り出さない）に
+        // 音声だけ流れて映像が止まるデッドロックになる
+        _videoRing?.Flush();
+        DiagnosticLog.Write("demux", $"seek 処理 target={normalizedTargetSeconds:F3} ringSerial={_videoRing?.CurrentSerial ?? -1}");
     }
 
     private void TeardownPipeline()
@@ -506,6 +528,8 @@ public unsafe class MediaEngine : IMediaEngine
     // ── ステータス通知（100ms 周期。映像フレーム配送は UI 側の CompositionTarget.Rendering がプルする）──
 
     private double _lastVideoLagSec;
+    private long _lastFrameServedTicks;
+    private const int VideoStallThresholdMs = 2000;
 
     private void StatusTick()
     {
@@ -513,7 +537,25 @@ public unsafe class MediaEngine : IMediaEngine
             PositionChanged?.Invoke(this, Position);
 
         StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _lastVideoLagSec));
+        DetectVideoStall();
         CheckPlaybackEnded();
+    }
+
+    /// <summary>
+    /// 再生中なのに映像フレームが一定時間配送されていない状態を検知して診断ログに残す。
+    /// 「音声だけ流れて映像が止まる」系の不具合が再発した場合、リングの内部状態がここで採取される。
+    /// </summary>
+    private void DetectVideoStall()
+    {
+        if (!DiagnosticLog.Enabled) return;
+        if (_state != CorePlaybackState.Playing || _videoDecoder == null || _videoRing == null) return;
+
+        long now = Environment.TickCount64;
+        if (now - _lastFrameServedTicks < VideoStallThresholdMs) return;
+
+        DiagnosticLog.Write("stall",
+            $"映像 {VideoStallThresholdMs}ms 以上停止 clock={GetMasterClockSeconds():F3} ring={_videoRing.DescribeSlots()}");
+        _lastFrameServedTicks = now; // 停止継続中は 2 秒おきに記録
     }
 
     private void CheckPlaybackEnded()

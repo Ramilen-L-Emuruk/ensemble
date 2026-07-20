@@ -100,6 +100,7 @@ public sealed unsafe class AudioDecodeThread
         // クロックとA/Vが恒久的にズレる（実機検証で -56s のズレとして観測されたバグ）。
         _anchorNotifyPending = _prerollActive;
         _anchorTarget = _prerollTarget;
+        Diagnostics.DiagnosticLog.Write("audio", $"flush 処理 preroll={(_prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
     }
 
     private void HandleEof(AVFrame* frame)

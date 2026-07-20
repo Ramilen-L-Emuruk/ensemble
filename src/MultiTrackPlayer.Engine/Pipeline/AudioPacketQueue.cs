@@ -32,6 +32,7 @@ public unsafe sealed class AudioPacketQueue
     public bool Close() => _queue.Close();
     public int Flush() => _queue.Flush();
     public void PutEof(int serial) => _queue.PutEof(serial);
+    public void AbortPutWaiters() => _queue.AbortPutWaiters();
 
     public bool PutMove(AVPacket* src, int trackIndex, int serial)
     {

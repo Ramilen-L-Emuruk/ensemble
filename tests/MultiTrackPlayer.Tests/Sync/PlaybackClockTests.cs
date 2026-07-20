@@ -160,4 +160,24 @@ public sealed class PlaybackClockTests
         // シーク後は 2x（_currentRate）で連続進行するはずなので 30.0 + 2.0s*2.0 = 34.0
         Assert.Equal(34.0, clock.PositionAt(clock.WriteCursor), precision: 6);
     }
+
+    [Fact]
+    public void BackwardSeek_AllowsPositionToDecrease_PastMonotonicClamp()
+    {
+        // Arrange: 100秒地点まで再生してクランプ基準を高い値にしておく
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, srcPtsSeconds: 100.0);
+        clock.OnAudioWritten(SampleRate);
+        Assert.Equal(101.0, clock.PositionAt(SampleRate), precision: 6);
+
+        // Act: 10秒地点へ後方シーク → 錨 → 1秒再生
+        clock.BeginSeek(10.0);
+        Assert.Equal(10.0, clock.PositionAt(SampleRate)); // 保留中は target
+        clock.AnchorAt(clock.WriteCursor, 10.0);
+        clock.OnAudioWritten(SampleRate);
+
+        // Assert: 単調クランプがシーク前の 101.0 に張り付かず、シーク先から進行する
+        // （張り付くと映像側が全フレームを期限切れ判定して大量ドロップになる回帰バグ）
+        Assert.Equal(11.0, clock.PositionAt(clock.WriteCursor), precision: 6);
+    }
 }

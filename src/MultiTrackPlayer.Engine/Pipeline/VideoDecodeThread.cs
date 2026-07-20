@@ -19,6 +19,9 @@ public sealed unsafe class VideoDecodeThread
     private double _nextSeekTarget = double.NaN;
     private bool _prerollActive;
     private double _prerollTarget;
+    // BeginWrite が SlotFlushed を返した（＝シークが発生した）後、FlushMarker に到達するまでの
+    // 残りフレームは全てシーク前の残骸なので、4K変換を行わずに捨てる
+    private bool _abandonUntilFlush;
 
     public VideoDecodeThread(VideoDecoder decoder, VideoPacketQueue queue, VideoFrameRing ring,
         Func<double> getPtsSyncOffset, double frameDurationSeconds)
@@ -72,13 +75,17 @@ public sealed unsafe class VideoDecodeThread
     private void HandleFlush()
     {
         _decoder.FlushBuffers();
+        // demux スレッドがシーク時に既に ring.Flush 済み（デッドロック解消のため）。
+        // ここでもう一度呼び、demux の Flush 後にコミットされ得た残骸 Ready も掃除する
         _ring.Flush();
+        _abandonUntilFlush = false;
         lock (_seekTargetLock)
         {
             _prerollActive = !double.IsNaN(_nextSeekTarget);
             _prerollTarget = _nextSeekTarget;
             _nextSeekTarget = double.NaN;
         }
+        Diagnostics.DiagnosticLog.Write("video", $"flush 処理 preroll={( _prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
     }
 
     private void HandleEof(AVFrame* frame)
@@ -110,6 +117,8 @@ public sealed unsafe class VideoDecodeThread
 
     private void EmitFrame(AVFrame* frame)
     {
+        if (_abandonUntilFlush) return; // シーク発生後の残骸フレーム（FlushMarker 到達まで捨てる）
+
         double offset = _getPtsSyncOffset();
         if (double.IsNaN(offset)) return; // demux 側で確定前（通常は先に確定している）
 
@@ -120,10 +129,12 @@ public sealed unsafe class VideoDecodeThread
             if (normalizedPts < _prerollTarget - _frameDurationSeconds / 2.0)
                 return; // hw転送・sws変換前に破棄（4Kの33MB転送を丸ごと省く）
             _prerollActive = false;
+            Diagnostics.DiagnosticLog.Write("video", $"preroll 完了 firstPts={normalizedPts:F3}");
         }
 
         int slot = _ring.BeginWrite(frame->width, frame->height);
-        if (slot < 0) return; // Close 済み
+        if (slot == VideoFrameRing.SlotClosed) return;
+        if (slot == VideoFrameRing.SlotFlushed) { _abandonUntilFlush = true; return; }
 
         IntPtr dst = _ring.GetWriteBuffer(slot);
         int stride = frame->width * 4;
