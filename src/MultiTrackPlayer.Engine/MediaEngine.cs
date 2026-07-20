@@ -360,7 +360,11 @@ public unsafe class MediaEngine : IMediaEngine
     public void StepBackward()
     {
         if (_state != CorePlaybackState.Paused) return;
-        var target = Position - TimeSpan.FromSeconds(_videoFrameDuration);
+        // Position（音声クロック基準）ではなく現在表示中フレームの実PTSを基準にする。
+        // StepForward は音声クロックを進めないため、Position を使うと数コマ進めた直後の
+        // 戻しが「一時停止した瞬間の位置」まで戻ってしまう不具合があった
+        var currentPts = _heldLease?.Pts ?? Position;
+        var target = currentPts - TimeSpan.FromSeconds(_videoFrameDuration);
         if (target < TimeSpan.Zero) target = TimeSpan.Zero;
         Seek(target); // Paused 中なので Seek 内部で held フレームも更新される
     }
