@@ -16,11 +16,15 @@
                         <Canvas/>
                     </ItemsPanelTemplate>
                 </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemContainerStyle>
+                    <Style TargetType="ContentPresenter">
+                        <Setter Property="Canvas.Left" Value="{Binding X}"/>
+                    </Style>
+                </ItemsControl.ItemContainerStyle>
                 <ItemsControl.ItemTemplate>
                     <DataTemplate>
                         <Rectangle Width="2" Height="24" Fill="White" Opacity="0.7"
-                                   ToolTip="{Binding ToolTip}"
-                                   Canvas.Left="{Binding X}"/>
+                                   ToolTip="{Binding ToolTip}"/>
                     </DataTemplate>
                 </ItemsControl.ItemTemplate>
             </ItemsControl>

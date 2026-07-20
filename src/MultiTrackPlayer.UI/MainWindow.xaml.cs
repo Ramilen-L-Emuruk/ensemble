@@ -31,8 +31,6 @@ public partial class MainWindow : Window
         DataContext = _vm;
         _kb.Load();
 
-        _vm.Engine.PositionChanged += (_, _) => UpdateSeekBarChapters();
-
         SeekBar.Seeking += (_, ratio) =>
             _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
         FullscreenSeekBar.Seeking += (_, ratio) =>

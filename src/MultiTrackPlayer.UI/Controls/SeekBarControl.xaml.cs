@@ -50,7 +50,7 @@ public partial class SeekBarControl : UserControl
         _markers.Clear();
         double w = TrackCanvas.ActualWidth;
         foreach (var (r, t) in chapters)
-            _markers.Add(new ChapterMarkerData { X = r * w - 1, ToolTip = t });
+            _markers.Add(new ChapterMarkerData { Ratio = r, X = r * w - 1, ToolTip = t });
     }
 
     private void UpdateVisuals()
