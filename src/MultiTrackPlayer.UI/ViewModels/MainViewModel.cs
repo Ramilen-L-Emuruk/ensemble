@@ -31,6 +31,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private bool _isFullscreen;
     [ObservableProperty] private string _statusText = string.Empty;
     [ObservableProperty] private bool _isDebugMode;
+    [ObservableProperty] private bool _isMasterMuted;
 
     public MainViewModel()
     {
@@ -75,7 +76,21 @@ public partial class MainViewModel : ObservableObject, IDisposable
             Engine.Seek(TimeSpan.FromSeconds(value * Duration.TotalSeconds));
     }
 
-    partial void OnMasterVolumeChanged(double value) => Engine.SetMasterVolume((float)(value / 100.0));
+    partial void OnMasterVolumeChanged(double value)
+    {
+        // スライダー操作でマスター音量を変えたら、ミュート状態と実際に聞こえる音を一致させるため自動的に解除する
+        if (IsMasterMuted) IsMasterMuted = false;
+        else Engine.SetMasterVolume((float)(value / 100.0));
+    }
+
+    partial void OnIsMasterMutedChanged(bool value)
+    {
+        Engine.SetMasterVolume(value ? 0f : (float)(MasterVolume / 100.0));
+        DiagnosticLog.Write("ui", $"マスターミュート切替 muted={value}");
+    }
+
+    [RelayCommand]
+    private void ToggleMute() => IsMasterMuted = !IsMasterMuted;
 
     public void OpenFile(string path)
     {
