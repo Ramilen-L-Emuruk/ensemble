@@ -49,9 +49,12 @@ public sealed class WasapiPositionSource : IPlaybackPositionSource
         if (!monotonic || !withinBounds)
         {
             _violationCount++;
+            Diagnostics.DiagnosticLog.Write("pos",
+                $"sanity違反 count={_violationCount} monotonic={monotonic} withinBounds={withinBounds} frames={frames} lastFrames={_lastFrames} writeCursor={writeCursor}");
             if (_violationCount >= ViolationThreshold)
             {
                 _fallbackActive = true;
+                Diagnostics.DiagnosticLog.Write("pos", $"フォールバック切替 frames={frames} writeCursor={writeCursor}");
                 return _fallback.GetPositionFrames();
             }
             return _lastFrames; // 直近の正常値を維持

@@ -95,6 +95,11 @@ public partial class MainWindow : Window
     // ── Key handling ──
     private void Window_KeyDown(object sender, KeyEventArgs e)
     {
+        // OS のキーリピートを無視する。矢印キーを押しっぱなしにして巻き戻すと、
+        // 前のシークの映像プリロールが終わる前に次の Skip が発行され続け、
+        // シークパイプラインが常に再武装された状態になって映像が乱れる原因になる
+        if (e.IsRepeat) { e.Handled = true; return; }
+
         if (e.Key == Key.Escape && _vm.IsFullscreen)
         {
             ToggleFullscreen();

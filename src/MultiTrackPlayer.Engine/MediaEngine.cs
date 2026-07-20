@@ -48,6 +48,10 @@ public unsafe class MediaEngine : IMediaEngine
     private double _pendingAnchorTarget;
     private int _awaitingAnchor;
 
+    // シーク後の音声・映像プリロール完了の両方を待つゲート（早送りバグの根治。詳細は Seek() 参照）
+    private volatile bool _videoPrerollReady = true;
+    private volatile bool _audioPrerollReady = true;
+
     private MediaInfo? _currentMedia;
     private CorePlaybackState _state = CorePlaybackState.Stopped;
     private double _playbackSpeed = 1.0;
@@ -248,6 +252,10 @@ public unsafe class MediaEngine : IMediaEngine
         _clock.Reset();
         _positionSource?.Reset();
         _playbackEndedFired = false;
+        // シーク中断のまま Stop された場合に保留状態が次の Play() へ持ち越されないようにする
+        _videoPrerollReady = true;
+        _audioPrerollReady = true;
+        if (_mixer != null) _mixer.HoldOutput = false;
     }
 
     public void Seek(TimeSpan position)
@@ -264,6 +272,19 @@ public unsafe class MediaEngine : IMediaEngine
         // ミキサーに残る旧位置の音声を即座に破棄する（シーク中に古い音が鳴り続けるのを防ぐ）。
         // クロックの錨は AudioDecodeThread が新サンプルを投入する瞬間に要求される（早期消費バグの根治）
         foreach (var s in _audioStates) s.Buffer.ClearBuffer();
+
+        // 映像プリロール（キーフレーム→目標地点の破棄デコード）は実時間がかかることがある。
+        // 音声だけ先にプリロールを終えて実時間で再生を始めるとクロックが映像を置き去りにし、
+        // 映像が追いつこうとして大量ドロップ（早送りに見える）が発生する。
+        // 音声・映像の両方のプリロールが完了するまでミキサーの実音声出力を保留する
+        if (_mixer != null)
+        {
+            _videoPrerollReady = _videoDecoder == null;
+            _audioPrerollReady = _audioDecoders.Count == 0;
+            _mixer.HoldOutput = true;
+            DiagnosticLog.Write("gate", $"HoldOutput 設定 target={target:F3} videoQueueSerial={_videoQueue?.Serial ?? -1} audioQueueSerial={_audioQueue?.Serial ?? -1}");
+        }
+
         int minSerial = (_videoRing?.CurrentSerial ?? 0) + 1; // これから demux が Flush で進める世代
         _demuxThread?.RequestSeek(target);
         _playbackEndedFired = false;
@@ -280,6 +301,33 @@ public unsafe class MediaEngine : IMediaEngine
         _pendingAnchorTarget = targetSeconds;
         Interlocked.Exchange(ref _awaitingAnchor, 1);
         DiagnosticLog.Write("clock", $"anchor 要求 target={targetSeconds:F3}");
+    }
+
+    /// <summary>音声プリロール完了時（AudioDecodeThread からのコールバック）。錨の要求と準備完了の両方を行う。</summary>
+    private void OnAudioPrerollReady(double targetSeconds)
+    {
+        RequestAnchor(targetSeconds);
+        _audioPrerollReady = true;
+        DiagnosticLog.Write("gate", $"audioPrerollReady=true target={targetSeconds:F3} video={_videoPrerollReady}");
+        TryReleaseMixerHold();
+    }
+
+    /// <summary>映像プリロール完了時（VideoDecodeThread からのコールバック）。</summary>
+    private void OnVideoPrerollReady()
+    {
+        _videoPrerollReady = true;
+        DiagnosticLog.Write("gate", $"videoPrerollReady=true audio={_audioPrerollReady}");
+        TryReleaseMixerHold();
+    }
+
+    /// <summary>音声・映像の両方のプリロールが完了して初めて、ミキサーの実音声出力保留を解除する。</summary>
+    private void TryReleaseMixerHold()
+    {
+        if (_videoPrerollReady && _audioPrerollReady && _mixer != null)
+        {
+            _mixer.HoldOutput = false;
+            DiagnosticLog.Write("gate", "HoldOutput 解除");
+        }
     }
 
     public void SetPlaybackSpeed(double speed)
@@ -453,11 +501,12 @@ public unsafe class MediaEngine : IMediaEngine
         if (_videoDecoder != null)
             _videoDecodeThread = new VideoDecodeThread(
                 _videoDecoder, _videoQueue, _videoRing,
-                () => _demuxThread!.PtsSyncOffset, _videoFrameDuration);
+                () => _demuxThread!.PtsSyncOffset, _videoFrameDuration,
+                onFirstFrameAfterFlush: OnVideoPrerollReady);
 
         _audioDecodeThread = new AudioDecodeThread(
             _audioDecoders, _audioStates, _audioQueue, () => _demuxThread!.PtsSyncOffset,
-            onFirstSamplesAfterFlush: RequestAnchor);
+            onFirstSamplesAfterFlush: OnAudioPrerollReady);
 
         if (_mixer != null)
         {
@@ -533,10 +582,21 @@ public unsafe class MediaEngine : IMediaEngine
 
     private void StatusTick()
     {
+        // GetPositionFrames() は呼ぶたびに内部の単調性チェック状態を更新するため、
+        // 1tick につき1回だけ呼び、PositionChanged 通知とデバッグログの両方で使い回す
+        long hwFrames = _positionSource?.GetPositionFrames() ?? 0;
+        double posSeconds = _positionSource == null ? 0.0 : _clock.PositionAt(hwFrames);
+        var pos = TimeSpan.FromSeconds(posSeconds);
+
         if (_state == CorePlaybackState.Playing || _state == CorePlaybackState.Paused)
-            PositionChanged?.Invoke(this, Position);
+            PositionChanged?.Invoke(this, pos);
 
         StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _lastVideoLagSec));
+
+        // 短時間の連続シーク直後にクロックが古いセグメントを指し続ける不具合の切り分け用
+        if (DiagnosticLog.Enabled && _state == CorePlaybackState.Playing)
+            DiagnosticLog.Write("pos", $"trace hwFrames={hwFrames} writeCursor={_clock.WriteCursor} pos={posSeconds:F3}");
+
         DetectVideoStall();
         CheckPlaybackEnded();
     }
