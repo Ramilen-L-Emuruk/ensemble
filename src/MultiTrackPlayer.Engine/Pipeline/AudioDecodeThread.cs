@@ -23,6 +23,9 @@ public sealed unsafe class AudioDecodeThread
     private double _nextSeekTarget = double.NaN;
     private bool _prerollActive;
     private double _prerollTarget;
+    // このプリロールが属するキュー世代（Flush 番兵自身の Serial）。VideoDecodeThread と同じ理由で、
+    // 次のシークに割り込まれた後の「無効な世代のプリロール完了」による誤アンカーを防ぐために使う
+    private int _prerollSerial;
     private bool _anchorNotifyPending;
     private double _anchorTarget;
 
@@ -61,7 +64,7 @@ public sealed unsafe class AudioDecodeThread
                 switch (item.Kind)
                 {
                     case QueueItemKind.Flush:
-                        HandleFlush();
+                        HandleFlush(item.Serial);
                         break;
                     case QueueItemKind.Eof:
                         HandleEof(frame);
@@ -81,7 +84,7 @@ public sealed unsafe class AudioDecodeThread
         }
     }
 
-    private void HandleFlush()
+    private void HandleFlush(int serial)
     {
         for (int i = 0; i < _decoders.Count; i++)
         {
@@ -89,6 +92,7 @@ public sealed unsafe class AudioDecodeThread
             _states[i].Buffer.ClearBuffer();
             _states[i].IsEof = false;
         }
+        _prerollSerial = serial;
         lock (_seekTargetLock)
         {
             _prerollActive = !double.IsNaN(_nextSeekTarget);
@@ -100,7 +104,7 @@ public sealed unsafe class AudioDecodeThread
         // クロックとA/Vが恒久的にズレる（実機検証で -56s のズレとして観測されたバグ）。
         _anchorNotifyPending = _prerollActive;
         _anchorTarget = _prerollTarget;
-        Diagnostics.DiagnosticLog.Write("audio", $"flush 処理 preroll={(_prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
+        Diagnostics.DiagnosticLog.Write("audio", $"flush 処理 serial={serial} preroll={(_prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
     }
 
     private void HandleEof(AVFrame* frame)
@@ -195,7 +199,13 @@ public sealed unsafe class AudioDecodeThread
         if (_anchorNotifyPending)
         {
             _anchorNotifyPending = false;
-            _onFirstSamplesAfterFlush?.Invoke(_anchorTarget);
+            // VideoDecodeThread と同じ理由の世代チェック: この間に次のシークが割り込んで
+            // キューの Serial が進んでいたら、この完了通知はもう無効な世代のもの。
+            // 錨要求もプリロール完了通知も発火しない（本物の Flush が後で来て正しく上書きする）
+            if (_queue.Serial == _prerollSerial)
+                _onFirstSamplesAfterFlush?.Invoke(_anchorTarget);
+            else
+                Diagnostics.DiagnosticLog.Write("audio", $"stale preroll 破棄 prerollSerial={_prerollSerial} currentSerial={_queue.Serial} target={_anchorTarget:F3}");
         }
         track.Buffer.AddSamples(pcm, offset, count);
     }

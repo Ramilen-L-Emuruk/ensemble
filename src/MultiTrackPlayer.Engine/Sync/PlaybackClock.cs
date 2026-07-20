@@ -121,6 +121,15 @@ public sealed class PlaybackClock
             if (_seekPending) return _seekTarget;
 
             long clamped = Math.Min(hwFrames, _writeCursor);
+
+            // clamped がまだ最新セグメント（直近の AnchorAt/SetSpeedAt）の開始フレームに達していない場合、
+            // HW は前のシークの音声をまだ再生し終えていない過渡期にある。この raw は一時的に
+            // （シーク前の位置に近い）高い値になり得るが、ここで _lastReturnedPosition を更新すると、
+            // 直後に HW が正しい新セグメントへ入った後もこの高い値に頭打ちされ続けてしまい、
+            // クロックが古い位置に固まって進まなくなる（後方シーク連打の実機検証で観測された不具合）
+            if (clamped < _segments[^1].StartFrame)
+                return PositionAtFrameLocked(clamped);
+
             double raw = PositionAtFrameLocked(clamped);
             if (raw < _lastReturnedPosition) raw = _lastReturnedPosition;
             _lastReturnedPosition = raw;
