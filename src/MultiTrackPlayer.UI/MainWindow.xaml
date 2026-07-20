@@ -25,6 +25,13 @@
                 <Separator/>
                 <MenuItem Header="フルスクリーン(_F)" InputGestureText="F11" Click="MenuFullscreen_Click"/>
             </MenuItem>
+            <MenuItem Header="設定(_S)">
+                <MenuItem Header="デバッグモード(_D)" IsCheckable="True"
+                          IsChecked="{Binding IsDebugMode, Mode=TwoWay}"/>
+                <Separator/>
+                <MenuItem Header="現在のミュート状態を既定にする(_M)" Click="MenuSaveDefaultMutes_Click"
+                          ToolTip="次回以降ファイルを開いたとき、いまミュートしているトラック番号を最初からミュートで開きます"/>
+            </MenuItem>
             <MenuItem Header="再生(_P)">
                 <MenuItem Header="再生/一時停止" InputGestureText="Space" Click="MenuPlayPause_Click"/>
                 <MenuItem Header="停止" InputGestureText="S" Click="MenuStop_Click"/>
@@ -44,10 +51,11 @@
             </MenuItem>
         </Menu>
 
-        <!-- Status bar (drop-rate / video lag) -->
+        <!-- Status bar (drop-rate / video lag) — デバッグモード時のみ表示 -->
         <TextBlock DockPanel.Dock="Bottom" Background="#FF1A1A1A" Foreground="Gray"
                    FontFamily="Consolas" FontSize="10" Padding="8,2"
-                   Text="{Binding StatusText}"/>
+                   Text="{Binding StatusText}"
+                   Visibility="{Binding IsDebugMode, Converter={StaticResource BoolToVis}}"/>
 
         <!-- Transport bar bottom -->
         <StackPanel DockPanel.Dock="Bottom" Background="#FF1E1E1E">

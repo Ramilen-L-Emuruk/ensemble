@@ -170,6 +170,7 @@ public partial class MainWindow : Window
     private void MenuStop_Click(object s, RoutedEventArgs e) => _vm.StopCommand.Execute(null);
     private void MenuStepFwd_Click(object s, RoutedEventArgs e) => _vm.Engine.StepForward();
     private void MenuStepBwd_Click(object s, RoutedEventArgs e) => _vm.Engine.StepBackward();
+    private void MenuSaveDefaultMutes_Click(object s, RoutedEventArgs e) => _vm.SaveCurrentMutesAsDefault();
 
     // ── Transport ──
     private void PlayPause_Click(object s, RoutedEventArgs e) => _vm.PlayPauseCommand.Execute(null);
