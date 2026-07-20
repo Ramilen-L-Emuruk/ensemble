@@ -480,6 +480,16 @@ public unsafe class MediaEngine : IMediaEngine
             c.IsUserDefined &&
             Math.Abs((c.StartTime - position).TotalSeconds) <= tolerance.TotalSeconds);
 
+    public void RenameUserChapter(ChapterInfo chapter, string newTitle)
+    {
+        if (!chapter.IsUserDefined) return;
+        var idx = _chapters.IndexOf(chapter);
+        if (idx < 0) return;
+        _chapters[idx] = chapter with { Title = newTitle };
+        if (_currentMedia != null)
+            UserChapterStore.Save(_currentMedia.FilePath, _chapters);
+    }
+
     // ── パイプライン構築・分解 ──
 
     private void EnsurePipelineStarted()
