@@ -1,18 +1,26 @@
 ﻿using System.Collections.ObjectModel;
+using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine;
+using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.UI.Settings;
 
 namespace MultiTrackPlayer.UI.ViewModels;
 
 public partial class MainViewModel : ObservableObject, IDisposable
 {
+    private static readonly string LogDirectory =
+        System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                               "MultiTrackPlayer", "logs");
+
     public MediaEngine Engine { get; } = new MediaEngine();
     public PlaylistViewModel Playlist { get; } = new PlaylistViewModel();
     public ObservableCollection<AudioTrackViewModel> AudioTracks { get; } = new();
     public ObservableCollection<ChapterViewModel> Chapters { get; } = new();
+    public AppSettings Settings { get; } = AppSettings.Load();
 
     [ObservableProperty] private PlaybackState _playbackState = PlaybackState.Stopped;
     [ObservableProperty] private TimeSpan _position;
@@ -22,10 +30,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private double _masterVolume = 80.0;
     [ObservableProperty] private string _title = "MultiTrackPlayer";
     [ObservableProperty] private bool _isFullscreen;
+    [ObservableProperty] private string _statusText = string.Empty;
+    [ObservableProperty] private bool _isDebugMode;
+    [ObservableProperty] private bool _isMasterMuted;
+    [ObservableProperty] private string _osdText = string.Empty;
+
+    private readonly DispatcherTimer _osdTimer = new() { Interval = TimeSpan.FromSeconds(1.2) };
 
     public MainViewModel()
     {
-        Engine.VideoFrameReady += (_, _) => { };
+        _osdTimer.Tick += (_, _) => { _osdTimer.Stop(); OsdText = string.Empty; };
         Engine.PositionChanged += (_, pos) =>
         {
             Position = pos;
@@ -33,6 +47,30 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 PositionRatio = pos.TotalSeconds / Duration.TotalSeconds;
         };
         Engine.PlaybackEnded += (_, _) => OnPlaybackEnded();
+        Engine.StatisticsUpdated += (_, stats) =>
+        {
+            int total = stats.DroppedFrames + stats.DisplayedFrames;
+            double dropRate = total > 0 ? stats.DroppedFrames * 100.0 / total : 0.0;
+            StatusText = $"表示 {stats.DisplayedFrames} / ドロップ {stats.DroppedFrames} ({dropRate:F1}%)  映像遅延 {stats.VideoLagSec * 1000:F0}ms";
+        };
+
+        IsDebugMode = Settings.DebugMode;
+    }
+
+    partial void OnIsDebugModeChanged(bool value)
+    {
+        if (value) DiagnosticLog.Enable(LogDirectory);
+        else DiagnosticLog.Disable();
+        Settings.DebugMode = value;
+        Settings.Save();
+    }
+
+    /// <summary>現在の各トラックのミュート状態を、次回以降ファイルを開いたときの既定値として保存する。</summary>
+    public void SaveCurrentMutesAsDefault()
+    {
+        Settings.DefaultMutedTracks = AudioTracks.Where(t => t.IsMuted).Select(t => t.TrackNumber).ToList();
+        Settings.Save();
+        DiagnosticLog.Write("ui", $"既定ミュート保存 tracks=[{string.Join(",", Settings.DefaultMutedTracks)}]");
     }
 
     [ObservableProperty] private double _positionRatio;
@@ -43,7 +81,31 @@ public partial class MainViewModel : ObservableObject, IDisposable
             Engine.Seek(TimeSpan.FromSeconds(value * Duration.TotalSeconds));
     }
 
-    partial void OnMasterVolumeChanged(double value) => Engine.SetMasterVolume((float)(value / 100.0));
+    partial void OnMasterVolumeChanged(double value)
+    {
+        // スライダー操作でマスター音量を変えたら、ミュート状態と実際に聞こえる音を一致させるため自動的に解除する
+        if (IsMasterMuted) IsMasterMuted = false;
+        else Engine.SetMasterVolume((float)(value / 100.0));
+        ShowOsd($"音量 {value:0}%");
+    }
+
+    partial void OnIsMasterMutedChanged(bool value)
+    {
+        Engine.SetMasterVolume(value ? 0f : (float)(MasterVolume / 100.0));
+        DiagnosticLog.Write("ui", $"マスターミュート切替 muted={value}");
+        ShowOsd(value ? "ミュート" : "ミュート解除");
+    }
+
+    [RelayCommand]
+    private void ToggleMute() => IsMasterMuted = !IsMasterMuted;
+
+    /// <summary>操作内容を一瞬だけ画面に表示する（何をしたか分かりにくいという声を受けて追加）。</summary>
+    public void ShowOsd(string text)
+    {
+        OsdText = text;
+        _osdTimer.Stop();
+        _osdTimer.Start();
+    }
 
     public void OpenFile(string path)
     {
@@ -56,7 +118,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         AudioTracks.Clear();
         foreach (var track in info.AudioTracks)
-            AudioTracks.Add(new AudioTrackViewModel(track, Engine.SetTrackVolume, Engine.SetTrackMute));
+        {
+            var trackVm = new AudioTrackViewModel(track, Engine.SetTrackVolume, Engine.SetTrackMute);
+            // 設定でデフォルトミュート指定されたトラック番号は最初からミュートで開く
+            if (Settings.DefaultMutedTracks.Contains(trackVm.TrackNumber))
+                trackVm.IsMuted = true;
+            AudioTracks.Add(trackVm);
+        }
 
         RefreshChapters();
         Engine.Play();
@@ -73,53 +141,91 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private void PlayPause()
     {
-        if (PlaybackState == PlaybackState.Playing) { Engine.Pause(); PlaybackState = PlaybackState.Paused; }
-        else { Engine.Play(); PlaybackState = PlaybackState.Playing; }
+        if (PlaybackState == PlaybackState.Playing)
+        {
+            Engine.Pause();
+            PlaybackState = PlaybackState.Paused;
+            ShowOsd("一時停止");
+        }
+        else
+        {
+            Engine.Play();
+            PlaybackState = PlaybackState.Playing;
+            ShowOsd("再生");
+        }
     }
 
     [RelayCommand]
-    private void Stop() { Engine.Stop(); PlaybackState = PlaybackState.Stopped; Position = TimeSpan.Zero; }
+    private void Stop()
+    {
+        Engine.Stop();
+        PlaybackState = PlaybackState.Stopped;
+        Position = TimeSpan.Zero;
+        ShowOsd("停止");
+    }
 
     [RelayCommand]
-    private void StepForward() => Engine.StepForward();
+    private void StepForward()
+    {
+        if (PlaybackState != PlaybackState.Paused) return;
+        Engine.StepForward();
+        ShowOsd("コマ送り");
+    }
 
     [RelayCommand]
-    private void StepBackward() => Engine.StepBackward();
+    private void StepBackward()
+    {
+        if (PlaybackState != PlaybackState.Paused) return;
+        Engine.StepBackward();
+        ShowOsd("コマ戻し");
+    }
 
-    public void Skip(double seconds) => Engine.Seek(Position + TimeSpan.FromSeconds(seconds));
+    public void Skip(double seconds)
+    {
+        Engine.Seek(Position + TimeSpan.FromSeconds(seconds));
+        ShowOsd(seconds >= 0 ? $"+{seconds:0}秒" : $"{seconds:0}秒");
+    }
 
     public void ChangeSpeed(double delta)
     {
         PlaybackSpeed = Math.Clamp(PlaybackSpeed + delta, 0.1, 2.0);
         Engine.SetPlaybackSpeed(PlaybackSpeed);
+        ShowOsd($"速度 {PlaybackSpeed:0.00}x");
     }
 
     public void SetSpeed(double speed)
     {
         PlaybackSpeed = speed;
         Engine.SetPlaybackSpeed(speed);
+        ShowOsd($"速度 {PlaybackSpeed:0.00}x");
     }
 
     public void ToggleChapterAtCurrentPosition()
     {
         var near = Engine.FindUserChapterNear(Position, TimeSpan.FromSeconds(0.5));
         if (near != null)
+        {
             Engine.RemoveUserChapter(near);
+            ShowOsd("チャプター削除");
+        }
         else
+        {
             Engine.AddUserChapter(new ChapterInfo(0, $"Chapter {Chapters.Count + 1}", Position, true));
+            ShowOsd("チャプター追加");
+        }
         RefreshChapters();
     }
 
     public void PlayNext()
     {
         var next = Playlist.MoveNext();
-        if (next != null) OpenFile(next);
+        if (next != null) { OpenFile(next); ShowOsd("次のファイル"); }
     }
 
     public void PlayPrevious()
     {
         var prev = Playlist.MovePrevious();
-        if (prev != null) OpenFile(prev);
+        if (prev != null) { OpenFile(prev); ShowOsd("前のファイル"); }
     }
 
     private void OnPlaybackEnded()

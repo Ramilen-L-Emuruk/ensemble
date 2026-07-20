@@ -2,9 +2,9 @@
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using Microsoft.Win32;
 using MultiTrackPlayer.Core.Enums;
-using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.UI.Settings;
 using MultiTrackPlayer.UI.ViewModels;
 using MultiTrackPlayer.UI.Windows;
@@ -19,8 +19,10 @@ public partial class MainWindow : Window
     private PlaylistWindow? _playlistWindow;
     private ChapterWindow? _chapterWindow;
     private WriteableBitmap? _bitmap;
+    private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
     private WindowState _prevWindowState;
     private WindowStyle _prevWindowStyle;
+    private readonly DispatcherTimer _overlayHideTimer = new() { Interval = TimeSpan.FromSeconds(2.5) };
 
     public MainWindow()
     {
@@ -28,22 +30,56 @@ public partial class MainWindow : Window
         DataContext = _vm;
         _kb.Load();
 
-        _vm.Engine.VideoFrameReady += Engine_VideoFrameReady;
         _vm.Engine.PositionChanged += (_, _) => UpdateSeekBarChapters();
 
         SeekBar.Seeking += (_, ratio) =>
             _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
+        FullscreenSeekBar.Seeking += (_, ratio) =>
+            _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
+
+        _overlayHideTimer.Tick += (_, _) =>
+        {
+            _overlayHideTimer.Stop();
+            FullscreenOverlay.Visibility = Visibility.Collapsed;
+        };
+        MouseMove += (_, _) => { if (_vm.IsFullscreen) ShowFullscreenOverlay(); };
+
+        CompositionTarget.Rendering += OnRendering;
+
+        // コマンドライン引数で渡された動画ファイルを起動時に開く
+        Loaded += (_, _) =>
+        {
+            var files = App.StartupArgs.Where(System.IO.File.Exists).ToArray();
+            if (files.Length == 0) return;
+            _vm.Playlist.AddFiles(files);
+            _vm.OpenFile(files[0]);
+            UpdateSeekBarChapters();
+        };
     }
 
-    private void Engine_VideoFrameReady(object? sender, VideoFrameData frame)
+    // 映像フレームをエンジンからプルする。VideoFrameLease は byte[] を経由せず
+    // ネイティブバッファから直接 WritePixels するため、毎フレームの確保が発生しない。
+    private void OnRendering(object? sender, EventArgs e)
     {
-        Dispatcher.BeginInvoke(() =>
+        var lease = _vm.Engine.TryGetFrame(_vm.Engine.Position);
+        if (lease == null) return;
+
+        if (lease.Pts == _lastRenderedPts)
         {
-            if (_bitmap is null || _bitmap.PixelWidth != frame.Width || _bitmap.PixelHeight != frame.Height)
-                _bitmap = new WriteableBitmap(frame.Width, frame.Height, 96, 96, PixelFormats.Bgra32, null);
-            _bitmap.WritePixels(new Int32Rect(0, 0, frame.Width, frame.Height), frame.Pixels, frame.Width * 4, 0);
-            VideoImage.Source = _bitmap;
-        });
+            _vm.Engine.ReturnFrame(lease);
+            return;
+        }
+
+        if (_bitmap is null || _bitmap.PixelWidth != lease.Width || _bitmap.PixelHeight != lease.Height)
+            _bitmap = new WriteableBitmap(lease.Width, lease.Height, 96, 96, PixelFormats.Bgra32, null);
+
+        _bitmap.WritePixels(
+            new Int32Rect(0, 0, lease.Width, lease.Height),
+            lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
+        VideoImage.Source = _bitmap;
+        _lastRenderedPts = lease.Pts;
+
+        _vm.Engine.ReturnFrame(lease);
     }
 
     private void UpdateSeekBarChapters()
@@ -59,6 +95,14 @@ public partial class MainWindow : Window
     // ── Key handling ──
     private void Window_KeyDown(object sender, KeyEventArgs e)
     {
+        if (e.Key == Key.Escape && _vm.IsFullscreen)
+        {
+            ToggleFullscreen();
+            e.Handled = true;
+            return;
+        }
+        if (_vm.IsFullscreen) ShowFullscreenOverlay();
+
         string keyStr = BuildKeyStr(e);
         string? cmd = _kb.GetCommand(keyStr);
         if (cmd == null) return;
@@ -82,8 +126,8 @@ public partial class MainWindow : Window
         {
             case "PlayPause":     _vm.PlayPauseCommand.Execute(null); break;
             case "Stop":          _vm.StopCommand.Execute(null); break;
-            case "StepForward":   if (_vm.PlaybackState == PlaybackState.Paused) _vm.Engine.StepForward(); break;
-            case "StepBackward":  if (_vm.PlaybackState == PlaybackState.Paused) _vm.Engine.StepBackward(); break;
+            case "StepForward":   _vm.StepForwardCommand.Execute(null); break;
+            case "StepBackward":  _vm.StepBackwardCommand.Execute(null); break;
             case "Skip+10":       _vm.Skip(10); break;
             case "Skip-10":       _vm.Skip(-10); break;
             case "Skip+3":        _vm.Skip(3); break;
@@ -92,10 +136,11 @@ public partial class MainWindow : Window
             case "Skip-60":       _vm.Skip(-60); break;
             case "VolumeUp":      _vm.MasterVolume = Math.Min(100, _vm.MasterVolume + 5); break;
             case "VolumeDown":    _vm.MasterVolume = Math.Max(0, _vm.MasterVolume - 5); break;
+            case "Mute":          _vm.ToggleMuteCommand.Execute(null); break;
             case "SpeedUp":       _vm.ChangeSpeed(0.25); break;
             case "SpeedDown":     _vm.ChangeSpeed(-0.25); break;
-            case "NextChapter":   _vm.Engine.JumpToNextChapter(); break;
-            case "PrevChapter":   _vm.Engine.JumpToPreviousChapter(); break;
+            case "NextChapter":   _vm.Engine.JumpToNextChapter(); _vm.ShowOsd("次のチャプター"); break;
+            case "PrevChapter":   _vm.Engine.JumpToPreviousChapter(); _vm.ShowOsd("前のチャプター"); break;
             case "NextFile":      _vm.PlayNext(); break;
             case "PrevFile":      _vm.PlayPrevious(); break;
             case "ToggleChapter": _vm.ToggleChapterAtCurrentPosition(); UpdateSeekBarChapters(); break;
@@ -126,12 +171,32 @@ public partial class MainWindow : Window
             _prevWindowStyle = WindowStyle;
             WindowStyle = WindowStyle.None;
             WindowState = WindowState.Maximized;
+            // メニュー・トランスポートバーを消し、映像用 Grid が DockPanel の残り全域（＝画面全体）を占めるようにする
+            AppMenu.Visibility = Visibility.Collapsed;
+            TransportBar.Visibility = Visibility.Collapsed;
+            _vm.IsFullscreen = true;
+            ShowFullscreenOverlay(); // 切替直後は一旦見せて、無操作なら自動的に消える
+            _vm.ShowOsd("フルスクリーン");
         }
         else
         {
             WindowStyle = _prevWindowStyle == WindowStyle.None ? WindowStyle.SingleBorderWindow : _prevWindowStyle;
             WindowState = _prevWindowState;
+            AppMenu.Visibility = Visibility.Visible;
+            TransportBar.Visibility = Visibility.Visible;
+            _vm.IsFullscreen = false;
+            _overlayHideTimer.Stop();
+            FullscreenOverlay.Visibility = Visibility.Collapsed;
+            _vm.ShowOsd("フルスクリーン解除");
         }
+    }
+
+    /// <summary>フルスクリーン中にシークバー＋現在時刻/長さのオーバーレイを表示し、無操作タイマーをリセットする。</summary>
+    private void ShowFullscreenOverlay()
+    {
+        FullscreenOverlay.Visibility = Visibility.Visible;
+        _overlayHideTimer.Stop();
+        _overlayHideTimer.Start();
     }
 
     // ── Menu handlers ──
@@ -143,8 +208,9 @@ public partial class MainWindow : Window
     private void MenuFullscreen_Click(object s, RoutedEventArgs e) => ToggleFullscreen();
     private void MenuPlayPause_Click(object s, RoutedEventArgs e) => _vm.PlayPauseCommand.Execute(null);
     private void MenuStop_Click(object s, RoutedEventArgs e) => _vm.StopCommand.Execute(null);
-    private void MenuStepFwd_Click(object s, RoutedEventArgs e) => _vm.Engine.StepForward();
-    private void MenuStepBwd_Click(object s, RoutedEventArgs e) => _vm.Engine.StepBackward();
+    private void MenuStepFwd_Click(object s, RoutedEventArgs e) => _vm.StepForwardCommand.Execute(null);
+    private void MenuStepBwd_Click(object s, RoutedEventArgs e) => _vm.StepBackwardCommand.Execute(null);
+    private void MenuSaveDefaultMutes_Click(object s, RoutedEventArgs e) => _vm.SaveCurrentMutesAsDefault();
 
     // ── Transport ──
     private void PlayPause_Click(object s, RoutedEventArgs e) => _vm.PlayPauseCommand.Execute(null);
@@ -190,6 +256,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        CompositionTarget.Rendering -= OnRendering;
         _vm.Dispose();
         base.OnClosed(e);
     }

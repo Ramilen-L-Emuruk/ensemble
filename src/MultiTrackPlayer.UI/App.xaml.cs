@@ -13,5 +13,13 @@ namespace MultiTrackPlayer.UI
     /// </summary>
     public partial class App : Application
     {
+        /// <summary>起動時のコマンドライン引数（動画ファイルパス）。MainWindow が Loaded 時に参照する。</summary>
+        public static string[] StartupArgs { get; private set; } = Array.Empty<string>();
+
+        protected override void OnStartup(StartupEventArgs e)
+        {
+            base.OnStartup(e);
+            StartupArgs = e.Args;
+        }
     }
 }

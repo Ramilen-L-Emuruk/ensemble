@@ -1,7 +1,5 @@
-﻿using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Utilities;
 using Sdcb.FFmpeg.Raw;
-using System.Runtime.InteropServices;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
 
 namespace MultiTrackPlayer.Engine.Decoding;
@@ -10,6 +8,10 @@ public unsafe class VideoDecoder : IDisposable
 {
     private AVCodecContext* _ctx;
     private AVBufferRef* _hwCtx;
+    // 注意: sws_scale_frame + threads によるマルチスレッド変換は FFmpeg 6.0 では使えない。
+    // buf 未割当の dst フレーム（外部プールバッファを data に直指定）に対して、エラーではなく
+    // 「内部バッファを新規確保して成功を返す」ため、プールには何も書かれず黒画面になる
+    // （実機検証で確認済み）。単スレッド sws_scale が正しい経路。
     private SwsContext* _swsCtx;
     private readonly int _streamIndex;
     private readonly AVRational _timeBase;
@@ -41,18 +43,27 @@ public unsafe class VideoDecoder : IDisposable
         if (ret < 0) throw new InvalidOperationException($"Could not open video codec: {ret}");
     }
 
-    public VideoFrameData? DecodePacket(AVPacket* pkt)
+    /// <summary>デコーダへパケットを送る（pkt に null を渡すと EOF フラッシュ）。avcodec_send_packet の戻り値をそのまま返す。</summary>
+    public int SendPacket(AVPacket* pkt) => avcodec_send_packet(_ctx, pkt);
+
+    /// <summary>1フレーム分だけ受信する。EAGAIN/EOF なら false（呼び出し側はループを抜ける）。</summary>
+    public bool TryReceiveFrame(AVFrame* frame) => avcodec_receive_frame(_ctx, frame) == 0;
+
+    public double GetPtsSeconds(AVFrame* frame)
     {
-        int ret = avcodec_send_packet(_ctx, pkt);
-        if (ret < 0) return null;
-        using var frame = new FrameHolder();
-        ret = avcodec_receive_frame(_ctx, frame.Frame);
-        if (ret < 0) return null;
-        return ConvertFrame(frame.Frame);
+        long pts = frame->best_effort_timestamp;
+        if (pts == long.MinValue) pts = 0; // AV_NOPTS_VALUE
+        return Math.Max(0.0, pts * av_q2d(_timeBase));
     }
 
-    private VideoFrameData? ConvertFrame(AVFrame* srcFrame)
+    /// <summary>
+    /// D3D11VA サーフェスなら CPU へ転送し、BGRA へ変換して dst（少なくとも frame の幅×高さ×4 バイト確保済み）へ書き込む。
+    /// 呼び出し側のプールバッファへ直接書くため、このメソッド自体は byte[] を確保しない。
+    /// </summary>
+    public bool ConvertInto(AVFrame* srcFrame, IntPtr dst, int dstStride, out int width, out int height)
     {
+        width = 0;
+        height = 0;
         AVFrame* frame = srcFrame;
         AVFrame* swFrame = null;
         try
@@ -65,7 +76,7 @@ public unsafe class VideoDecoder : IDisposable
                 {
                     swFrame = av_frame_alloc();
                     int ret = av_hwframe_transfer_data(swFrame, frame, 0);
-                    if (ret < 0) return null;
+                    if (ret < 0) return false;
                     frame = swFrame;
                 }
                 // else: コーデックがソフトウェアデコードにフォールバック済みのため直接使用
@@ -73,7 +84,7 @@ public unsafe class VideoDecoder : IDisposable
 
             int w = frame->width;
             int h = frame->height;
-            if (w <= 0 || h <= 0) return null;
+            if (w <= 0 || h <= 0) return false;
 
             var srcFmt = (AVPixelFormat)frame->format;
 
@@ -82,9 +93,7 @@ public unsafe class VideoDecoder : IDisposable
                 w, h, AVPixelFormat.Bgra,
                 2, null, null, null); // 2 = SWS_BILINEAR
 
-            if (_swsCtx == null) return null;
-
-            var pixels = new byte[w * h * 4];
+            if (_swsCtx == null) return false;
 
             var srcDataArr = new byte*[] {
                 (byte*)frame->data[0], (byte*)frame->data[1], (byte*)frame->data[2], (byte*)frame->data[3],
@@ -94,19 +103,13 @@ public unsafe class VideoDecoder : IDisposable
                 frame->linesize[0], frame->linesize[1], frame->linesize[2], frame->linesize[3],
                 0, 0, 0, 0
             };
+            var dstData = new byte*[] { (byte*)dst, null, null, null, null, null, null, null };
+            var dstStrideArr = new int[] { dstStride, 0, 0, 0, 0, 0, 0, 0 };
+            sws_scale(_swsCtx, srcDataArr, srcStride, 0, h, dstData, dstStrideArr);
 
-            fixed (byte* dstPtr = pixels)
-            {
-                var dstData = new byte*[] { dstPtr, null, null, null, null, null, null, null };
-                var dstStride = new int[] { w * 4, 0, 0, 0, 0, 0, 0, 0 };
-                sws_scale(_swsCtx, srcDataArr, srcStride, 0, h, dstData, dstStride);
-            }
-
-            long pts = srcFrame->best_effort_timestamp;
-            // AV_NOPTS_VALUE (long.MinValue) の場合は 0 で代替
-            if (pts == long.MinValue) pts = 0;
-            double seconds = Math.Max(0.0, pts * av_q2d(_timeBase));
-            return new VideoFrameData(pixels, w, h, TimeSpan.FromSeconds(seconds));
+            width = w;
+            height = h;
+            return true;
         }
         finally
         {
@@ -121,11 +124,5 @@ public unsafe class VideoDecoder : IDisposable
         if (_swsCtx != null) { sws_freeContext(_swsCtx); _swsCtx = null; }
         if (_hwCtx != null) { AVBufferRef* h = _hwCtx; av_buffer_unref(&h); _hwCtx = null; }
         if (_ctx != null) { AVCodecContext* c = _ctx; avcodec_free_context(&c); _ctx = null; }
-    }
-
-    private unsafe class FrameHolder : IDisposable
-    {
-        public AVFrame* Frame = av_frame_alloc();
-        public void Dispose() { if (Frame != null) { AVFrame* f = Frame; av_frame_free(&f); } Frame = null; }
     }
 }

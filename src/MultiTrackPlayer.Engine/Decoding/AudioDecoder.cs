@@ -1,4 +1,4 @@
-﻿using Sdcb.FFmpeg.Raw;
+using Sdcb.FFmpeg.Raw;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
 
 namespace MultiTrackPlayer.Engine.Decoding;
@@ -10,13 +10,14 @@ public unsafe class AudioDecoder : IDisposable
     private readonly AVRational _timeBase;
 
     public int StreamIndex { get; }
-    public const int OutSampleRate = 44100;
+    // OBS 等の一般的なソースは 48kHz のため、無意味なリサンプルを避けるべく出力もネイティブに合わせる
+    public const int OutSampleRate = 48000;
     public const int OutChannels = 2;
     public static readonly AVSampleFormat OutFormat = AVSampleFormat.Flt;
 
     private double _playbackSpeed = 1.0;
     // 再生速度を変更すると SWR コンテキストを再初期化して有効出力レートを調整する
-    // speed 2.0 → effectiveOutRate = 22050 → 1 source秒あたり半数サンプル → WASAPI が 0.5 秒で消費 → 2x 速再生
+    // speed 2.0 → effectiveOutRate = 24000 → 1 source秒あたり半数サンプル → WASAPI が 0.5 秒で消費 → 2x 速再生
     public double PlaybackSpeed
     {
         get => _playbackSpeed;
@@ -28,6 +29,8 @@ public unsafe class AudioDecoder : IDisposable
             if (_swrCtx != null) { SwrContext* s = _swrCtx; swr_free(&s); _swrCtx = null; }
         }
     }
+
+    public int EffectiveOutSampleRate => (int)(OutSampleRate / _playbackSpeed);
 
     public AudioDecoder(AVStream* stream)
     {
@@ -43,37 +46,25 @@ public unsafe class AudioDecoder : IDisposable
         if (ret < 0) throw new InvalidOperationException($"Could not open audio codec: {ret}");
     }
 
-    public byte[]? DecodePacket(AVPacket* pkt)
+    /// <summary>デコーダへパケットを送る（pkt に null を渡すと EOF フラッシュ）。avcodec_send_packet の戻り値をそのまま返す。</summary>
+    public int SendPacket(AVPacket* pkt) => avcodec_send_packet(_ctx, pkt);
+
+    /// <summary>1フレーム分だけ受信する。EAGAIN/EOF なら false（呼び出し側はループを抜ける）。</summary>
+    public bool TryReceiveFrame(AVFrame* frame) => avcodec_receive_frame(_ctx, frame) == 0;
+
+    public double GetPtsSeconds(AVFrame* frame)
     {
-        int ret = avcodec_send_packet(_ctx, pkt);
-        if (ret < 0) return null;
-
-        // 1パケットから複数フレームが出るコーデックに対応するためループで受け取る
-        var segments = new List<byte[]>();
-        AVFrame* frame = av_frame_alloc();
-        try
-        {
-            while (avcodec_receive_frame(_ctx, frame) == 0)
-            {
-                var pcm = Resample(frame);
-                if (pcm != null) segments.Add(pcm);
-                av_frame_unref(frame);
-            }
-        }
-        finally
-        {
-            av_frame_free(&frame);
-        }
-
-        if (segments.Count == 0) return null;
-        if (segments.Count == 1) return segments[0];
-
-        int total = segments.Sum(s => s.Length);
-        var result = new byte[total];
-        int offset = 0;
-        foreach (var seg in segments) { Buffer.BlockCopy(seg, 0, result, offset, seg.Length); offset += seg.Length; }
-        return result;
+        long pts = frame->pts;
+        if (pts == long.MinValue) pts = frame->best_effort_timestamp;
+        if (pts == long.MinValue) return double.NaN; // AV_NOPTS_VALUE
+        return pts * av_q2d(_timeBase);
     }
+
+    public int NbSamples(AVFrame* frame) => frame->nb_samples;
+    public int InSampleRate(AVFrame* frame) => frame->sample_rate;
+
+    /// <summary>デコード済みフレームを OutSampleRate/OutChannels/OutFormat へリサンプルする。</summary>
+    public byte[]? ResampleFrame(AVFrame* frame) => Resample(frame);
 
     private byte[]? Resample(AVFrame* frame)
     {
@@ -115,7 +106,7 @@ public unsafe class AudioDecoder : IDisposable
 
         // effectiveOutRate = OutSampleRate / speed で SWR に出力密度を伝える
         // → WASAPI は OutSampleRate で消費するので speed 倍の速度で再生される
-        int effectiveOutRate = (int)(OutSampleRate / _playbackSpeed);
+        int effectiveOutRate = EffectiveOutSampleRate;
         SwrContext* ctx = null;
         swr_alloc_set_opts2(&ctx,
             &outLayout, OutFormat, effectiveOutRate,
@@ -127,31 +118,11 @@ public unsafe class AudioDecoder : IDisposable
         av_channel_layout_uninit(&outLayout);
     }
 
-    public void FlushBuffers()
-    {
-        avcodec_flush_buffers(_ctx);
-        if (_swrCtx != null)
-            swr_set_compensation(_swrCtx, 0, OutSampleRate); // フラッシュ時はドリフト補正をリセット
-    }
-
-    // swr_set_compensation を使ったソフト補正（VLC aout_FiltersAdjustResampling 相当）
-    // sampleDelta > 0 → サンプル追加（masterClock 前進を速める）→ 映像先行ドリフト補正
-    // sampleDelta < 0 → サンプル削除（masterClock 前進を遅らせる）→ 映像遅延ドリフト補正
-    public void SetDriftCompensation(int sampleDelta, int compensationDistance)
-    {
-        if (_swrCtx == null) return;
-        swr_set_compensation(_swrCtx, sampleDelta, compensationDistance);
-    }
+    public void FlushBuffers() => avcodec_flush_buffers(_ctx);
 
     public void Dispose()
     {
         if (_swrCtx != null) { SwrContext* s = _swrCtx; swr_free(&s); _swrCtx = null; }
         if (_ctx != null) { AVCodecContext* c = _ctx; avcodec_free_context(&c); _ctx = null; }
-    }
-
-    private unsafe class FrameHolder : IDisposable
-    {
-        public AVFrame* Frame = av_frame_alloc();
-        public void Dispose() { if (Frame != null) { AVFrame* f = Frame; av_frame_free(&f); } Frame = null; }
     }
 }
