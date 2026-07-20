@@ -89,6 +89,7 @@
                         <ComboBoxItem Tag="1.0" IsSelected="True">1.0x</ComboBoxItem>
                         <ComboBoxItem Tag="1.25">1.25x</ComboBoxItem>
                         <ComboBoxItem Tag="1.5">1.5x</ComboBoxItem>
+                        <ComboBoxItem Tag="1.75">1.75x</ComboBoxItem>
                         <ComboBoxItem Tag="2.0">2.0x</ComboBoxItem>
                     </ComboBox>
                 </StackPanel>
