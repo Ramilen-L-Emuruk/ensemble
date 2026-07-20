@@ -31,6 +31,13 @@ public partial class MainWindow : Window
         DataContext = _vm;
         _kb.Load();
 
+        // SpeedBox はプリセット項目の静的な ComboBox で PlaybackSpeed に双方向バインドしていないため、
+        // キーボードショートカットやメニューからの速度変更を選択表示へ手動で反映する
+        _vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(MainViewModel.PlaybackSpeed)) SyncSpeedBox();
+        };
+
         _vm.Engine.PositionChanged += (_, _) => UpdateSeekBarChapters();
 
         SeekBar.Seeking += (_, ratio) =>
@@ -81,6 +88,20 @@ public partial class MainWindow : Window
         _lastRenderedPts = lease.Pts;
 
         _vm.Engine.ReturnFrame(lease);
+    }
+
+    private void SyncSpeedBox()
+    {
+        foreach (System.Windows.Controls.ComboBoxItem item in SpeedBox.Items)
+        {
+            if (item.Tag is string s && double.TryParse(s, out double v) &&
+                Math.Abs(v - _vm.PlaybackSpeed) < 0.001)
+            {
+                SpeedBox.SelectedItem = item;
+                return;
+            }
+        }
+        SpeedBox.SelectedIndex = -1;
     }
 
     private void UpdateSeekBarChapters()
