@@ -2,6 +2,7 @@
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using Microsoft.Win32;
 using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.UI.Settings;
@@ -21,6 +22,7 @@ public partial class MainWindow : Window
     private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
     private WindowState _prevWindowState;
     private WindowStyle _prevWindowStyle;
+    private readonly DispatcherTimer _overlayHideTimer = new() { Interval = TimeSpan.FromSeconds(2.5) };
 
     public MainWindow()
     {
@@ -32,6 +34,15 @@ public partial class MainWindow : Window
 
         SeekBar.Seeking += (_, ratio) =>
             _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
+        FullscreenSeekBar.Seeking += (_, ratio) =>
+            _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
+
+        _overlayHideTimer.Tick += (_, _) =>
+        {
+            _overlayHideTimer.Stop();
+            FullscreenOverlay.Visibility = Visibility.Collapsed;
+        };
+        MouseMove += (_, _) => { if (_vm.IsFullscreen) ShowFullscreenOverlay(); };
 
         CompositionTarget.Rendering += OnRendering;
 
@@ -90,6 +101,7 @@ public partial class MainWindow : Window
             e.Handled = true;
             return;
         }
+        if (_vm.IsFullscreen) ShowFullscreenOverlay();
 
         string keyStr = BuildKeyStr(e);
         string? cmd = _kb.GetCommand(keyStr);
@@ -162,6 +174,7 @@ public partial class MainWindow : Window
             AppMenu.Visibility = Visibility.Collapsed;
             TransportBar.Visibility = Visibility.Collapsed;
             _vm.IsFullscreen = true;
+            ShowFullscreenOverlay(); // 切替直後は一旦見せて、無操作なら自動的に消える
         }
         else
         {
@@ -170,7 +183,17 @@ public partial class MainWindow : Window
             AppMenu.Visibility = Visibility.Visible;
             TransportBar.Visibility = Visibility.Visible;
             _vm.IsFullscreen = false;
+            _overlayHideTimer.Stop();
+            FullscreenOverlay.Visibility = Visibility.Collapsed;
         }
+    }
+
+    /// <summary>フルスクリーン中にシークバー＋現在時刻/長さのオーバーレイを表示し、無操作タイマーをリセットする。</summary>
+    private void ShowFullscreenOverlay()
+    {
+        FullscreenOverlay.Visibility = Visibility.Visible;
+        _overlayHideTimer.Stop();
+        _overlayHideTimer.Start();
     }
 
     // ── Menu handlers ──
