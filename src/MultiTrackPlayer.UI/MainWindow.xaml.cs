@@ -18,6 +18,7 @@ public partial class MainWindow : Window
     private MixerWindow? _mixerWindow;
     private PlaylistWindow? _playlistWindow;
     private ChapterWindow? _chapterWindow;
+    private ShortcutsWindow? _shortcutsWindow;
     private WriteableBitmap? _bitmap;
     private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
     private WindowState _prevWindowState;
@@ -151,6 +152,7 @@ public partial class MainWindow : Window
             case "ToggleChapter": _vm.ToggleChapterAtCurrentPosition(); UpdateSeekBarChapters(); break;
             case "Fullscreen":    ToggleFullscreen(); break;
             case "Open":          OpenFileDialog(); break;
+            case "ShowShortcuts": GetShortcuts().Show(); break;
         }
     }
 
@@ -211,6 +213,7 @@ public partial class MainWindow : Window
     private void MenuPlaylist_Click(object s, RoutedEventArgs e) => GetPlaylist().Show();
     private void MenuChapter_Click(object s, RoutedEventArgs e) => GetChapter().Show();
     private void MenuFullscreen_Click(object s, RoutedEventArgs e) => ToggleFullscreen();
+    private void MenuShortcuts_Click(object s, RoutedEventArgs e) => GetShortcuts().Show();
     private void MenuPlayPause_Click(object s, RoutedEventArgs e) => _vm.PlayPauseCommand.Execute(null);
     private void MenuStop_Click(object s, RoutedEventArgs e) => _vm.StopCommand.Execute(null);
     private void MenuStepFwd_Click(object s, RoutedEventArgs e) => _vm.StepForwardCommand.Execute(null);
@@ -258,6 +261,8 @@ public partial class MainWindow : Window
         => _playlistWindow ??= new PlaylistWindow(_vm) { Owner = this };
     private ChapterWindow GetChapter()
         => _chapterWindow ??= new ChapterWindow(_vm) { Owner = this };
+    private ShortcutsWindow GetShortcuts()
+        => _shortcutsWindow ??= new ShortcutsWindow(_kb) { Owner = this };
 
     protected override void OnClosed(EventArgs e)
     {
