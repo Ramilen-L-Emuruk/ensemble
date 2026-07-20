@@ -13,12 +13,36 @@
                  MouseDoubleClick="ChapterList_MouseDoubleClick"
                  PreviewKeyDown="ChapterList_PreviewKeyDown">
             <ListBox.ItemContainerStyle>
+                <!--
+                    既定の ListBoxItem テーマスタイルは選択時に背景を独自に塗り替えてしまい、
+                    Style.Triggers で設定した IsCurrent の背景色が選択中は隠れてしまう。
+                    そのため Background は IsCurrent 専任、選択状態は枠線で表現するよう分離する。
+                -->
                 <Style TargetType="ListBoxItem">
-                    <Style.Triggers>
-                        <DataTrigger Binding="{Binding IsCurrent}" Value="True">
-                            <Setter Property="Background" Value="#FF2D4A63"/>
-                        </DataTrigger>
-                    </Style.Triggers>
+                    <Setter Property="Padding" Value="2"/>
+                    <Setter Property="Template">
+                        <Setter.Value>
+                            <ControlTemplate TargetType="ListBoxItem">
+                                <Border x:Name="Bd" Background="Transparent"
+                                        BorderThickness="1" BorderBrush="Transparent"
+                                        Padding="{TemplateBinding Padding}"
+                                        SnapsToDevicePixels="True">
+                                    <ContentPresenter/>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <DataTrigger Binding="{Binding IsCurrent}" Value="True">
+                                        <Setter TargetName="Bd" Property="Background" Value="#FF2D4A63"/>
+                                    </DataTrigger>
+                                    <Trigger Property="IsMouseOver" Value="True">
+                                        <Setter TargetName="Bd" Property="Background" Value="#FF3A3A3A"/>
+                                    </Trigger>
+                                    <Trigger Property="IsSelected" Value="True">
+                                        <Setter TargetName="Bd" Property="BorderBrush" Value="#FF64B5F6"/>
+                                    </Trigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </Setter.Value>
+                    </Setter>
                 </Style>
             </ListBox.ItemContainerStyle>
             <ListBox.ItemTemplate>
