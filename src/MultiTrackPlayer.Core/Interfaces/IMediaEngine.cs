@@ -27,10 +27,16 @@ public interface IMediaEngine : IDisposable
     void JumpToPreviousChapter();
     void JumpToNextChapter();
 
-    event EventHandler<VideoFrameData> VideoFrameReady;
+    /// <summary>
+    /// 現在位置に表示すべき新しいフレームがあればリースして返す（無ければ null）。
+    /// 呼び出し側は使い終えたら必ず ReturnFrame で返却すること。呼び出しは UI スレッドから行う想定。
+    /// </summary>
+    VideoFrameLease? TryGetFrame(TimeSpan position);
+    void ReturnFrame(VideoFrameLease lease);
+
     event EventHandler<TimeSpan> PositionChanged;
     event EventHandler PlaybackEnded;
     event EventHandler<PlaybackStatistics>? StatisticsUpdated;
 }
 
-public record PlaybackStatistics(int DroppedFrames, int DisplayedFrames, double AverageDriftSec);
+public record PlaybackStatistics(int DroppedFrames, int DisplayedFrames, double VideoLagSec);

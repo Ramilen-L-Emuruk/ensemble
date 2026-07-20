@@ -15,8 +15,8 @@ public class KeyBindings
     {
         ["Space"]        = "PlayPause",
         ["S"]            = "Stop",
-        ["Period"]       = "StepForward",
-        ["Comma"]        = "StepBackward",
+        ["OemPeriod"]    = "StepForward",
+        ["OemComma"]     = "StepBackward",
         ["Right"]        = "Skip+10",
         ["Left"]         = "Skip-10",
         ["Shift+Right"]  = "Skip+3",

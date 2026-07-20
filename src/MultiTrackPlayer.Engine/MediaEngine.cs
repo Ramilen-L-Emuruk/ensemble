@@ -3,7 +3,10 @@ using MultiTrackPlayer.Core.Interfaces;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Audio;
 using MultiTrackPlayer.Engine.Decoding;
+using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.Engine.Pipeline;
 using MultiTrackPlayer.Engine.Sync;
+using MultiTrackPlayer.Engine.Video;
 using NAudio.Wave;
 using Sdcb.FFmpeg.Raw;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
@@ -18,35 +21,42 @@ public unsafe class MediaEngine : IMediaEngine
     private VideoDecoder? _videoDecoder;
     private readonly List<AudioDecoder> _audioDecoders = new();
     private readonly List<AudioTrackState> _audioStates = new();
+    private readonly Dictionary<int, int> _audioStreamToTrack = new();
     private MultiTrackMixer? _mixer;
     private WasapiOut? _wasapiOut;
 
-    private Thread? _decodeThread;
-    private CancellationTokenSource? _cts;
-    private readonly object _seekLock = new();
+    // ffplay 型パイプライン: demux/デコードは各専用スレッドが担当し、AVFormatContext は DemuxThread が唯一専有する
+    private VideoPacketQueue? _videoQueue;
+    private AudioPacketQueue? _audioQueue;
+    private VideoFrameRing? _videoRing;
+    private DemuxThread? _demuxThread;
+    private VideoDecodeThread? _videoDecodeThread;
+    private AudioDecodeThread? _audioDecodeThread;
+    private Thread? _demuxThreadHandle;
+    private Thread? _videoDecodeThreadHandle;
+    private Thread? _audioDecodeThreadHandle;
+    private Timer? _statusTimer;
+    private volatile bool _playbackEndedFired;
+
+    // Paused 中に表示するフレーム（Step/Seek で更新）。Playing 中は使わず TryLeaseDue を直接使う
+    private VideoFrameLease? _heldLease;
+    private bool _heldFrameConsumed = true;
+
+    // audio-master クロック: mixer が書いたサンプル軸のセグメントマップ + WASAPI 実位置の写像
+    private readonly PlaybackClock _clock = new(AudioDecoder.OutSampleRate);
+    private IPlaybackPositionSource? _positionSource;
+    private double _pendingAnchorTarget;
+    private int _awaitingAnchor;
 
     private MediaInfo? _currentMedia;
     private CorePlaybackState _state = CorePlaybackState.Stopped;
     private double _playbackSpeed = 1.0;
     private List<ChapterInfo> _chapters = new();
-    // 最初のビデオフレームのPTSを基準として正規化（OBS Replay Bufferなど大きなPTSに対応）
-    private double _ptsSyncOffset = double.NaN;
-    // WASAPI 出力バッファ遅延（秒）: Init() 後に取得し masterClock から引いて実出力タイミングに補正
-    private double _wasapiLatencySec;
-    // 映像の1フレーム時間（秒）: フレームドロップ閾値の動的計算に使用
+    // 映像の1フレーム時間（秒）: due 判定・プリロール猶予・フレームドロップ閾値に使用
     private double _videoFrameDuration = 1.0 / 30.0;
-    // ドリフト移動平均（VLC average_t range=10 相当）: 瞬間ドリフトを平滑化して補正判定に使用
-    private readonly DriftAverage _driftAverage = new(range: 10);
-    // 直前フレームの正規化PTS: 不連続検出に使用（VLC CR_MAX_GAP = 300ms 相当）
-    private double _lastNormalizedPts = double.NaN;
-    private const double DiscontinuityThresholdSec = 0.3;
-    // シーク後グレース期間: シーク直後の数フレームはドロップ判定をスキップ（VLC プリロール相当）
-    private int _seekGraceFrames;
-    private const int SeekGraceFrameCount = 5;
     // フレームドロップ統計（100フレームごとに StatisticsUpdated イベントで通知）
     private int _droppedFrames;
     private int _displayedFrames;
-    private const int StatisticsIntervalFrames = 100;
 
     public MediaInfo? CurrentMedia => _currentMedia;
     public CorePlaybackState State => _state;
@@ -57,11 +67,13 @@ public unsafe class MediaEngine : IMediaEngine
         get
         {
             if (_wasapiOut == null) return TimeSpan.Zero;
-            return TimeSpan.FromSeconds((_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate);
+            return TimeSpan.FromSeconds(GetMasterClockSeconds());
         }
     }
 
-    public event EventHandler<VideoFrameData>? VideoFrameReady;
+    private double GetMasterClockSeconds()
+        => _positionSource == null ? 0.0 : _clock.PositionAt(_positionSource.GetPositionFrames());
+
     public event EventHandler<TimeSpan>? PositionChanged;
     public event EventHandler? PlaybackEnded;
     public event EventHandler<PlaybackStatistics>? StatisticsUpdated;
@@ -70,7 +82,6 @@ public unsafe class MediaEngine : IMediaEngine
     {
         Stop();
         DisposeDecoders();
-        _ptsSyncOffset = double.NaN;
 
         fixed (AVFormatContext** fmtCtxPtr = &_fmtCtx)
         {
@@ -96,6 +107,7 @@ public unsafe class MediaEngine : IMediaEngine
             {
                 var decoder = new AudioDecoder(stream);
                 _audioDecoders.Add(decoder);
+                _audioStreamToTrack[stream->index] = _audioDecoders.Count - 1;
 
                 var langTag = av_dict_get(stream->metadata, "language", null, 0);
                 string lang = langTag != null ? Marshal.PtrToStringUTF8((IntPtr)langTag->value) ?? string.Empty : "";
@@ -180,100 +192,184 @@ public unsafe class MediaEngine : IMediaEngine
             _audioStates.Add(state);
             _mixer.AddTrack(state);
         }
-        // WasapiOut の要求レイテンシ。この値が masterClock 補正にも使われるため一か所で定義する
-        int wasapiLatencyMs = 200;
+
+        int wasapiLatencyMs = 100;
         _wasapiOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, wasapiLatencyMs);
         _wasapiOut.Init(_mixer);
-        _wasapiLatencySec = wasapiLatencyMs / 1000.0;
+
+        _clock.Reset();
+        _positionSource = new WasapiPositionSource(
+            _wasapiOut, _wasapiOut.OutputWaveFormat, AudioDecoder.OutSampleRate,
+            () => _clock.WriteCursor, wasapiLatencyMs / 1000.0);
+
+        _mixer.OnAudioWritten = frames =>
+        {
+            if (Interlocked.Exchange(ref _awaitingAnchor, 0) == 1)
+            {
+                _clock.AnchorAt(_clock.WriteCursor, _pendingAnchorTarget);
+                DiagnosticLog.Write("clock", $"anchor 確定 cursor={_clock.WriteCursor} pts={_pendingAnchorTarget:F3}");
+            }
+            _clock.OnAudioWritten(frames);
+        };
+        _mixer.OnSilenceWritten = frames => _clock.OnSilenceWritten(frames);
     }
 
     public void Play()
     {
         if (_fmtCtx == null) return;
         if (_state == CorePlaybackState.Playing) return;
+        bool wasStopped = _state == CorePlaybackState.Stopped;
         _state = CorePlaybackState.Playing;
+        _playbackEndedFired = false;
+        _lastFrameServedTicks = Environment.TickCount64;
+        DiagnosticLog.Write("engine", $"Play wasStopped={wasStopped}");
+        ReleaseHeldFrame();
+        EnsurePipelineStarted();
+        if (wasStopped)
+            RequestAnchor(0.0);
         _wasapiOut?.Play();
-        if (_decodeThread == null || !_decodeThread.IsAlive)
-        {
-            _cts = new CancellationTokenSource();
-            _decodeThread = new Thread(() => DecodeLoop(_cts.Token)) { IsBackground = true };
-            _decodeThread.Start();
-        }
     }
 
     public void Pause()
     {
         if (_state != CorePlaybackState.Playing) return;
         _state = CorePlaybackState.Paused;
+        DiagnosticLog.Write("engine", $"Pause pos={Position.TotalSeconds:F3}");
         _wasapiOut?.Pause();
     }
 
     public void Stop()
     {
-        _cts?.Cancel();
+        ReleaseHeldFrame();
+        TeardownPipeline();
         _state = CorePlaybackState.Stopped;
         _wasapiOut?.Stop();
         foreach (var s in _audioStates) s.Buffer.ClearBuffer();
+        _clock.Reset();
+        _positionSource?.Reset();
+        _playbackEndedFired = false;
     }
 
     public void Seek(TimeSpan position)
     {
         if (_fmtCtx == null) return;
-        lock (_seekLock)
-        {
-            long ts = (long)(position.TotalSeconds * AV_TIME_BASE);
-            av_seek_frame(_fmtCtx, -1, ts, (int)AVSEEK_FLAG.Backward);
-            _videoDecoder?.FlushBuffers();
-            foreach (var d in _audioDecoders) d.FlushBuffers();
-            foreach (var s in _audioStates) s.Buffer.ClearBuffer();
-            // 速度補正: masterClock = PlayedSamples / OutSampleRate * speed のため逆算
-            _mixer?.SetPlayedSamples((long)(position.TotalSeconds / _playbackSpeed * AudioDecoder.OutSampleRate));
-            // シーク後もPTSオフセットは保持（最初のフレームで確定した相対オフセットは変わらない）
-            _seekGraceFrames = SeekGraceFrameCount;
-            _driftAverage.Reset();
-            _lastNormalizedPts = double.NaN;
-        }
+
+        // 目標を [0, duration) にクランプ（スキップ連打で負値や duration 超えの目標が来る）
+        double durationSec = _currentMedia?.Duration.TotalSeconds ?? 0.0;
+        double target = Math.Clamp(position.TotalSeconds, 0.0, Math.Max(0.0, durationSec - 0.1));
+        DiagnosticLog.Write("engine", $"Seek 要求 raw={position.TotalSeconds:F3} target={target:F3} state={_state}");
+
+        _clock.BeginSeek(target);
+        ReleaseHeldFrame();
+        // ミキサーに残る旧位置の音声を即座に破棄する（シーク中に古い音が鳴り続けるのを防ぐ）。
+        // クロックの錨は AudioDecodeThread が新サンプルを投入する瞬間に要求される（早期消費バグの根治）
+        foreach (var s in _audioStates) s.Buffer.ClearBuffer();
+        int minSerial = (_videoRing?.CurrentSerial ?? 0) + 1; // これから demux が Flush で進める世代
+        _demuxThread?.RequestSeek(target);
+        _playbackEndedFired = false;
+        _lastFrameServedTicks = Environment.TickCount64;
+
+        // 一時停止中のシークは、着地後（＝新世代）の最初のフレームを即座に1枚だけ表示する
+        if (_state == CorePlaybackState.Paused)
+            TryHoldNextFrame(TimeSpan.FromMilliseconds(500), minSerial);
+    }
+
+    /// <summary>次に実音声が mixer へ書かれた瞬間、その書込カーソル位置を srcPts=target としてクロックを起点合わせする。</summary>
+    private void RequestAnchor(double targetSeconds)
+    {
+        _pendingAnchorTarget = targetSeconds;
+        Interlocked.Exchange(ref _awaitingAnchor, 1);
+        DiagnosticLog.Write("clock", $"anchor 要求 target={targetSeconds:F3}");
     }
 
     public void SetPlaybackSpeed(double speed)
     {
-        _playbackSpeed = Math.Clamp(speed, 0.1, 4.0);
+        double clamped = Math.Clamp(speed, 0.1, 4.0);
+        _playbackSpeed = clamped;
         foreach (var d in _audioDecoders)
-            d.PlaybackSpeed = _playbackSpeed;
+            d.PlaybackSpeed = clamped;
+
+        // 境界 = 現在の書込カーソル + バッファ残量。バッファ内の旧速度 PCM が掃けた地点から新レートを適用する
+        long boundary = _clock.WriteCursor + EstimateBufferedFramesAheadOfCursor();
+        _clock.SetSpeedAt(boundary, clamped);
+    }
+
+    private long EstimateBufferedFramesAheadOfCursor()
+    {
+        if (_audioStates.Count == 0 || _mixer == null) return 0;
+        int blockAlign = _mixer.WaveFormat.BlockAlign;
+        int maxBufferedBytes = _audioStates.Max(s => s.Buffer.BufferedBytes);
+        return maxBufferedBytes / blockAlign;
     }
 
     public void StepForward()
     {
         if (_state != CorePlaybackState.Paused) return;
-        var frame = DecodeOneVideoFrame();
-        if (frame != null) VideoFrameReady?.Invoke(this, frame);
+        ReleaseHeldFrame();
+        TryHoldNextFrame(TimeSpan.FromMilliseconds(500), _videoRing?.CurrentSerial ?? 0);
     }
 
     public void StepBackward()
     {
         if (_state != CorePlaybackState.Paused) return;
-        var target = Position - TimeSpan.FromMilliseconds(40);
+        var target = Position - TimeSpan.FromSeconds(_videoFrameDuration);
         if (target < TimeSpan.Zero) target = TimeSpan.Zero;
-        Seek(target);
-        var frame = DecodeOneVideoFrame();
-        if (frame != null) VideoFrameReady?.Invoke(this, frame);
+        Seek(target); // Paused 中なので Seek 内部で held フレームも更新される
     }
 
-    private VideoFrameData? DecodeOneVideoFrame()
+    /// <summary>
+    /// 現在位置に表示すべき新しいフレームがあればリースして返す。Playing 中はクロック位置に対して
+    /// due なフレームをその場でリースする。Paused 中は Step/Seek で更新された保持フレームを一度だけ返す。
+    /// </summary>
+    public VideoFrameLease? TryGetFrame(TimeSpan position)
     {
-        if (_fmtCtx == null || _videoDecoder == null) return null;
-        using var pkt = new PacketHolder();
-        while (av_read_frame(_fmtCtx, pkt.Packet) >= 0)
+        if (_videoRing == null) return null;
+
+        if (_state == CorePlaybackState.Playing)
         {
-            if (pkt.Packet->stream_index == _videoDecoder.StreamIndex)
-            {
-                var frame = _videoDecoder.DecodePacket(pkt.Packet);
-                av_packet_unref(pkt.Packet);
-                if (frame != null) return frame;
-            }
-            av_packet_unref(pkt.Packet);
+            bool got = _videoRing.TryLeaseDue(position.TotalSeconds, _videoFrameDuration, out var raw, out int dropped);
+            _droppedFrames += dropped;
+            if (!got) return null;
+
+            _displayedFrames++;
+            _lastVideoLagSec = raw.PtsSeconds - position.TotalSeconds;
+            _lastFrameServedTicks = Environment.TickCount64;
+            return new VideoFrameLease(raw.SlotIndex, raw.Buffer, raw.Width, raw.Height, raw.Stride, TimeSpan.FromSeconds(raw.PtsSeconds));
+        }
+
+        if (_heldLease is { } held && !_heldFrameConsumed)
+        {
+            _heldFrameConsumed = true;
+            return held;
         }
         return null;
+    }
+
+    public void ReturnFrame(VideoFrameLease lease)
+    {
+        // Paused 中に保持しているフレーム（_heldLease）だけは Step/Seek/Play で入れ替えるまで手放さない。
+        // それ以外は必ず返却する。以前は「Playing 中のみ返却」だったため、TryGetFrame と
+        // ReturnFrame の間に Pause 等の状態遷移が挟まるとリースが漏れ、4スロット枯渇で映像が止まった
+        if (_heldLease != null && lease.SlotIndex == _heldLease.SlotIndex) return;
+        _videoRing?.ReturnLease(lease.SlotIndex);
+    }
+
+    private void ReleaseHeldFrame()
+    {
+        if (_heldLease is { } held)
+            _videoRing?.ReturnLease(held.SlotIndex);
+        _heldLease = null;
+        _heldFrameConsumed = true;
+    }
+
+    private void TryHoldNextFrame(TimeSpan timeout, int minSerial)
+    {
+        if (_videoRing == null) return;
+        if (!_videoRing.TryLeaseOldest(timeout, minSerial, out var raw)) return;
+
+        _heldLease = new VideoFrameLease(raw.SlotIndex, raw.Buffer, raw.Width, raw.Height, raw.Stride, TimeSpan.FromSeconds(raw.PtsSeconds));
+        _heldFrameConsumed = false;
+        PositionChanged?.Invoke(this, _heldLease.Pts);
     }
 
     public void SetTrackVolume(int trackNumber, float volume)
@@ -286,6 +382,7 @@ public unsafe class MediaEngine : IMediaEngine
     public void SetTrackMute(int trackNumber, bool muted)
     {
         int idx = trackNumber - 1;
+        DiagnosticLog.Write("engine", $"SetTrackMute track={trackNumber} muted={muted} state={_state}");
         if (idx >= 0 && idx < _audioStates.Count)
             _audioStates[idx].IsMuted = muted;
     }
@@ -335,155 +432,143 @@ public unsafe class MediaEngine : IMediaEngine
             c.IsUserDefined &&
             Math.Abs((c.StartTime - position).TotalSeconds) <= tolerance.TotalSeconds);
 
-    private void DecodeLoop(CancellationToken ct)
+    // ── パイプライン構築・分解 ──
+
+    private void EnsurePipelineStarted()
     {
+        if (_demuxThread != null) return; // 既に構築済み
         if (_fmtCtx == null) return;
-        using var pkt = new PacketHolder();
 
-        try
+        int videoStreamIndex = _videoDecoder?.StreamIndex ?? -1;
+        int trackCount = Math.Max(1, _audioDecoders.Count);
+
+        _videoQueue = new VideoPacketQueue(maxCount: 512, maxBytes: 40 * 1024 * 1024);
+        _audioQueue = new AudioPacketQueue(maxCount: 256 * trackCount, maxBytes: 4 * 1024 * 1024 * trackCount);
+        _videoRing = new VideoFrameRing();
+
+        _demuxThread = new DemuxThread(
+            _fmtCtx, videoStreamIndex, _audioStreamToTrack,
+            _videoQueue, _audioQueue, PublishSeekTarget);
+
+        if (_videoDecoder != null)
+            _videoDecodeThread = new VideoDecodeThread(
+                _videoDecoder, _videoQueue, _videoRing,
+                () => _demuxThread!.PtsSyncOffset, _videoFrameDuration);
+
+        _audioDecodeThread = new AudioDecodeThread(
+            _audioDecoders, _audioStates, _audioQueue, () => _demuxThread!.PtsSyncOffset,
+            onFirstSamplesAfterFlush: RequestAnchor);
+
+        if (_mixer != null)
         {
-            while (!ct.IsCancellationRequested)
-            {
-                if (_state == CorePlaybackState.Paused) { Thread.Sleep(10); continue; }
-
-                bool bufferFull = _audioStates.Count > 0 &&
-                                  _audioStates.Any(s => s.Buffer.BufferedDuration > TimeSpan.FromSeconds(1));
-                if (bufferFull) { Thread.Sleep(5); continue; }
-
-                lock (_seekLock) { }
-
-                int ret = av_read_frame(_fmtCtx, pkt.Packet);
-                if (ret < 0)
-                {
-                    Thread.Sleep(200);
-                    PlaybackEnded?.Invoke(this, EventArgs.Empty);
-                    return;
-                }
-
-                int idx = pkt.Packet->stream_index;
-
-                if (_videoDecoder != null && idx == _videoDecoder.StreamIndex)
-                {
-                    var frame = _videoDecoder.DecodePacket(pkt.Packet);
-                    if (frame != null)
-                    {
-                        double absFramePts = frame.Pts.TotalSeconds;
-
-                        // 初回フレームでPTSオフセットを確定（OBS Replay Bufferなど非ゼロ開始PTSに対応）
-                        if (double.IsNaN(_ptsSyncOffset))
-                            _ptsSyncOffset = absFramePts;
-
-                        double normalizedPts = absFramePts - _ptsSyncOffset;
-
-                        // 不連続検出: PTS が 300ms 以上ジャンプするか逆行した場合にバッファをフラッシュ（VLC CR_MAX_GAP 相当）
-                        if (!double.IsNaN(_lastNormalizedPts))
-                        {
-                            double ptsDiff = normalizedPts - _lastNormalizedPts;
-                            if (ptsDiff < 0 || ptsDiff > DiscontinuityThresholdSec)
-                                HandleDiscontinuity();
-                        }
-                        _lastNormalizedPts = normalizedPts;
-
-                        // PlayedSamples はWASAPIバッファへの書き込み数のため、実際の出力は _wasapiLatencySec 分遅れる
-                        // _playbackSpeed を乗算することでソースタイムライン上の現在位置を算出する
-                        // （例: 2x 速では PlayedSamples の増加が 2 倍遅いため、speed を掛けて補正）
-                        double masterClock = (_mixer?.PlayedSamples ?? 0) / (double)AudioDecoder.OutSampleRate
-                                            * _playbackSpeed - _wasapiLatencySec;
-                        double diff = normalizedPts - masterClock;
-                        _driftAverage.Update(diff);
-                        ApplyDriftCorrection(_driftAverage.Get());
-
-                        // シーク後グレース期間中はドロップ判定をスキップして即座に表示（VLC プリロール相当）
-                        if (_seekGraceFrames > 0)
-                        {
-                            _seekGraceFrames--;
-                            VideoFrameReady?.Invoke(this, frame);
-                            PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
-                            av_packet_unref(pkt.Packet);
-                            continue;
-                        }
-
-                        // 映像が音声より先行している場合は待つ（最大100ms）
-                        if (diff > 0.002)
-                            Thread.Sleep((int)(Math.Min(diff, 0.1) * 1000));
-
-                        // 映像が2フレーム以上遅れている場合はスキップして追いつかせる（VLC の VOUT_DISPLAY_LATE_THRESHOLD 相当）
-                        if (diff >= -_videoFrameDuration * 2)
-                        {
-                            _displayedFrames++;
-                            VideoFrameReady?.Invoke(this, frame);
-                            PositionChanged?.Invoke(this, TimeSpan.FromSeconds(normalizedPts));
-                        }
-                        else
-                        {
-                            _droppedFrames++;
-                        }
-
-                        int totalFrames = _displayedFrames + _droppedFrames;
-                        if (totalFrames > 0 && totalFrames % StatisticsIntervalFrames == 0)
-                            StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _driftAverage.Get()));
-                    }
-                }
-                else
-                {
-                    for (int i = 0; i < _audioDecoders.Count; i++)
-                    {
-                        if (_audioDecoders[i].StreamIndex == idx)
-                        {
-                            var pcm = _audioDecoders[i].DecodePacket(pkt.Packet);
-                            if (pcm != null)
-                            {
-                                var buf = _audioStates[i].Buffer;
-                                if (buf.BufferedDuration > buf.BufferDuration * 0.95)
-                                    System.Diagnostics.Debug.WriteLine($"[Audio] Track {i} buffer near overflow ({buf.BufferedDuration.TotalMilliseconds:F0}ms)");
-                                buf.AddSamples(pcm, 0, pcm.Length);
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                av_packet_unref(pkt.Packet);
-            }
+            var audioThread = _audioDecodeThread;
+            _mixer.OnRead = () => audioThread.Wake();
         }
-        catch (Exception)
-        {
-            // デコードスレッドの例外でアプリがクラッシュしないよう捕捉
-            // （D3D11VAの失敗、ネイティブクラッシュなどへの安全網）
-        }
-        finally
-        {
-            _decodeThread = null;
-        }
+
+        _demuxThreadHandle = StartBackgroundThread(_demuxThread.Run);
+        if (_videoDecodeThread != null)
+            _videoDecodeThreadHandle = StartBackgroundThread(_videoDecodeThread.Run);
+        _audioDecodeThreadHandle = StartBackgroundThread(_audioDecodeThread.Run);
+        _statusTimer ??= new Timer(_ => StatusTick(), null, 100, 100);
     }
 
-    private void HandleDiscontinuity()
+    private static Thread StartBackgroundThread(ThreadStart action)
     {
-        _driftAverage.Reset();
+        var thread = new Thread(action) { IsBackground = true };
+        thread.Start();
+        return thread;
+    }
+
+    // demux スレッドがシーク実行直後（各キューへ FlushMarker を入れる前）に呼ぶ
+    private void PublishSeekTarget(double normalizedTargetSeconds)
+    {
+        _videoDecodeThread?.SetSeekTarget(normalizedTargetSeconds);
+        _audioDecodeThread?.SetSeekTarget(normalizedTargetSeconds);
+        // リングを demux スレッド側から即時 Flush する。これが無いと、リング満杯で
+        // BeginWrite ブロック中の VideoDecodeThread が FlushMarker を処理できず、
+        // 後方シーク時（リング内フレームが全て「未来」になり誰も取り出さない）に
+        // 音声だけ流れて映像が止まるデッドロックになる
+        _videoRing?.Flush();
+        DiagnosticLog.Write("demux", $"seek 処理 target={normalizedTargetSeconds:F3} ringSerial={_videoRing?.CurrentSerial ?? -1}");
+    }
+
+    private void TeardownPipeline()
+    {
+        _demuxThread?.RequestStop();
+        _videoDecodeThread?.RequestStop();
+        _audioDecodeThread?.RequestStop();
+        _statusTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+
+        _videoQueue?.Close();
+        _audioQueue?.Close();
+        _videoRing?.Close();
+        _audioDecodeThread?.Wake();
+
+        _demuxThreadHandle?.Join(TimeSpan.FromSeconds(3));
+        _videoDecodeThreadHandle?.Join(TimeSpan.FromSeconds(3));
+        _audioDecodeThreadHandle?.Join(TimeSpan.FromSeconds(3));
+
+        _videoQueue?.DrainAndDispose();
+        _audioQueue?.DrainAndDispose();
+        _videoRing?.Dispose();
+        _statusTimer?.Dispose();
+
+        _demuxThread = null;
+        _videoDecodeThread = null;
+        _audioDecodeThread = null;
+        _videoQueue = null;
+        _audioQueue = null;
+        _videoRing = null;
+        _demuxThreadHandle = null;
+        _videoDecodeThreadHandle = null;
+        _audioDecodeThreadHandle = null;
+        _statusTimer = null;
+    }
+
+    // ── ステータス通知（100ms 周期。映像フレーム配送は UI 側の CompositionTarget.Rendering がプルする）──
+
+    private double _lastVideoLagSec;
+    private long _lastFrameServedTicks;
+    private const int VideoStallThresholdMs = 2000;
+
+    private void StatusTick()
+    {
+        if (_state == CorePlaybackState.Playing || _state == CorePlaybackState.Paused)
+            PositionChanged?.Invoke(this, Position);
+
+        StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _lastVideoLagSec));
+        DetectVideoStall();
+        CheckPlaybackEnded();
+    }
+
+    /// <summary>
+    /// 再生中なのに映像フレームが一定時間配送されていない状態を検知して診断ログに残す。
+    /// 「音声だけ流れて映像が止まる」系の不具合が再発した場合、リングの内部状態がここで採取される。
+    /// </summary>
+    private void DetectVideoStall()
+    {
+        if (!DiagnosticLog.Enabled) return;
+        if (_state != CorePlaybackState.Playing || _videoDecoder == null || _videoRing == null) return;
+
+        long now = Environment.TickCount64;
+        if (now - _lastFrameServedTicks < VideoStallThresholdMs) return;
+
+        DiagnosticLog.Write("stall",
+            $"映像 {VideoStallThresholdMs}ms 以上停止 clock={GetMasterClockSeconds():F3} ring={_videoRing.DescribeSlots()}");
+        _lastFrameServedTicks = now; // 停止継続中は 2 秒おきに記録
+    }
+
+    private void CheckPlaybackEnded()
+    {
+        if (_playbackEndedFired) return;
+        if (_state != CorePlaybackState.Playing && _state != CorePlaybackState.Paused) return;
+        if (_demuxThread == null || !_demuxThread.EofReached) return;
+        if (_videoDecoder != null && (_videoRing == null || !_videoRing.IsEofDrained)) return;
         foreach (var s in _audioStates)
-            s.Buffer.ClearBuffer();
-    }
+            if (!s.IsEof || s.Buffer.BufferedBytes > 0) return;
 
-    // VLC stream_HandleDrift / aout_FiltersAdjustResampling 相当
-    // swr_set_compensation で微量のサンプル追加/削除を行い、音声クロックを映像に追従させる
-    private void ApplyDriftCorrection(double avgDriftSec)
-    {
-        const double kThreshold = 0.04;      // 40ms 超で補正開始
-        const double kResetThreshold = 0.01; // 10ms 未満で補正終了
-        const int kCompensationDistance = AudioDecoder.OutSampleRate / 2; // 500ms ウィンドウ
-        const int kCorrectionSamples = 44;   // ≈ 0.1% of OutSampleRate (≈1ms per 500ms)
-
-        if (Math.Abs(avgDriftSec) > kThreshold)
-        {
-            int sampleDelta = Math.Sign(avgDriftSec) * kCorrectionSamples;
-            foreach (var d in _audioDecoders)
-                d.SetDriftCompensation(sampleDelta, kCompensationDistance);
-        }
-        else if (Math.Abs(avgDriftSec) < kResetThreshold)
-        {
-            foreach (var d in _audioDecoders)
-                d.SetDriftCompensation(0, AudioDecoder.OutSampleRate);
-        }
+        _playbackEndedFired = true;
+        PlaybackEnded?.Invoke(this, EventArgs.Empty);
     }
 
     private void DisposeDecoders()
@@ -492,17 +577,13 @@ public unsafe class MediaEngine : IMediaEngine
         foreach (var d in _audioDecoders) d.Dispose();
         _audioDecoders.Clear();
         _audioStates.Clear();
+        _audioStreamToTrack.Clear();
         _wasapiOut?.Dispose(); _wasapiOut = null;
         _mixer = null;
+        _positionSource = null;
         if (_fmtCtx != null) { fixed (AVFormatContext** p = &_fmtCtx) avformat_close_input(p); }
         _fmtCtx = null;
     }
 
     public void Dispose() { Stop(); DisposeDecoders(); }
-
-    private unsafe class PacketHolder : IDisposable
-    {
-        public AVPacket* Packet = av_packet_alloc();
-        public void Dispose() { if (Packet != null) { AVPacket* p = Packet; av_packet_free(&p); } Packet = null; }
-    }
 }

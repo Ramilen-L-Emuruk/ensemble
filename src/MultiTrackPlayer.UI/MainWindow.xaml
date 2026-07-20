@@ -9,10 +9,11 @@
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVis"/>
         <local:NullToVisibilityConverter x:Key="NullToVis"/>
+        <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVis"/>
     </Window.Resources>
     <DockPanel>
         <!-- Menu -->
-        <Menu DockPanel.Dock="Top">
+        <Menu x:Name="AppMenu" DockPanel.Dock="Top">
             <MenuItem Header="ファイル(_F)">
                 <MenuItem Header="開く(_O)" InputGestureText="Ctrl+O" Click="MenuOpen_Click"/>
                 <Separator/>
@@ -24,6 +25,13 @@
                 <MenuItem Header="チャプター(_T)" InputGestureText="Ctrl+T" Click="MenuChapter_Click"/>
                 <Separator/>
                 <MenuItem Header="フルスクリーン(_F)" InputGestureText="F11" Click="MenuFullscreen_Click"/>
+            </MenuItem>
+            <MenuItem Header="設定(_S)">
+                <MenuItem Header="デバッグモード(_D)" IsCheckable="True"
+                          IsChecked="{Binding IsDebugMode, Mode=TwoWay}"/>
+                <Separator/>
+                <MenuItem Header="現在のミュート状態を既定にする(_M)" Click="MenuSaveDefaultMutes_Click"
+                          ToolTip="次回以降ファイルを開いたとき、いまミュートしているトラック番号を最初からミュートで開きます"/>
             </MenuItem>
             <MenuItem Header="再生(_P)">
                 <MenuItem Header="再生/一時停止" InputGestureText="Space" Click="MenuPlayPause_Click"/>
@@ -44,8 +52,14 @@
             </MenuItem>
         </Menu>
 
+        <!-- Status bar (drop-rate / video lag) — デバッグモード時のみ表示（フルスクリーン中は非表示） -->
+        <TextBlock x:Name="StatusBar" DockPanel.Dock="Bottom" Background="#FF1A1A1A" Foreground="Gray"
+                   FontFamily="Consolas" FontSize="10" Padding="8,2"
+                   Text="{Binding StatusText}"
+                   Visibility="{Binding IsDebugMode, Converter={StaticResource BoolToVis}}"/>
+
         <!-- Transport bar bottom -->
-        <StackPanel DockPanel.Dock="Bottom" Background="#FF1E1E1E">
+        <StackPanel x:Name="TransportBar" DockPanel.Dock="Bottom" Background="#FF1E1E1E">
             <!-- SeekBar -->
             <ctrl:SeekBarControl x:Name="SeekBar" Margin="8,6,8,2"
                                  PositionRatio="{Binding PositionRatio, Mode=TwoWay}"
@@ -88,6 +102,28 @@
                        HorizontalAlignment="Center" VerticalAlignment="Center"
                        Foreground="Gray" FontSize="18"
                        Visibility="{Binding CurrentMedia, Converter={StaticResource NullToVis}}"/>
+
+            <!-- 操作 OSD: 何か操作を行うたび一瞬だけ内容を表示する（無操作で自動的に消える） -->
+            <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="16,16,0,0"
+                    Background="#B0000000" CornerRadius="4" Padding="14,6" IsHitTestVisible="False"
+                    Visibility="{Binding OsdText, Converter={StaticResource EmptyStringToVis}}">
+                <TextBlock Text="{Binding OsdText}" Foreground="White" FontSize="16"/>
+            </Border>
+
+            <!-- フルスクリーン時のオーバーレイ: マウス移動・キー操作で一時表示し、無操作で自動的に消える -->
+            <Border x:Name="FullscreenOverlay" VerticalAlignment="Bottom"
+                    Background="#CC000000" Padding="8,6" Visibility="Collapsed">
+                <StackPanel>
+                    <ctrl:SeekBarControl x:Name="FullscreenSeekBar" Margin="0,0,0,4"
+                                         PositionRatio="{Binding PositionRatio, Mode=TwoWay}"
+                                         Duration="{Binding Duration}"/>
+                    <TextBlock Foreground="White" FontFamily="Consolas" FontSize="12" HorizontalAlignment="Center">
+                        <Run Text="{Binding Position, StringFormat={}{0:hh\\:mm\\:ss}}"/>
+                        <Run Text=" / "/>
+                        <Run Text="{Binding Duration, StringFormat={}{0:hh\\:mm\\:ss}}"/>
+                    </TextBlock>
+                </StackPanel>
+            </Border>
         </Grid>
     </DockPanel>
 </Window>

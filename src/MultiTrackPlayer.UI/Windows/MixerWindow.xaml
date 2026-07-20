@@ -32,12 +32,15 @@
                 <ColumnDefinition Width="80"/>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="50"/>
+                <ColumnDefinition Width="50"/>
             </Grid.ColumnDefinitions>
             <TextBlock Grid.Column="0" Text="マスター音量" VerticalAlignment="Center"/>
             <Slider Grid.Column="1" Minimum="0" Maximum="100" Value="{Binding MasterVolume}"
                     VerticalAlignment="Center" Margin="4,0"/>
             <TextBlock Grid.Column="2" Text="{Binding MasterVolume, StringFormat={}{0:0}%}"
                        VerticalAlignment="Center" TextAlignment="Right"/>
+            <ToggleButton Grid.Column="3" Content="MUTE" IsChecked="{Binding IsMasterMuted}"
+                          Margin="4,0" FontSize="9" Padding="2"/>
         </Grid>
     </StackPanel>
 </Window>
