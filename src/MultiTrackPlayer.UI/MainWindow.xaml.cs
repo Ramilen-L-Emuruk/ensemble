@@ -38,8 +38,6 @@ public partial class MainWindow : Window
             if (e.PropertyName == nameof(MainViewModel.PlaybackSpeed)) SyncSpeedBox();
         };
 
-        _vm.Engine.PositionChanged += (_, _) => UpdateSeekBarChapters();
-
         SeekBar.Seeking += (_, ratio) =>
             _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
         FullscreenSeekBar.Seeking += (_, ratio) =>
