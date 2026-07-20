@@ -30,6 +30,9 @@ public partial class ShortcutsWindow : Window
         ["PrevFile"]      = "前のファイルを再生",
         ["ToggleChapter"] = "現在位置にチャプター追加/削除",
         ["ShowShortcuts"] = "ショートカット一覧を表示",
+        ["ShowMixer"]     = "ミキサーを表示",
+        ["ShowPlaylist"]  = "プレイリストを表示",
+        ["ShowChapter"]   = "チャプター一覧を表示",
     };
 
     private static readonly Dictionary<string, string> KeyDisplayNames = new()
