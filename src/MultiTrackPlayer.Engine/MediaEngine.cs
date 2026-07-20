@@ -6,6 +6,7 @@ using MultiTrackPlayer.Engine.Decoding;
 using MultiTrackPlayer.Engine.Diagnostics;
 using MultiTrackPlayer.Engine.Pipeline;
 using MultiTrackPlayer.Engine.Sync;
+using MultiTrackPlayer.Engine.Utilities;
 using MultiTrackPlayer.Engine.Video;
 using NAudio.Wave;
 using Sdcb.FFmpeg.Raw;
@@ -90,7 +91,12 @@ public unsafe class MediaEngine : IMediaEngine
         fixed (AVFormatContext** fmtCtxPtr = &_fmtCtx)
         {
             int ret = avformat_open_input(fmtCtxPtr, filePath, null, null);
-            if (ret < 0) throw new InvalidOperationException($"Cannot open file: {filePath}");
+            if (ret < 0)
+            {
+                string err = FFmpegError.Describe(ret);
+                DiagnosticLog.Write("error", $"ファイルオープン失敗 path={filePath} ret={ret} ({err})");
+                throw new InvalidOperationException($"Cannot open file: {filePath} (ret={ret}: {err})");
+            }
         }
         avformat_find_stream_info(_fmtCtx, null);
 
