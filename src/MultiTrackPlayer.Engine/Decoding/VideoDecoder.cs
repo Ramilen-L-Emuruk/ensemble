@@ -1,3 +1,4 @@
+using MultiTrackPlayer.Engine.Diagnostics;
 using MultiTrackPlayer.Engine.Utilities;
 using Sdcb.FFmpeg.Raw;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
@@ -46,8 +47,16 @@ public unsafe class VideoDecoder : IDisposable
     /// <summary>デコーダへパケットを送る（pkt に null を渡すと EOF フラッシュ）。avcodec_send_packet の戻り値をそのまま返す。</summary>
     public int SendPacket(AVPacket* pkt) => avcodec_send_packet(_ctx, pkt);
 
-    /// <summary>1フレーム分だけ受信する。EAGAIN/EOF なら false（呼び出し側はループを抜ける）。</summary>
-    public bool TryReceiveFrame(AVFrame* frame) => avcodec_receive_frame(_ctx, frame) == 0;
+    /// <summary>1フレーム分だけ受信する。EAGAIN/EOF なら false（呼び出し側はループを抜ける）。
+    /// それ以外の負値（壊れたデータ等の本当のデコードエラー）は診断ログに残す。</summary>
+    public bool TryReceiveFrame(AVFrame* frame)
+    {
+        int ret = avcodec_receive_frame(_ctx, frame);
+        if (ret == 0) return true;
+        if (ret != -EAGAIN && ret != AVERROR_EOF)
+            DiagnosticLog.Write("error", $"映像デコードエラー ret={ret} ({FFmpegError.Describe(ret)})");
+        return false;
+    }
 
     public double GetPtsSeconds(AVFrame* frame)
     {
