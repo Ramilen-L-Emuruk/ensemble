@@ -180,4 +180,31 @@ public sealed class PlaybackClockTests
         // （張り付くと映像側が全フレームを期限切れ判定して大量ドロップになる回帰バグ）
         Assert.Equal(11.0, clock.PositionAt(clock.WriteCursor), precision: 6);
     }
+
+    [Fact]
+    public void PositionAt_DuringHwLatencyTail_DoesNotPoisonClamp_ForNewSeekSegment()
+    {
+        // Arrange: 100秒地点まで再生してクランプ基準を高い値にしておく
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, srcPtsSeconds: 100.0);
+        clock.OnAudioWritten(SampleRate); // writeCursor=48000, position=101.0
+
+        // Act: 10秒地点へ後方シーク → 錨（この時点ではまだ新区間の音声は書かれていない）
+        clock.BeginSeek(10.0);
+        long anchorFrame = clock.WriteCursor; // 48000
+        clock.AnchorAt(anchorFrame, 10.0);
+
+        // WASAPI のレイテンシ分、HW はまだシーク前の音声を再生し終えていない過渡期を模す
+        // （hwFrames が新セグメント開始フレームより手前）。この瞬間の raw が高い値でも許容する
+        double duringLatencyTail = clock.PositionAt(anchorFrame - 1000);
+        Assert.True(duringLatencyTail >= 10.0);
+
+        // HW が新区間に追いついた
+        clock.OnAudioWritten(SampleRate);
+
+        // Assert: 過渡期の高い値が単調クランプの基準として焼き付いておらず、
+        // 新しいシーク先から正しく進行する（焼き付くとクロックが古い位置に固まって
+        // 映像が「期限切れ」判定され続け、リング満杯で完全停止する回帰バグ）
+        Assert.Equal(11.0, clock.PositionAt(clock.WriteCursor), precision: 6);
+    }
 }

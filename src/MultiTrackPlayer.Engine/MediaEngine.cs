@@ -282,6 +282,7 @@ public unsafe class MediaEngine : IMediaEngine
             _videoPrerollReady = _videoDecoder == null;
             _audioPrerollReady = _audioDecoders.Count == 0;
             _mixer.HoldOutput = true;
+            DiagnosticLog.Write("gate", $"HoldOutput 設定 target={target:F3} videoQueueSerial={_videoQueue?.Serial ?? -1} audioQueueSerial={_audioQueue?.Serial ?? -1}");
         }
 
         int minSerial = (_videoRing?.CurrentSerial ?? 0) + 1; // これから demux が Flush で進める世代
@@ -307,6 +308,7 @@ public unsafe class MediaEngine : IMediaEngine
     {
         RequestAnchor(targetSeconds);
         _audioPrerollReady = true;
+        DiagnosticLog.Write("gate", $"audioPrerollReady=true target={targetSeconds:F3} video={_videoPrerollReady}");
         TryReleaseMixerHold();
     }
 
@@ -314,6 +316,7 @@ public unsafe class MediaEngine : IMediaEngine
     private void OnVideoPrerollReady()
     {
         _videoPrerollReady = true;
+        DiagnosticLog.Write("gate", $"videoPrerollReady=true audio={_audioPrerollReady}");
         TryReleaseMixerHold();
     }
 
@@ -321,7 +324,10 @@ public unsafe class MediaEngine : IMediaEngine
     private void TryReleaseMixerHold()
     {
         if (_videoPrerollReady && _audioPrerollReady && _mixer != null)
+        {
             _mixer.HoldOutput = false;
+            DiagnosticLog.Write("gate", "HoldOutput 解除");
+        }
     }
 
     public void SetPlaybackSpeed(double speed)
@@ -576,10 +582,21 @@ public unsafe class MediaEngine : IMediaEngine
 
     private void StatusTick()
     {
+        // GetPositionFrames() は呼ぶたびに内部の単調性チェック状態を更新するため、
+        // 1tick につき1回だけ呼び、PositionChanged 通知とデバッグログの両方で使い回す
+        long hwFrames = _positionSource?.GetPositionFrames() ?? 0;
+        double posSeconds = _positionSource == null ? 0.0 : _clock.PositionAt(hwFrames);
+        var pos = TimeSpan.FromSeconds(posSeconds);
+
         if (_state == CorePlaybackState.Playing || _state == CorePlaybackState.Paused)
-            PositionChanged?.Invoke(this, Position);
+            PositionChanged?.Invoke(this, pos);
 
         StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _lastVideoLagSec));
+
+        // 短時間の連続シーク直後にクロックが古いセグメントを指し続ける不具合の切り分け用
+        if (DiagnosticLog.Enabled && _state == CorePlaybackState.Playing)
+            DiagnosticLog.Write("pos", $"trace hwFrames={hwFrames} writeCursor={_clock.WriteCursor} pos={posSeconds:F3}");
+
         DetectVideoStall();
         CheckPlaybackEnded();
     }

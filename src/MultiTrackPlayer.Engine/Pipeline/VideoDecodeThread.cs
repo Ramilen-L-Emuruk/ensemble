@@ -20,6 +20,9 @@ public sealed unsafe class VideoDecodeThread
     private double _nextSeekTarget = double.NaN;
     private bool _prerollActive;
     private double _prerollTarget;
+    // このプリロールが属するキュー世代（Flush 番兵自身の Serial）。プリロール完了判定の瞬間に
+    // 現在のキュー Serial と比較することで、既に次のシークに割り込まれた「無効な世代の完了通知」を検出する
+    private int _prerollSerial;
     // BeginWrite が SlotFlushed を返した（＝シークが発生した）後、FlushMarker に到達するまでの
     // 残りフレームは全てシーク前の残骸なので、4K変換を行わずに捨てる
     private bool _abandonUntilFlush;
@@ -55,7 +58,7 @@ public sealed unsafe class VideoDecodeThread
                 switch (item.Kind)
                 {
                     case QueueItemKind.Flush:
-                        HandleFlush();
+                        HandleFlush(item.Serial);
                         break;
                     case QueueItemKind.Eof:
                         HandleEof(frame);
@@ -74,20 +77,21 @@ public sealed unsafe class VideoDecodeThread
         }
     }
 
-    private void HandleFlush()
+    private void HandleFlush(int serial)
     {
         _decoder.FlushBuffers();
         // demux スレッドがシーク時に既に ring.Flush 済み（デッドロック解消のため）。
         // ここでもう一度呼び、demux の Flush 後にコミットされ得た残骸 Ready も掃除する
         _ring.Flush();
         _abandonUntilFlush = false;
+        _prerollSerial = serial;
         lock (_seekTargetLock)
         {
             _prerollActive = !double.IsNaN(_nextSeekTarget);
             _prerollTarget = _nextSeekTarget;
             _nextSeekTarget = double.NaN;
         }
-        Diagnostics.DiagnosticLog.Write("video", $"flush 処理 preroll={( _prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
+        Diagnostics.DiagnosticLog.Write("video", $"flush 処理 serial={serial} preroll={( _prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
     }
 
     private void HandleEof(AVFrame* frame)
@@ -130,8 +134,22 @@ public sealed unsafe class VideoDecodeThread
         {
             if (normalizedPts < _prerollTarget - _frameDurationSeconds / 2.0)
                 return; // hw転送・sws変換前に破棄（4Kの33MB転送を丸ごと省く）
+
+            // プリロール完了と判定できたが、その間に次のシークが割り込んでキューの Serial が
+            // 既に進んでいる場合、これは無効な世代の完了通知（このデコードスレッドがまだ
+            // 新しい Flush 番兵に到達していないだけ）。コールバックを発火せず残骸として捨てる。
+            // 発火してしまうと MediaEngine 側が古いシーク目標を「映像プリロール完了」と誤認し、
+            // 音声側が別世代で先に完了していた場合にミキサーの保留を誤って解除してしまう
+            // （巻き戻し連打時に稀に発生する早送り/大量ドロップの原因）
+            if (_queue.Serial != _prerollSerial)
+            {
+                _abandonUntilFlush = true;
+                Diagnostics.DiagnosticLog.Write("video", $"stale preroll 破棄 prerollSerial={_prerollSerial} currentSerial={_queue.Serial} pts={normalizedPts:F3}");
+                return;
+            }
+
             _prerollActive = false;
-            Diagnostics.DiagnosticLog.Write("video", $"preroll 完了 firstPts={normalizedPts:F3}");
+            Diagnostics.DiagnosticLog.Write("video", $"preroll 完了 firstPts={normalizedPts:F3} serial={_prerollSerial}");
             // シーク後、映像プリロールがここで完了する。MediaEngine 側はこれを合図に
             // ミキサーの音声出力保留（HoldOutput）を解除する（早送りバグの根治）
             _onFirstFrameAfterFlush?.Invoke();
