@@ -128,11 +128,63 @@ public partial class MainWindow : Window
         }
         if (_vm.IsFullscreen) ShowFullscreenOverlay();
 
+        if (TryHandleTrackKey(e)) { e.Handled = true; return; }
+
         string keyStr = BuildKeyStr(e);
         string? cmd = _kb.GetCommand(keyStr);
         if (cmd == null) return;
         e.Handled = true;
         ExecuteCommand(cmd);
+    }
+
+    // 数字キー(1〜9、テンキー含む)を押しっぱなしにしながら M/↑/↓ を押すと、
+    // その番号のトラックに対してミュート切替・音量±5%を行う。
+    // 対象トラックが存在しない場合は通常のキーバインド処理にフォールスルーする。
+    private bool TryHandleTrackKey(KeyEventArgs e)
+    {
+        if (!TryGetHeldTrackNumber(out int trackNumber)) return false;
+
+        AudioTrackViewModel? track = null;
+        foreach (var t in _vm.AudioTracks)
+        {
+            if (t.TrackNumber == trackNumber) { track = t; break; }
+        }
+        if (track == null) return false;
+
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        switch (key)
+        {
+            case Key.M:
+                track.IsMuted = !track.IsMuted;
+                _vm.ShowOsd($"{track.Name} {(track.IsMuted ? "ミュート" : "ミュート解除")}");
+                return true;
+            case Key.Up:
+                track.Volume = Math.Min(200, track.Volume + 5);
+                _vm.ShowOsd($"{track.Name} 音量 {track.Volume:0}%");
+                return true;
+            case Key.Down:
+                track.Volume = Math.Max(0, track.Volume - 5);
+                _vm.ShowOsd($"{track.Name} 音量 {track.Volume:0}%");
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool TryGetHeldTrackNumber(out int trackNumber)
+    {
+        for (int i = 1; i <= 9; i++)
+        {
+            var digitKey = (Key)((int)Key.D0 + i);
+            var numpadKey = (Key)((int)Key.NumPad0 + i);
+            if (Keyboard.IsKeyDown(digitKey) || Keyboard.IsKeyDown(numpadKey))
+            {
+                trackNumber = i;
+                return true;
+            }
+        }
+        trackNumber = 0;
+        return false;
     }
 
     // WPF の Key 列挙体は一部の値が別名（エイリアス）を持ち、ToString() が
