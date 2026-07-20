@@ -4,6 +4,7 @@
         xmlns:ctrl="clr-namespace:MultiTrackPlayer.UI.Controls"
         xmlns:local="clr-namespace:MultiTrackPlayer.UI"
         Title="{Binding Title}" Width="960" Height="600"
+        Icon="app.ico"
         AllowDrop="True" Drop="Window_Drop" DragOver="Window_DragOver"
         KeyDown="Window_KeyDown">
     <Window.Resources>
