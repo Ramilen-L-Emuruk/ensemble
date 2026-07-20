@@ -84,6 +84,13 @@ public partial class MainWindow : Window
     // ── Key handling ──
     private void Window_KeyDown(object sender, KeyEventArgs e)
     {
+        if (e.Key == Key.Escape && _vm.IsFullscreen)
+        {
+            ToggleFullscreen();
+            e.Handled = true;
+            return;
+        }
+
         string keyStr = BuildKeyStr(e);
         string? cmd = _kb.GetCommand(keyStr);
         if (cmd == null) return;
@@ -151,11 +158,18 @@ public partial class MainWindow : Window
             _prevWindowStyle = WindowStyle;
             WindowStyle = WindowStyle.None;
             WindowState = WindowState.Maximized;
+            // メニュー・トランスポートバーを消し、映像用 Grid が DockPanel の残り全域（＝画面全体）を占めるようにする
+            AppMenu.Visibility = Visibility.Collapsed;
+            TransportBar.Visibility = Visibility.Collapsed;
+            _vm.IsFullscreen = true;
         }
         else
         {
             WindowStyle = _prevWindowStyle == WindowStyle.None ? WindowStyle.SingleBorderWindow : _prevWindowStyle;
             WindowState = _prevWindowState;
+            AppMenu.Visibility = Visibility.Visible;
+            TransportBar.Visibility = Visibility.Visible;
+            _vm.IsFullscreen = false;
         }
     }
 

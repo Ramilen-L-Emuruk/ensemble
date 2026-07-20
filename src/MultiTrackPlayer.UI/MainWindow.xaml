@@ -12,7 +12,7 @@
     </Window.Resources>
     <DockPanel>
         <!-- Menu -->
-        <Menu DockPanel.Dock="Top">
+        <Menu x:Name="AppMenu" DockPanel.Dock="Top">
             <MenuItem Header="ファイル(_F)">
                 <MenuItem Header="開く(_O)" InputGestureText="Ctrl+O" Click="MenuOpen_Click"/>
                 <Separator/>
@@ -51,14 +51,14 @@
             </MenuItem>
         </Menu>
 
-        <!-- Status bar (drop-rate / video lag) — デバッグモード時のみ表示 -->
-        <TextBlock DockPanel.Dock="Bottom" Background="#FF1A1A1A" Foreground="Gray"
+        <!-- Status bar (drop-rate / video lag) — デバッグモード時のみ表示（フルスクリーン中は非表示） -->
+        <TextBlock x:Name="StatusBar" DockPanel.Dock="Bottom" Background="#FF1A1A1A" Foreground="Gray"
                    FontFamily="Consolas" FontSize="10" Padding="8,2"
                    Text="{Binding StatusText}"
                    Visibility="{Binding IsDebugMode, Converter={StaticResource BoolToVis}}"/>
 
         <!-- Transport bar bottom -->
-        <StackPanel DockPanel.Dock="Bottom" Background="#FF1E1E1E">
+        <StackPanel x:Name="TransportBar" DockPanel.Dock="Bottom" Background="#FF1E1E1E">
             <!-- SeekBar -->
             <ctrl:SeekBarControl x:Name="SeekBar" Margin="8,6,8,2"
                                  PositionRatio="{Binding PositionRatio, Mode=TwoWay}"
