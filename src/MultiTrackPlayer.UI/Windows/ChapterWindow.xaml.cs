@@ -79,11 +79,15 @@ public partial class ChapterWindow : Window
 
     private void TitleEditBox_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
     {
-        if (sender is TextBox { IsVisible: true } tb)
-        {
-            tb.Focus();
-            tb.SelectAll();
-        }
+        if (sender is not TextBox { IsVisible: true } tb) return;
+
+        // Text は Mode=OneWay のため、前回キャンセルした入力途中の文字列がそのまま残っている。
+        // 編集を開始するたびに ViewModel の現在値へ明示的に同期し直す。
+        if (tb.DataContext is ChapterViewModel cvm)
+            tb.Text = cvm.Title;
+
+        tb.Focus();
+        tb.SelectAll();
     }
 
     private void TitleEditBox_KeyDown(object sender, KeyEventArgs e)
