@@ -26,6 +26,7 @@
                 <MenuItem Header="チャプター(_T)" InputGestureText="Ctrl+T" Click="MenuChapter_Click"/>
                 <Separator/>
                 <MenuItem Header="フルスクリーン(_F)" InputGestureText="F11" Click="MenuFullscreen_Click"/>
+                <MenuItem Header="ショートカット一覧(_K)" InputGestureText="F1" Click="MenuShortcuts_Click"/>
             </MenuItem>
             <MenuItem Header="設定(_S)">
                 <MenuItem Header="デバッグモード(_D)" IsCheckable="True"

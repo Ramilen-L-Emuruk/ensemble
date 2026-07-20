@@ -36,6 +36,7 @@ public class KeyBindings
         ["N"]            = "NextFile",
         ["P"]            = "PrevFile",
         ["C"]            = "ToggleChapter",
+        ["F1"]           = "ShowShortcuts",
     };
 
     public void Load()
