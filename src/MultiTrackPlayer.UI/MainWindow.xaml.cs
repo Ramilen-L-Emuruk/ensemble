@@ -136,6 +136,7 @@ public partial class MainWindow : Window
             case "Skip-60":       _vm.Skip(-60); break;
             case "VolumeUp":      _vm.MasterVolume = Math.Min(100, _vm.MasterVolume + 5); break;
             case "VolumeDown":    _vm.MasterVolume = Math.Max(0, _vm.MasterVolume - 5); break;
+            case "Mute":          _vm.ToggleMuteCommand.Execute(null); break;
             case "SpeedUp":       _vm.ChangeSpeed(0.25); break;
             case "SpeedDown":     _vm.ChangeSpeed(-0.25); break;
             case "NextChapter":   _vm.Engine.JumpToNextChapter(); break;
