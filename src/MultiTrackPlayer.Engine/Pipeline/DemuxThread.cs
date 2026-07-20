@@ -44,6 +44,11 @@ public sealed unsafe class DemuxThread
     public void RequestSeek(double targetSeconds)
     {
         lock (_seekLock) { _pendingSeekTarget = targetSeconds; _hasPendingSeek = true; }
+        // demux スレッドが満杯キューの Put でブロック中だとシーク要求を永遠にチェックできない
+        //（映像リング満杯→映像キュー満杯→demux ブロック→全パイプライン凍結、の実機で観測された連鎖）。
+        // Put 待ちを中断させてループ先頭へ帰還させる
+        _videoQueue.AbortPutWaiters();
+        _audioQueue.AbortPutWaiters();
         _wakeEvent.Set();
     }
 
@@ -83,7 +88,11 @@ public sealed unsafe class DemuxThread
 
             bool routed = RoutePacket(pkt.Packet);
             av_packet_unref(pkt.Packet);
-            if (!routed) break; // キューが Close 済み＝終了処理中
+            if (!routed)
+            {
+                if (_videoQueue.IsClosed || _audioQueue.IsClosed) break; // 終了処理中
+                continue; // Put がシーク割込みで中断された: このパケットは捨ててループ先頭で保留シークを処理する
+            }
         }
     }
 

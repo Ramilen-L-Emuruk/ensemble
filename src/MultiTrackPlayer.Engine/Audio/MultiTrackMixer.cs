@@ -59,9 +59,16 @@ public class MultiTrackMixer : IWaveProvider
     {
         if (_tracks.Count == 0) return 0;
 
+        // EOF 済みトラックは可用量の下限計算から除外する（残量ゼロの EOF トラックが
+        // 常に common=0 を強制し、他トラックの音声まで止めてしまうのを防ぐ）。
+        // Read 自体は全トラックに対して行うので、EOF トラックの残りも消費される
         int common = int.MaxValue;
         foreach (var track in _tracks)
+        {
+            if (track.IsEof) continue;
             common = Math.Min(common, track.Buffer.BufferedBytes);
+        }
+        if (common == int.MaxValue) common = 0; // 全トラック EOF
 
         common = Math.Min(common, count);
         common -= common % _blockAlign;

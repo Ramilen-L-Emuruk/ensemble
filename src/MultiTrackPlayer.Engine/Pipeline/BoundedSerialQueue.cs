@@ -44,6 +44,8 @@ public sealed class BoundedSerialQueue<T>
     private int _currentWeight;
     private int _serial;
     private bool _closed;
+    // AbortPutWaiters のたびに増える世代番号。満杯待ち中の Put はこれが変わったら false で戻る
+    private int _abortGeneration;
 
     public BoundedSerialQueue(int maxCount, int maxWeight = int.MaxValue, Func<T, int>? weigh = null, Action<T>? disposer = null)
     {
@@ -70,16 +72,34 @@ public sealed class BoundedSerialQueue<T>
         }
     }
 
-    /// <summary>満杯の間はブロックする。Close() されたら false を返して即座に戻る。</summary>
+    /// <summary>
+    /// 満杯の間はブロックする。Close() または AbortPutWaiters() で中断されたら false を返して即座に戻る
+    /// （どちらで戻ったかは IsClosed で判別できる）。
+    /// </summary>
     public bool Put(T value, int serial)
     {
         lock (_lock)
         {
-            while (!_closed && IsFullLocked())
+            int gen = _abortGeneration;
+            while (!_closed && IsFullLocked() && gen == _abortGeneration)
                 Monitor.Wait(_lock);
-            if (_closed) return false;
+            if (_closed || gen != _abortGeneration) return false;
             EnqueueLocked(QueueItem<T>.Data(value, serial));
             return true;
+        }
+    }
+
+    /// <summary>
+    /// 満杯待ちでブロック中の Put を false で中断させる（キュー自体は開いたまま）。
+    /// プロデューサ（demux スレッド）が Put でブロックしているとシーク要求のチェックに戻れないため、
+    /// シーク要求側がこれを呼んでプロデューサをループ先頭へ帰還させる。
+    /// </summary>
+    public void AbortPutWaiters()
+    {
+        lock (_lock)
+        {
+            _abortGeneration++;
+            Monitor.PulseAll(_lock);
         }
     }
 

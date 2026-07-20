@@ -153,4 +153,38 @@ public sealed class BoundedSerialQueueTests
         Assert.True(putTask.Wait(1000));
         Assert.True(putTask.Result);
     }
+
+    [Fact]
+    public void AbortPutWaiters_UnblocksWaitingPut_WithoutClosingQueue()
+    {
+        // Arrange: 満杯にして Put をブロックさせる
+        var q = new BoundedSerialQueue<int>(maxCount: 1);
+        Assert.True(q.Put(1, 0));
+        var blocked = Task.Run(() => q.Put(2, 0));
+        Assert.False(blocked.Wait(200)); // ブロックしていること
+
+        // Act: シーク割込み相当
+        q.AbortPutWaiters();
+
+        // Assert: false で戻るがキューは開いたまま（IsClosed で Close と判別できる）
+        Assert.True(blocked.Wait(3000));
+        Assert.False(blocked.Result);
+        Assert.False(q.IsClosed);
+
+        // 空きができれば以後の Put は普通に成功する（demux がループ先頭からシーク処理後に再開する動き）
+        Assert.True(q.Get(out _));
+        Assert.True(q.Put(3, 1));
+    }
+
+    [Fact]
+    public void AbortPutWaiters_DoesNotAffect_SubsequentPut()
+    {
+        // Arrange: 誰も待っていない状態で Abort（demux がブロックしていないタイミングのシーク）
+        var q = new BoundedSerialQueue<int>(maxCount: 2);
+        q.AbortPutWaiters();
+
+        // Assert: その後の Put は影響を受けない
+        Assert.True(q.Put(1, 0));
+        Assert.True(q.Put(2, 0));
+    }
 }

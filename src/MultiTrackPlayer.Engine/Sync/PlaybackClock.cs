@@ -59,6 +59,10 @@ public sealed class PlaybackClock
             _seekPending = true;
             _seekTarget = targetSeconds;
             _pausedOverride = null;
+            // 単調クランプの基準もシーク先へ折り返す。これを怠ると後方シーク後の
+            // PositionAt がシーク前の値に張り付き続け、映像側が全フレームを
+            // 「期限切れ」と誤判定して大量ドロップになる（実機で -17s の映像遅延として観測）
+            _lastReturnedPosition = targetSeconds;
             ReplaceSegmentsFromLocked(_writeCursor, targetSeconds, 0.0);
         }
     }
@@ -70,6 +74,7 @@ public sealed class PlaybackClock
         {
             ReplaceSegmentsFromLocked(atFrame, srcPtsSeconds, _currentRate);
             _seekPending = false;
+            _lastReturnedPosition = Math.Min(_lastReturnedPosition, srcPtsSeconds);
         }
     }
 

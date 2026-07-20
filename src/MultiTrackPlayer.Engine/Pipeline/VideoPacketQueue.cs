@@ -20,6 +20,7 @@ public unsafe sealed class VideoPacketQueue
     public bool Close() => _queue.Close();
     public int Flush() => _queue.Flush();
     public void PutEof(int serial) => _queue.PutEof(serial);
+    public void AbortPutWaiters() => _queue.AbortPutWaiters();
 
     /// <summary>src の中身の所有権を取って投入する。Close 済みで投入できなかった場合は自分で解放する。</summary>
     public bool PutMove(AVPacket* src, int serial)
