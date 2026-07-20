@@ -31,6 +31,13 @@ public partial class MainWindow : Window
         DataContext = _vm;
         _kb.Load();
 
+        // SpeedBox はプリセット項目の静的な ComboBox で PlaybackSpeed に双方向バインドしていないため、
+        // キーボードショートカットやメニューからの速度変更を選択表示へ手動で反映する
+        _vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(MainViewModel.PlaybackSpeed)) SyncSpeedBox();
+        };
+
         _vm.Engine.PositionChanged += (_, _) => UpdateSeekBarChapters();
 
         SeekBar.Seeking += (_, ratio) =>
@@ -83,6 +90,20 @@ public partial class MainWindow : Window
         _vm.Engine.ReturnFrame(lease);
     }
 
+    private void SyncSpeedBox()
+    {
+        foreach (System.Windows.Controls.ComboBoxItem item in SpeedBox.Items)
+        {
+            if (item.Tag is string s && double.TryParse(s, out double v) &&
+                Math.Abs(v - _vm.PlaybackSpeed) < 0.001)
+            {
+                SpeedBox.SelectedItem = item;
+                return;
+            }
+        }
+        SpeedBox.SelectedIndex = -1;
+    }
+
     private void UpdateSeekBarChapters()
     {
         if (_vm.Duration <= TimeSpan.Zero) return;
@@ -116,6 +137,17 @@ public partial class MainWindow : Window
         ExecuteCommand(cmd);
     }
 
+    // WPF の Key 列挙体は一部の値が別名（エイリアス）を持ち、ToString() が
+    // キーバインド辞書とは異なる別名を返すことがある（例: PageDown と Next は同じ値で
+    // ToString() は "Next" を返す）。辞書に登録している名前に正規化する。
+    private static readonly Dictionary<Key, string> KeyAliasNormalization = new()
+    {
+        [Key.Next] = "PageDown",
+        [Key.Prior] = "PageUp",
+        [Key.Oem6] = "OemCloseBrackets",
+        [Key.Oem4] = "OemOpenBrackets",
+    };
+
     private static string BuildKeyStr(KeyEventArgs e)
     {
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
@@ -123,7 +155,8 @@ public partial class MainWindow : Window
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control)) prefix += "Ctrl+";
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) prefix += "Shift+";
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Alt)) prefix += "Alt+";
-        return prefix + key.ToString();
+        string keyName = KeyAliasNormalization.TryGetValue(key, out var normalized) ? normalized : key.ToString();
+        return prefix + keyName;
     }
 
     private void ExecuteCommand(string cmd)
