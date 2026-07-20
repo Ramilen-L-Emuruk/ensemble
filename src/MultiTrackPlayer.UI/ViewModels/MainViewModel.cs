@@ -36,6 +36,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _osdText = string.Empty;
 
     private readonly DispatcherTimer _osdTimer = new() { Interval = TimeSpan.FromSeconds(1.2) };
+    private int _currentChapterIndex = -1;
 
     public MainViewModel()
     {
@@ -45,6 +46,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             Position = pos;
             if (Duration > TimeSpan.Zero)
                 PositionRatio = pos.TotalSeconds / Duration.TotalSeconds;
+            UpdateCurrentChapterHighlight(pos);
         };
         Engine.PlaybackEnded += (_, _) => OnPlaybackEnded();
         Engine.StatisticsUpdated += (_, stats) =>
@@ -136,6 +138,35 @@ public partial class MainViewModel : ObservableObject, IDisposable
         Chapters.Clear();
         foreach (var ch in Engine.GetChapters())
             Chapters.Add(new ChapterViewModel(ch));
+        _currentChapterIndex = -1;
+        UpdateCurrentChapterHighlight(Position);
+    }
+
+    /// <summary>
+    /// 現在再生位置が属するチャプターの行だけを IsCurrent 切り替えでハイライトする。
+    /// PositionChanged は再生中高頻度で発火するため、一覧全体の再構築は避ける。
+    /// </summary>
+    private void UpdateCurrentChapterHighlight(TimeSpan position)
+    {
+        int idx = -1;
+        for (int i = 0; i < Chapters.Count; i++)
+        {
+            if (Chapters[i].Chapter.StartTime <= position) idx = i;
+            else break;
+        }
+        if (idx == _currentChapterIndex) return;
+        if (_currentChapterIndex >= 0 && _currentChapterIndex < Chapters.Count)
+            Chapters[_currentChapterIndex].IsCurrent = false;
+        if (idx >= 0)
+            Chapters[idx].IsCurrent = true;
+        _currentChapterIndex = idx;
+    }
+
+    public void RenameChapter(ChapterViewModel chapter, string newTitle)
+    {
+        if (!chapter.IsUserDefined || string.IsNullOrWhiteSpace(newTitle)) return;
+        Engine.RenameUserChapter(chapter.Chapter, newTitle);
+        RefreshChapters();
     }
 
     [RelayCommand]
