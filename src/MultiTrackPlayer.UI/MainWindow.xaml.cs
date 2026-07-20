@@ -184,6 +184,9 @@ public partial class MainWindow : Window
             case "Fullscreen":    ToggleFullscreen(); break;
             case "Open":          OpenFileDialog(); break;
             case "ShowShortcuts": GetShortcuts().Show(); break;
+            case "ShowMixer":     GetMixer().Show(); break;
+            case "ShowPlaylist":  GetPlaylist().Show(); break;
+            case "ShowChapter":   GetChapter().Show(); break;
         }
     }
 
