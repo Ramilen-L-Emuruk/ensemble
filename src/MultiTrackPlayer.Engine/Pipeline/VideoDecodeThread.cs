@@ -13,6 +13,7 @@ public sealed unsafe class VideoDecodeThread
     private readonly VideoFrameRing _ring;
     private readonly Func<double> _getPtsSyncOffset;
     private readonly double _frameDurationSeconds;
+    private readonly Action? _onFirstFrameAfterFlush;
 
     private volatile bool _stopRequested;
     private readonly object _seekTargetLock = new();
@@ -24,13 +25,14 @@ public sealed unsafe class VideoDecodeThread
     private bool _abandonUntilFlush;
 
     public VideoDecodeThread(VideoDecoder decoder, VideoPacketQueue queue, VideoFrameRing ring,
-        Func<double> getPtsSyncOffset, double frameDurationSeconds)
+        Func<double> getPtsSyncOffset, double frameDurationSeconds, Action? onFirstFrameAfterFlush = null)
     {
         _decoder = decoder;
         _queue = queue;
         _ring = ring;
         _getPtsSyncOffset = getPtsSyncOffset;
         _frameDurationSeconds = frameDurationSeconds;
+        _onFirstFrameAfterFlush = onFirstFrameAfterFlush;
     }
 
     /// <summary>DemuxThread のシーク処理から、Flush 番兵を投入する前に呼ぶこと（happens-before の担保に必要）。</summary>
@@ -130,6 +132,9 @@ public sealed unsafe class VideoDecodeThread
                 return; // hw転送・sws変換前に破棄（4Kの33MB転送を丸ごと省く）
             _prerollActive = false;
             Diagnostics.DiagnosticLog.Write("video", $"preroll 完了 firstPts={normalizedPts:F3}");
+            // シーク後、映像プリロールがここで完了する。MediaEngine 側はこれを合図に
+            // ミキサーの音声出力保留（HoldOutput）を解除する（早送りバグの根治）
+            _onFirstFrameAfterFlush?.Invoke();
         }
 
         int slot = _ring.BeginWrite(frame->width, frame->height);

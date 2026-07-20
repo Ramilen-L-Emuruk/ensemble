@@ -20,6 +20,14 @@ public class MultiTrackMixer : IWaveProvider
     /// <summary>Read() 完了ごとに呼ばれる。AudioDecodeThread の充填ゲート待ちを起こすためのフック。</summary>
     public Action? OnRead;
 
+    /// <summary>
+    /// true の間、トラックバッファに実データがあっても Read() は無音を返す（バッファ自体は裏で埋まり続ける）。
+    /// シーク直後、映像側のプリロール（キーフレーム→目標地点の破棄デコード）が完了するまで音声出力を
+    /// 保留するために使う。これが無いと音声だけ先に実時間で進んでクロックが映像を置き去りにし、
+    /// 映像が追いつこうとして大量ドロップ（早送りに見える）が発生する。
+    /// </summary>
+    public volatile bool HoldOutput;
+
     public MultiTrackMixer()
     {
         _format = WaveFormat.CreateIeeeFloatWaveFormat(
@@ -37,7 +45,7 @@ public class MultiTrackMixer : IWaveProvider
         var outFloats = MemoryMarshal.Cast<byte, float>(buffer.AsSpan(offset, count));
         outFloats.Clear();
 
-        int common = ComputeCommonAvailableBytes(count);
+        int common = HoldOutput ? 0 : ComputeCommonAvailableBytes(count);
         if (common > 0)
             MixCommonBytes(common, outFloats);
 
