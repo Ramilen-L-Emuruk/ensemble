@@ -1,4 +1,5 @@
 ﻿using System.Collections.ObjectModel;
+using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using MultiTrackPlayer.Core.Enums;
@@ -32,9 +33,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _statusText = string.Empty;
     [ObservableProperty] private bool _isDebugMode;
     [ObservableProperty] private bool _isMasterMuted;
+    [ObservableProperty] private string _osdText = string.Empty;
+
+    private readonly DispatcherTimer _osdTimer = new() { Interval = TimeSpan.FromSeconds(1.2) };
 
     public MainViewModel()
     {
+        _osdTimer.Tick += (_, _) => { _osdTimer.Stop(); OsdText = string.Empty; };
         Engine.PositionChanged += (_, pos) =>
         {
             Position = pos;
@@ -81,16 +86,26 @@ public partial class MainViewModel : ObservableObject, IDisposable
         // スライダー操作でマスター音量を変えたら、ミュート状態と実際に聞こえる音を一致させるため自動的に解除する
         if (IsMasterMuted) IsMasterMuted = false;
         else Engine.SetMasterVolume((float)(value / 100.0));
+        ShowOsd($"音量 {value:0}%");
     }
 
     partial void OnIsMasterMutedChanged(bool value)
     {
         Engine.SetMasterVolume(value ? 0f : (float)(MasterVolume / 100.0));
         DiagnosticLog.Write("ui", $"マスターミュート切替 muted={value}");
+        ShowOsd(value ? "ミュート" : "ミュート解除");
     }
 
     [RelayCommand]
     private void ToggleMute() => IsMasterMuted = !IsMasterMuted;
+
+    /// <summary>操作内容を一瞬だけ画面に表示する（何をしたか分かりにくいという声を受けて追加）。</summary>
+    public void ShowOsd(string text)
+    {
+        OsdText = text;
+        _osdTimer.Stop();
+        _osdTimer.Start();
+    }
 
     public void OpenFile(string path)
     {
@@ -126,53 +141,91 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private void PlayPause()
     {
-        if (PlaybackState == PlaybackState.Playing) { Engine.Pause(); PlaybackState = PlaybackState.Paused; }
-        else { Engine.Play(); PlaybackState = PlaybackState.Playing; }
+        if (PlaybackState == PlaybackState.Playing)
+        {
+            Engine.Pause();
+            PlaybackState = PlaybackState.Paused;
+            ShowOsd("一時停止");
+        }
+        else
+        {
+            Engine.Play();
+            PlaybackState = PlaybackState.Playing;
+            ShowOsd("再生");
+        }
     }
 
     [RelayCommand]
-    private void Stop() { Engine.Stop(); PlaybackState = PlaybackState.Stopped; Position = TimeSpan.Zero; }
+    private void Stop()
+    {
+        Engine.Stop();
+        PlaybackState = PlaybackState.Stopped;
+        Position = TimeSpan.Zero;
+        ShowOsd("停止");
+    }
 
     [RelayCommand]
-    private void StepForward() => Engine.StepForward();
+    private void StepForward()
+    {
+        if (PlaybackState != PlaybackState.Paused) return;
+        Engine.StepForward();
+        ShowOsd("コマ送り");
+    }
 
     [RelayCommand]
-    private void StepBackward() => Engine.StepBackward();
+    private void StepBackward()
+    {
+        if (PlaybackState != PlaybackState.Paused) return;
+        Engine.StepBackward();
+        ShowOsd("コマ戻し");
+    }
 
-    public void Skip(double seconds) => Engine.Seek(Position + TimeSpan.FromSeconds(seconds));
+    public void Skip(double seconds)
+    {
+        Engine.Seek(Position + TimeSpan.FromSeconds(seconds));
+        ShowOsd(seconds >= 0 ? $"+{seconds:0}秒" : $"{seconds:0}秒");
+    }
 
     public void ChangeSpeed(double delta)
     {
         PlaybackSpeed = Math.Clamp(PlaybackSpeed + delta, 0.1, 2.0);
         Engine.SetPlaybackSpeed(PlaybackSpeed);
+        ShowOsd($"速度 {PlaybackSpeed:0.00}x");
     }
 
     public void SetSpeed(double speed)
     {
         PlaybackSpeed = speed;
         Engine.SetPlaybackSpeed(speed);
+        ShowOsd($"速度 {PlaybackSpeed:0.00}x");
     }
 
     public void ToggleChapterAtCurrentPosition()
     {
         var near = Engine.FindUserChapterNear(Position, TimeSpan.FromSeconds(0.5));
         if (near != null)
+        {
             Engine.RemoveUserChapter(near);
+            ShowOsd("チャプター削除");
+        }
         else
+        {
             Engine.AddUserChapter(new ChapterInfo(0, $"Chapter {Chapters.Count + 1}", Position, true));
+            ShowOsd("チャプター追加");
+        }
         RefreshChapters();
     }
 
     public void PlayNext()
     {
         var next = Playlist.MoveNext();
-        if (next != null) OpenFile(next);
+        if (next != null) { OpenFile(next); ShowOsd("次のファイル"); }
     }
 
     public void PlayPrevious()
     {
         var prev = Playlist.MovePrevious();
-        if (prev != null) OpenFile(prev);
+        if (prev != null) { OpenFile(prev); ShowOsd("前のファイル"); }
     }
 
     private void OnPlaybackEnded()

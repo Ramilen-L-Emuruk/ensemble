@@ -9,6 +9,7 @@
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVis"/>
         <local:NullToVisibilityConverter x:Key="NullToVis"/>
+        <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVis"/>
     </Window.Resources>
     <DockPanel>
         <!-- Menu -->
@@ -101,6 +102,13 @@
                        HorizontalAlignment="Center" VerticalAlignment="Center"
                        Foreground="Gray" FontSize="18"
                        Visibility="{Binding CurrentMedia, Converter={StaticResource NullToVis}}"/>
+
+            <!-- 操作 OSD: 何か操作を行うたび一瞬だけ内容を表示する（無操作で自動的に消える） -->
+            <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="16,16,0,0"
+                    Background="#B0000000" CornerRadius="4" Padding="14,6" IsHitTestVisible="False"
+                    Visibility="{Binding OsdText, Converter={StaticResource EmptyStringToVis}}">
+                <TextBlock Text="{Binding OsdText}" Foreground="White" FontSize="16"/>
+            </Border>
 
             <!-- フルスクリーン時のオーバーレイ: マウス移動・キー操作で一時表示し、無操作で自動的に消える -->
             <Border x:Name="FullscreenOverlay" VerticalAlignment="Bottom"
