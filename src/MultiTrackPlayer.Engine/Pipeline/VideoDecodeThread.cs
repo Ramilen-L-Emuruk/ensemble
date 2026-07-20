@@ -17,7 +17,11 @@ public sealed unsafe class VideoDecodeThread
 
     private volatile bool _stopRequested;
     private readonly object _seekTargetLock = new();
-    private double _nextSeekTarget = double.NaN;
+    // Flush 番兵1個につき1個の目標値が対応する FIFO。単一フィールドだと、このスレッドの処理が
+    // 追いつかないまま2回連続でシークされた際に後発の SetSeekTarget が先発の値を上書きしてしまい、
+    // 番兵と目標の対応がズレて片方の生成が「目標なし」のまま一生プリロール完了しなくなるバグがあった
+    // （スキップ連打で HoldOutput が解除されず再生が固まる不具合の原因）
+    private readonly Queue<double> _pendingSeekTargets = new();
     private bool _prerollActive;
     private double _prerollTarget;
     // このプリロールが属するキュー世代（Flush 番兵自身の Serial）。プリロール完了判定の瞬間に
@@ -41,7 +45,7 @@ public sealed unsafe class VideoDecodeThread
     /// <summary>DemuxThread のシーク処理から、Flush 番兵を投入する前に呼ぶこと（happens-before の担保に必要）。</summary>
     public void SetSeekTarget(double normalizedTargetSeconds)
     {
-        lock (_seekTargetLock) _nextSeekTarget = normalizedTargetSeconds;
+        lock (_seekTargetLock) _pendingSeekTargets.Enqueue(normalizedTargetSeconds);
     }
 
     public void RequestStop() => _stopRequested = true;
@@ -87,9 +91,8 @@ public sealed unsafe class VideoDecodeThread
         _prerollSerial = serial;
         lock (_seekTargetLock)
         {
-            _prerollActive = !double.IsNaN(_nextSeekTarget);
-            _prerollTarget = _nextSeekTarget;
-            _nextSeekTarget = double.NaN;
+            _prerollActive = _pendingSeekTargets.Count > 0;
+            _prerollTarget = _prerollActive ? _pendingSeekTargets.Dequeue() : double.NaN;
         }
         Diagnostics.DiagnosticLog.Write("video", $"flush 処理 serial={serial} preroll={( _prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
     }
