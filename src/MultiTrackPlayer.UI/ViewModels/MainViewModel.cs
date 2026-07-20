@@ -4,15 +4,22 @@ using CommunityToolkit.Mvvm.Input;
 using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine;
+using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.UI.Settings;
 
 namespace MultiTrackPlayer.UI.ViewModels;
 
 public partial class MainViewModel : ObservableObject, IDisposable
 {
+    private static readonly string LogDirectory =
+        System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                               "MultiTrackPlayer", "logs");
+
     public MediaEngine Engine { get; } = new MediaEngine();
     public PlaylistViewModel Playlist { get; } = new PlaylistViewModel();
     public ObservableCollection<AudioTrackViewModel> AudioTracks { get; } = new();
     public ObservableCollection<ChapterViewModel> Chapters { get; } = new();
+    public AppSettings Settings { get; } = AppSettings.Load();
 
     [ObservableProperty] private PlaybackState _playbackState = PlaybackState.Stopped;
     [ObservableProperty] private TimeSpan _position;
@@ -23,6 +30,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _title = "MultiTrackPlayer";
     [ObservableProperty] private bool _isFullscreen;
     [ObservableProperty] private string _statusText = string.Empty;
+    [ObservableProperty] private bool _isDebugMode;
 
     public MainViewModel()
     {
@@ -39,6 +47,24 @@ public partial class MainViewModel : ObservableObject, IDisposable
             double dropRate = total > 0 ? stats.DroppedFrames * 100.0 / total : 0.0;
             StatusText = $"表示 {stats.DisplayedFrames} / ドロップ {stats.DroppedFrames} ({dropRate:F1}%)  映像遅延 {stats.VideoLagSec * 1000:F0}ms";
         };
+
+        IsDebugMode = Settings.DebugMode;
+    }
+
+    partial void OnIsDebugModeChanged(bool value)
+    {
+        if (value) DiagnosticLog.Enable(LogDirectory);
+        else DiagnosticLog.Disable();
+        Settings.DebugMode = value;
+        Settings.Save();
+    }
+
+    /// <summary>現在の各トラックのミュート状態を、次回以降ファイルを開いたときの既定値として保存する。</summary>
+    public void SaveCurrentMutesAsDefault()
+    {
+        Settings.DefaultMutedTracks = AudioTracks.Where(t => t.IsMuted).Select(t => t.TrackNumber).ToList();
+        Settings.Save();
+        DiagnosticLog.Write("ui", $"既定ミュート保存 tracks=[{string.Join(",", Settings.DefaultMutedTracks)}]");
     }
 
     [ObservableProperty] private double _positionRatio;
@@ -62,7 +88,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         AudioTracks.Clear();
         foreach (var track in info.AudioTracks)
-            AudioTracks.Add(new AudioTrackViewModel(track, Engine.SetTrackVolume, Engine.SetTrackMute));
+        {
+            var trackVm = new AudioTrackViewModel(track, Engine.SetTrackVolume, Engine.SetTrackMute);
+            // 設定でデフォルトミュート指定されたトラック番号は最初からミュートで開く
+            if (Settings.DefaultMutedTracks.Contains(trackVm.TrackNumber))
+                trackVm.IsMuted = true;
+            AudioTracks.Add(trackVm);
+        }
 
         RefreshChapters();
         Engine.Play();
