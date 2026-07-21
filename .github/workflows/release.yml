@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "リリースするバージョン番号（例: 1.2.3。v プレフィックスなし）"
+        required: true
+        default: "0.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "push") {
+            $version = "${{ github.ref_name }}" -replace '^v', ''
+            $tagName = "${{ github.ref_name }}"
+          } else {
+            $version = "${{ github.event.inputs.version }}"
+            $tagName = "v$version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag_name=$tagName" >> $env:GITHUB_OUTPUT
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "6.0.x"
+
+      - name: Restore
+        run: dotnet restore src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj
+
+      - name: Publish
+        run: dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o publish /p:Version=${{ steps.version.outputs.version }}
+
+      - name: Create archive
+        shell: pwsh
+        run: Compress-Archive -Path publish/* -DestinationPath "MultiTrackPlayer-${{ steps.version.outputs.version }}-win-x64.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag_name }}
+          name: ${{ steps.version.outputs.tag_name }}
+          generate_release_notes: true
+          files: MultiTrackPlayer-*.zip
