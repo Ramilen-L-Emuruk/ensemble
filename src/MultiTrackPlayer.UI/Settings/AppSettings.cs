@@ -16,10 +16,12 @@ public class AppSettings
     public bool DebugMode { get; set; }
 
     /// <summary>
-    /// ファイルを開いたとき既定でミュートするトラック番号（1始まり）。
-    /// 例: 1 が Main Mix・2 以降が個別音源の録画なら [2,3,4,...] を入れて Main Mix だけ聴く。
+    /// ファイルを開いたとき既定でミュートするトラック番号（1始まり）を、ファイルが置かれたディレクトリごとに保持する。
+    /// キーはディレクトリの絶対パス（大文字小文字を区別しない）。
+    /// 例: あるフォルダで 1 が Main Mix・2 以降が個別音源の録画なら [2,3,4,...] を入れて Main Mix だけ聴く。
     /// </summary>
-    public List<int> DefaultMutedTracks { get; set; } = new();
+    public Dictionary<string, List<int>> DefaultMutedTracksByDirectory { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public static AppSettings Load()
     {
@@ -28,7 +30,13 @@ public class AppSettings
             if (File.Exists(FilePath))
             {
                 var loaded = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath));
-                if (loaded != null) return loaded;
+                if (loaded != null)
+                {
+                    // System.Text.Json はデシリアライズ時に辞書の比較子（OrdinalIgnoreCase）を保持しないため作り直す
+                    loaded.DefaultMutedTracksByDirectory =
+                        new Dictionary<string, List<int>>(loaded.DefaultMutedTracksByDirectory, StringComparer.OrdinalIgnoreCase);
+                    return loaded;
+                }
             }
         }
         catch
