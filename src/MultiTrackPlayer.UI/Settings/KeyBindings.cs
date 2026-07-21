@@ -32,6 +32,7 @@ public class KeyBindings
         ["Ctrl+M"]       = "ShowMixer",
         ["Ctrl+L"]       = "ShowPlaylist",
         ["Ctrl+T"]       = "ShowChapter",
+        ["Ctrl+D"]       = "ShowDebug",
         ["OemCloseBrackets"] = "SpeedUp",
         ["OemOpenBrackets"]  = "SpeedDown",
         ["PageDown"]     = "NextChapter",

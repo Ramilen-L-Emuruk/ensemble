@@ -21,6 +21,7 @@ public partial class MainWindow : Window
     private PlaylistWindow? _playlistWindow;
     private ChapterWindow? _chapterWindow;
     private ShortcutsWindow? _shortcutsWindow;
+    private DebugWindow? _debugWindow;
     private WriteableBitmap? _bitmap;
     private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
     private WindowState _prevWindowState;
@@ -255,6 +256,7 @@ public partial class MainWindow : Window
             case "ShowMixer":     GetMixer().Show(); break;
             case "ShowPlaylist":  GetPlaylist().Show(); break;
             case "ShowChapter":   GetChapter().Show(); break;
+            case "ShowDebug":     GetDebug().Show(); break;
         }
     }
 
@@ -314,6 +316,7 @@ public partial class MainWindow : Window
     private void MenuMixer_Click(object s, RoutedEventArgs e) => GetMixer().Show();
     private void MenuPlaylist_Click(object s, RoutedEventArgs e) => GetPlaylist().Show();
     private void MenuChapter_Click(object s, RoutedEventArgs e) => GetChapter().Show();
+    private void MenuDebug_Click(object s, RoutedEventArgs e) => GetDebug().Show();
     private void MenuFullscreen_Click(object s, RoutedEventArgs e) => ToggleFullscreen();
     private void MenuShortcuts_Click(object s, RoutedEventArgs e) => GetShortcuts().Show();
     private void MenuPlayPause_Click(object s, RoutedEventArgs e) => _vm.PlayPauseCommand.Execute(null);
@@ -363,6 +366,8 @@ public partial class MainWindow : Window
         => _playlistWindow ??= new PlaylistWindow(_vm) { Owner = this };
     private ChapterWindow GetChapter()
         => _chapterWindow ??= new ChapterWindow(_vm) { Owner = this };
+    private DebugWindow GetDebug()
+        => _debugWindow ??= new DebugWindow(_vm) { Owner = this };
     private ShortcutsWindow GetShortcuts()
         => _shortcutsWindow ??= new ShortcutsWindow(_kb) { Owner = this };
 
