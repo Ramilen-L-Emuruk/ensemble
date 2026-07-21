@@ -3,10 +3,22 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              Height="24">
     <Grid>
+        <Popup x:Name="ThumbnailPopup" Placement="Relative" PlacementTarget="{Binding ElementName=TrackCanvas}"
+               AllowsTransparency="True" IsHitTestVisible="False" IsOpen="False">
+            <Border Background="#EE202020" BorderBrush="#FF606060" BorderThickness="1" Padding="2">
+                <StackPanel>
+                    <Image x:Name="ThumbnailImage" Stretch="None" SnapsToDevicePixels="True"/>
+                    <TextBlock x:Name="ThumbnailTimeText" Foreground="White" FontSize="11"
+                               HorizontalAlignment="Center" Margin="0,2,0,0"/>
+                </StackPanel>
+            </Border>
+        </Popup>
         <Canvas x:Name="TrackCanvas" Background="#FF404040"
                 MouseLeftButtonDown="Canvas_MouseLeftButtonDown"
                 MouseMove="Canvas_MouseMove"
                 MouseLeftButtonUp="Canvas_MouseLeftButtonUp"
+                MouseEnter="Canvas_MouseEnter"
+                MouseLeave="Canvas_MouseLeave"
                 Cursor="Hand">
             <Rectangle x:Name="ProgressRect" Height="4" Fill="#FF2196F3"
                        Canvas.Left="0" Canvas.Top="10"/>
