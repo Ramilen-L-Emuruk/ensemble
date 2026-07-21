@@ -551,8 +551,14 @@ public unsafe class MediaEngine : IMediaEngine
     // demux スレッドがシーク実行直後（各キューへ FlushMarker を入れる前）に呼ぶ
     private void PublishSeekTarget(double normalizedTargetSeconds)
     {
-        _videoDecodeThread?.SetSeekTarget(normalizedTargetSeconds);
-        _audioDecodeThread?.SetSeekTarget(normalizedTargetSeconds);
+        // これから videoQueue.Flush()/audioQueue.Flush() が発行する Flush 番兵自身の Serial を先読みする
+        // （Flush() は呼ばれるたびに Serial をちょうど+1して即座にその番兵を積むため確定的に計算できる）。
+        // 短時間に複数回シークされて前の Flush 番兵が後続の Flush() の Clear() で消えても、
+        // 生き残った番兵は必ず自分の Serial に対応する正しい目標値を引けるようにするための紐付け
+        int videoTargetSerial = (_videoQueue?.Serial ?? 0) + 1;
+        int audioTargetSerial = (_audioQueue?.Serial ?? 0) + 1;
+        _videoDecodeThread?.SetSeekTarget(videoTargetSerial, normalizedTargetSeconds);
+        _audioDecodeThread?.SetSeekTarget(audioTargetSerial, normalizedTargetSeconds);
         // リングを demux スレッド側から即時 Flush する。これが無いと、リング満杯で
         // BeginWrite ブロック中の VideoDecodeThread が FlushMarker を処理できず、
         // 後方シーク時（リング内フレームが全て「未来」になり誰も取り出さない）に
