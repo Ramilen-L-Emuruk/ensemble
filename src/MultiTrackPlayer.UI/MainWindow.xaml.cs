@@ -1,10 +1,12 @@
-﻿using System.Windows;
+﻿using System.Diagnostics;
+using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using MultiTrackPlayer.Core.Enums;
+using MultiTrackPlayer.Engine.Diagnostics;
 using MultiTrackPlayer.UI.Settings;
 using MultiTrackPlayer.UI.ViewModels;
 using MultiTrackPlayer.UI.Windows;
@@ -24,6 +26,9 @@ public partial class MainWindow : Window
     private WindowState _prevWindowState;
     private WindowStyle _prevWindowStyle;
     private readonly DispatcherTimer _overlayHideTimer = new() { Interval = TimeSpan.FromSeconds(2.5) };
+    // OnRendering 1回の処理時間調査用（ドロップ調査ログ専用）。1フレーム予算(60fpsで約16.7ms)の
+    // 半分を超えたときだけ記録し、TryGetFrame と WritePixels のどちらが重いか切り分ける
+    private const double RenderCostLogThresholdMs = 8.0;
 
     public MainWindow()
     {
@@ -67,7 +72,9 @@ public partial class MainWindow : Window
     // ネイティブバッファから直接 WritePixels するため、毎フレームの確保が発生しない。
     private void OnRendering(object? sender, EventArgs e)
     {
+        long t0 = Stopwatch.GetTimestamp();
         var lease = _vm.Engine.TryGetFrame(_vm.Engine.Position);
+        long t1 = Stopwatch.GetTimestamp();
         if (lease == null) return;
 
         if (lease.Pts == _lastRenderedPts)
@@ -83,9 +90,18 @@ public partial class MainWindow : Window
             new Int32Rect(0, 0, lease.Width, lease.Height),
             lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
         VideoImage.Source = _bitmap;
+        long t2 = Stopwatch.GetTimestamp();
         _lastRenderedPts = lease.Pts;
 
         _vm.Engine.ReturnFrame(lease);
+
+        double tryGetFrameMs = (t1 - t0) * 1000.0 / Stopwatch.Frequency;
+        double writePixelsMs = (t2 - t1) * 1000.0 / Stopwatch.Frequency;
+        if (tryGetFrameMs + writePixelsMs > RenderCostLogThresholdMs)
+        {
+            DiagnosticLog.Write("renderCost",
+                $"total={tryGetFrameMs + writePixelsMs:F1}ms tryGetFrame={tryGetFrameMs:F1}ms writePixels={writePixelsMs:F1}ms w={lease.Width} h={lease.Height}");
+        }
     }
 
     private void SyncSpeedBox()
