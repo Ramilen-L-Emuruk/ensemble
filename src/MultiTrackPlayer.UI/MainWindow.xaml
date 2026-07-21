@@ -24,6 +24,7 @@
                 <MenuItem Header="ミキサー(_M)" InputGestureText="Ctrl+M" Click="MenuMixer_Click"/>
                 <MenuItem Header="プレイリスト(_L)" InputGestureText="Ctrl+L" Click="MenuPlaylist_Click"/>
                 <MenuItem Header="チャプター(_T)" InputGestureText="Ctrl+T" Click="MenuChapter_Click"/>
+                <MenuItem Header="デバッグ情報(_D)" InputGestureText="Ctrl+D" Click="MenuDebug_Click"/>
                 <Separator/>
                 <MenuItem Header="フルスクリーン(_F)" InputGestureText="F11" Click="MenuFullscreen_Click"/>
                 <MenuItem Header="ショートカット一覧(_K)" InputGestureText="F1" Click="MenuShortcuts_Click"/>
