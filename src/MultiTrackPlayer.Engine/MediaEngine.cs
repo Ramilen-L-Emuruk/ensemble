@@ -11,6 +11,7 @@ using MultiTrackPlayer.Engine.Video;
 using NAudio.Wave;
 using Sdcb.FFmpeg.Raw;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using CorePlaybackState = MultiTrackPlayer.Core.Enums.PlaybackState;
 
@@ -232,6 +233,7 @@ public unsafe class MediaEngine : IMediaEngine
         _state = CorePlaybackState.Playing;
         _playbackEndedFired = false;
         _lastFrameServedTicks = Environment.TickCount64;
+        _lastPullTimestamp = Stopwatch.GetTimestamp();
         DiagnosticLog.Write("engine", $"Play wasStopped={wasStopped}");
         ReleaseHeldFrame();
         EnsurePipelineStarted();
@@ -295,6 +297,7 @@ public unsafe class MediaEngine : IMediaEngine
         _demuxThread?.RequestSeek(target);
         _playbackEndedFired = false;
         _lastFrameServedTicks = Environment.TickCount64;
+        _lastPullTimestamp = Stopwatch.GetTimestamp();
 
         // 一時停止中のシークは、着地後（＝新世代）の最初のフレームを即座に1枚だけ表示する
         if (_state == CorePlaybackState.Paused)
@@ -385,8 +388,19 @@ public unsafe class MediaEngine : IMediaEngine
 
         if (_state == CorePlaybackState.Playing)
         {
+            long pullNow = Stopwatch.GetTimestamp();
+            double gapSincePrevPullMs = _lastPullTimestamp == 0
+                ? 0.0
+                : (pullNow - _lastPullTimestamp) * 1000.0 / Stopwatch.Frequency;
+            _lastPullTimestamp = pullNow;
+
             bool got = _videoRing.TryLeaseDue(position.TotalSeconds, _videoFrameDuration, out var raw, out int dropped);
             _droppedFrames += dropped;
+            if (dropped > 0)
+            {
+                DiagnosticLog.Write("videoDrop",
+                    $"dropped={dropped} gapSincePrevPullMs={gapSincePrevPullMs:F1} frameDurationMs={_videoFrameDuration * 1000.0:F1} clock={position.TotalSeconds:F3} ring={_videoRing.DescribeSlots()}");
+            }
             if (!got) return null;
 
             _displayedFrames++;
@@ -605,6 +619,9 @@ public unsafe class MediaEngine : IMediaEngine
     private double _lastVideoLagSec;
     private long _lastFrameServedTicks;
     private const int VideoStallThresholdMs = 2000;
+    // TryGetFrame の pull 間隔計測用（ドロップ調査ログ専用）。TickCount64 は既定タイマー分解能が粗く
+    // 1フレーム予算（60fps で約16.7ms）を見るには不十分なため Stopwatch を使う
+    private long _lastPullTimestamp;
 
     private void StatusTick()
     {
