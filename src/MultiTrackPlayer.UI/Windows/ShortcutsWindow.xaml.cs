@@ -33,6 +33,7 @@ public partial class ShortcutsWindow : Window
         ["ShowMixer"]     = "ミキサーを表示",
         ["ShowPlaylist"]  = "プレイリストを表示",
         ["ShowChapter"]   = "チャプター一覧を表示",
+        ["ShowDebug"]     = "デバッグ情報を表示",
     };
 
     private static readonly Dictionary<string, string> KeyDisplayNames = new()
