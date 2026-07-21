@@ -1,4 +1,5 @@
 ﻿using System.Collections.ObjectModel;
+using System.Windows;
 using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -6,6 +7,7 @@ using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine;
 using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.Engine.Thumbnails;
 using MultiTrackPlayer.UI.Settings;
 
 namespace MultiTrackPlayer.UI.ViewModels;
@@ -18,6 +20,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     public MediaEngine Engine { get; } = new MediaEngine();
     public PlaylistViewModel Playlist { get; } = new PlaylistViewModel();
+    public ThumbnailCacheService Thumbnails { get; } = new ThumbnailCacheService();
     public ObservableCollection<AudioTrackViewModel> AudioTracks { get; } = new();
     public ObservableCollection<ChapterViewModel> Chapters { get; } = new();
     public AppSettings Settings { get; } = AppSettings.Load();
@@ -26,6 +29,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private TimeSpan _position;
     [ObservableProperty] private TimeSpan _duration;
     [ObservableProperty] private MediaInfo? _currentMedia;
+    [ObservableProperty] private ThumbnailSheet? _thumbnailSheet;
     [ObservableProperty] private double _playbackSpeed = 1.0;
     [ObservableProperty] private double _masterVolume = 80.0;
     [ObservableProperty] private string _title = "MultiTrackPlayer";
@@ -49,6 +53,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
             UpdateCurrentChapterHighlight(pos);
         };
         Engine.PlaybackEnded += (_, _) => OnPlaybackEnded();
+        Thumbnails.ThumbnailsReady += (_, sheet) =>
+            Application.Current.Dispatcher.Invoke(() => ThumbnailSheet = sheet);
         Engine.StatisticsUpdated += (_, stats) =>
         {
             int total = stats.DroppedFrames + stats.DisplayedFrames;
@@ -121,6 +127,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
         Duration = info.Duration;
         Title = System.IO.Path.GetFileName(path) + " - MultiTrackPlayer";
         Playlist.SetCurrentByPath(path);
+
+        ThumbnailSheet = null;
+        Thumbnails.RequestForFile(path, info.Duration, info.Width, info.Height);
 
         string directory = System.IO.Path.GetDirectoryName(path) ?? string.Empty;
         bool hasSavedDefault = Settings.DefaultMutedTracksByDirectory.TryGetValue(directory, out var mutedTracks);
