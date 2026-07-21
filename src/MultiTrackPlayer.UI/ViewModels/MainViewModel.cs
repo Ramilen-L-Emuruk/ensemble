@@ -67,12 +67,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
         Settings.Save();
     }
 
-    /// <summary>現在の各トラックのミュート状態を、次回以降ファイルを開いたときの既定値として保存する。</summary>
+    /// <summary>現在の各トラックのミュート状態を、このファイルが置かれたフォルダの既定値として保存する。</summary>
     public void SaveCurrentMutesAsDefault()
     {
-        Settings.DefaultMutedTracks = AudioTracks.Where(t => t.IsMuted).Select(t => t.TrackNumber).ToList();
+        if (CurrentMedia == null) return;
+
+        string directory = System.IO.Path.GetDirectoryName(CurrentMedia.FilePath) ?? string.Empty;
+        var mutedTracks = AudioTracks.Where(t => t.IsMuted).Select(t => t.TrackNumber).ToList();
+        Settings.DefaultMutedTracksByDirectory[directory] = mutedTracks;
         Settings.Save();
-        DiagnosticLog.Write("ui", $"既定ミュート保存 tracks=[{string.Join(",", Settings.DefaultMutedTracks)}]");
+        DiagnosticLog.Write("ui", $"既定ミュート保存 dir={directory} tracks=[{string.Join(",", mutedTracks)}]");
     }
 
     [ObservableProperty] private double _positionRatio;
@@ -118,13 +122,17 @@ public partial class MainViewModel : ObservableObject, IDisposable
         Title = System.IO.Path.GetFileName(path) + " - MultiTrackPlayer";
         Playlist.SetCurrentByPath(path);
 
+        string directory = System.IO.Path.GetDirectoryName(path) ?? string.Empty;
+        bool hasSavedDefault = Settings.DefaultMutedTracksByDirectory.TryGetValue(directory, out var mutedTracks);
+
         AudioTracks.Clear();
         foreach (var track in info.AudioTracks)
         {
             var trackVm = new AudioTrackViewModel(track, Engine.SetTrackVolume, Engine.SetTrackMute);
-            // 設定でデフォルトミュート指定されたトラック番号は最初からミュートで開く
-            if (Settings.DefaultMutedTracks.Contains(trackVm.TrackNumber))
-                trackVm.IsMuted = true;
+            // このフォルダに保存済みの既定ミュートがあればそれを、無ければトラック1のみ再生する既定値を適用する
+            trackVm.IsMuted = hasSavedDefault
+                ? mutedTracks!.Contains(trackVm.TrackNumber)
+                : trackVm.TrackNumber != 1;
             AudioTracks.Add(trackVm);
         }
 
