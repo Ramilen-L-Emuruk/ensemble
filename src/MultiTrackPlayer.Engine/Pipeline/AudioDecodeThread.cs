@@ -1,6 +1,7 @@
 using MultiTrackPlayer.Engine.Audio;
 using MultiTrackPlayer.Engine.Decoding;
 using Sdcb.FFmpeg.Raw;
+using System.Linq;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
 
 namespace MultiTrackPlayer.Engine.Pipeline;
@@ -20,8 +21,8 @@ public sealed unsafe class AudioDecodeThread
 
     private volatile bool _stopRequested;
     private readonly object _seekTargetLock = new();
-    // VideoDecodeThread と同じ理由（コメント参照）で単一フィールドではなく FIFO にする
-    private readonly Queue<double> _pendingSeekTargets = new();
+    // VideoDecodeThread と同じ理由（コメント参照）で FIFO ではなく Flush 番兵の Serial キー付き辞書にする
+    private readonly Dictionary<int, double> _pendingSeekTargets = new();
     private bool _prerollActive;
     private double _prerollTarget;
     // このプリロールが属するキュー世代（Flush 番兵自身の Serial）。VideoDecodeThread と同じ理由で、
@@ -42,10 +43,13 @@ public sealed unsafe class AudioDecodeThread
         _onFirstSamplesAfterFlush = onFirstSamplesAfterFlush;
     }
 
-    /// <summary>DemuxThread のシーク処理から、Flush 番兵を投入する前に呼ぶこと。</summary>
-    public void SetSeekTarget(double normalizedTargetSeconds)
+    /// <summary>
+    /// DemuxThread のシーク処理から、Flush 番兵を投入する前に呼ぶこと。
+    /// serial は、これから投入される Flush 番兵自身の Serial（呼び出し側で Flush() 前のキュー Serial + 1 として算出）。
+    /// </summary>
+    public void SetSeekTarget(int serial, double normalizedTargetSeconds)
     {
-        lock (_seekTargetLock) _pendingSeekTargets.Enqueue(normalizedTargetSeconds);
+        lock (_seekTargetLock) _pendingSeekTargets[serial] = normalizedTargetSeconds;
     }
 
     public void RequestStop() => _stopRequested = true;
@@ -96,8 +100,15 @@ public sealed unsafe class AudioDecodeThread
         _prerollSerial = serial;
         lock (_seekTargetLock)
         {
-            _prerollActive = _pendingSeekTargets.Count > 0;
-            _prerollTarget = _prerollActive ? _pendingSeekTargets.Dequeue() : double.NaN;
+            _prerollActive = _pendingSeekTargets.Remove(serial, out _prerollTarget);
+            if (!_prerollActive) _prerollTarget = double.NaN;
+            // この番兵より前の serial 宛ての目標は、対応する番兵が Flush() の Clear() で
+            // 消えて二度と来ない残骸。溜め続けると意味のない対応関係が残るので掃除する
+            if (_pendingSeekTargets.Count > 0)
+            {
+                foreach (int staleKey in _pendingSeekTargets.Keys.Where(k => k <= serial).ToList())
+                    _pendingSeekTargets.Remove(staleKey);
+            }
         }
         // クロックの錨（anchor）はシーク後最初の「新しい」音声サンプル投入時に要求する。
         // UI の Seek() 時点で要求すると、ミキサーに残る旧位置の音声で錨が早期消費されて

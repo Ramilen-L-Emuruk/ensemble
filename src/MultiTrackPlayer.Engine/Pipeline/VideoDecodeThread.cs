@@ -1,6 +1,7 @@
 using MultiTrackPlayer.Engine.Decoding;
 using MultiTrackPlayer.Engine.Video;
 using Sdcb.FFmpeg.Raw;
+using System.Linq;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
 
 namespace MultiTrackPlayer.Engine.Pipeline;
@@ -17,11 +18,12 @@ public sealed unsafe class VideoDecodeThread
 
     private volatile bool _stopRequested;
     private readonly object _seekTargetLock = new();
-    // Flush 番兵1個につき1個の目標値が対応する FIFO。単一フィールドだと、このスレッドの処理が
-    // 追いつかないまま2回連続でシークされた際に後発の SetSeekTarget が先発の値を上書きしてしまい、
-    // 番兵と目標の対応がズレて片方の生成が「目標なし」のまま一生プリロール完了しなくなるバグがあった
-    // （スキップ連打で HoldOutput が解除されず再生が固まる不具合の原因）
-    private readonly Queue<double> _pendingSeekTargets = new();
+    // Flush 番兵の Serial をキーに目標値を対応付ける。FIFO（順序のみで対応付け）だと、
+    // BoundedSerialQueue.Flush() が短時間に連続で呼ばれた際に前の Flush 番兵が Clear() で
+    // 消えて後続の1個しか生き残らない一方、SetSeekTarget は呼ばれた回数だけ積まれてしまい、
+    // 生き残った番兵が本来とは別のシークの目標値を取り出してしまうバグがあった
+    // （ほぼ同時刻の2連続シークだけで再生が固まる不具合の原因。詳細は MediaEngine.PublishSeekTarget 参照）
+    private readonly Dictionary<int, double> _pendingSeekTargets = new();
     private bool _prerollActive;
     private double _prerollTarget;
     // このプリロールが属するキュー世代（Flush 番兵自身の Serial）。プリロール完了判定の瞬間に
@@ -42,10 +44,13 @@ public sealed unsafe class VideoDecodeThread
         _onFirstFrameAfterFlush = onFirstFrameAfterFlush;
     }
 
-    /// <summary>DemuxThread のシーク処理から、Flush 番兵を投入する前に呼ぶこと（happens-before の担保に必要）。</summary>
-    public void SetSeekTarget(double normalizedTargetSeconds)
+    /// <summary>
+    /// DemuxThread のシーク処理から、Flush 番兵を投入する前に呼ぶこと（happens-before の担保に必要）。
+    /// serial は、これから投入される Flush 番兵自身の Serial（呼び出し側で Flush() 前のキュー Serial + 1 として算出）。
+    /// </summary>
+    public void SetSeekTarget(int serial, double normalizedTargetSeconds)
     {
-        lock (_seekTargetLock) _pendingSeekTargets.Enqueue(normalizedTargetSeconds);
+        lock (_seekTargetLock) _pendingSeekTargets[serial] = normalizedTargetSeconds;
     }
 
     public void RequestStop() => _stopRequested = true;
@@ -91,8 +96,15 @@ public sealed unsafe class VideoDecodeThread
         _prerollSerial = serial;
         lock (_seekTargetLock)
         {
-            _prerollActive = _pendingSeekTargets.Count > 0;
-            _prerollTarget = _prerollActive ? _pendingSeekTargets.Dequeue() : double.NaN;
+            _prerollActive = _pendingSeekTargets.Remove(serial, out _prerollTarget);
+            if (!_prerollActive) _prerollTarget = double.NaN;
+            // この番兵より前の serial 宛ての目標は、対応する番兵が Flush() の Clear() で
+            // 消えて二度と来ない残骸。溜め続けると意味のない対応関係が残るので掃除する
+            if (_pendingSeekTargets.Count > 0)
+            {
+                foreach (int staleKey in _pendingSeekTargets.Keys.Where(k => k <= serial).ToList())
+                    _pendingSeekTargets.Remove(staleKey);
+            }
         }
         Diagnostics.DiagnosticLog.Write("video", $"flush 処理 serial={serial} preroll={( _prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
     }

@@ -29,6 +29,12 @@ public partial class SeekBarControl : UserControl
 
     public event EventHandler<double>? Seeking;
 
+    // クリック直後、マウスがピクセル単位でほぼ動いていなくても WPF は MouseMove を発火する。
+    // 閾値なしで毎回 SeekTo すると、1回のクリックでほぼ同時刻に Seeking が2回発火し、
+    // エンジン側のシークパイプラインが壊れる（プリロール対象のシリアル対応がズレて再生が固まる）
+    // 不具合の引き金になっていた（診断ログで確認済み）。実際のドラッグ移動が閾値を超えた時だけ再発火する
+    private const double MinDragPixelDelta = 2.0;
+    private double _dragAnchorX;
     private bool _isDragging;
     private readonly ObservableCollection<ChapterMarkerData> _markers = new();
 
@@ -69,13 +75,18 @@ public partial class SeekBarControl : UserControl
     {
         _isDragging = true;
         TrackCanvas.CaptureMouse();
-        SeekTo(e.GetPosition(TrackCanvas).X);
+        double x = e.GetPosition(TrackCanvas).X;
+        _dragAnchorX = x;
+        SeekTo(x);
     }
 
     private void Canvas_MouseMove(object sender, MouseEventArgs e)
     {
         if (!_isDragging) return;
-        SeekTo(e.GetPosition(TrackCanvas).X);
+        double x = e.GetPosition(TrackCanvas).X;
+        if (Math.Abs(x - _dragAnchorX) < MinDragPixelDelta) return;
+        _dragAnchorX = x;
+        SeekTo(x);
     }
 
     private void Canvas_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
