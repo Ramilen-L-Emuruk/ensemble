@@ -65,7 +65,8 @@
             <!-- SeekBar -->
             <ctrl:SeekBarControl x:Name="SeekBar" Margin="8,6,8,2"
                                  PositionRatio="{Binding PositionRatio, Mode=TwoWay}"
-                                 Duration="{Binding Duration}"/>
+                                 Duration="{Binding Duration}"
+                                 ThumbnailSheet="{Binding ThumbnailSheet}"/>
             <!-- Time labels + transport buttons -->
             <Grid Margin="8,0,8,6">
                 <Grid.ColumnDefinitions>
@@ -119,7 +120,8 @@
                 <StackPanel>
                     <ctrl:SeekBarControl x:Name="FullscreenSeekBar" Margin="0,0,0,4"
                                          PositionRatio="{Binding PositionRatio, Mode=TwoWay}"
-                                         Duration="{Binding Duration}"/>
+                                         Duration="{Binding Duration}"
+                                         ThumbnailSheet="{Binding ThumbnailSheet}"/>
                     <TextBlock Foreground="White" FontFamily="Consolas" FontSize="12" HorizontalAlignment="Center">
                         <Run Text="{Binding Position, StringFormat={}{0:hh\\:mm\\:ss}}"/>
                         <Run Text=" / "/>
