@@ -33,7 +33,7 @@
                           IsChecked="{Binding IsDebugMode, Mode=TwoWay}"/>
                 <Separator/>
                 <MenuItem Header="現在のミュート状態を既定にする(_M)" Click="MenuSaveDefaultMutes_Click"
-                          ToolTip="次回以降ファイルを開いたとき、いまミュートしているトラック番号を最初からミュートで開きます"/>
+                          ToolTip="このフォルダのファイルを次回以降開いたとき、いまミュートしているトラック番号を最初からミュートで開きます（未設定のフォルダはトラック1のみ再生で開きます）"/>
             </MenuItem>
             <MenuItem Header="再生(_P)">
                 <MenuItem Header="再生/一時停止" InputGestureText="Space" Click="MenuPlayPause_Click"/>
