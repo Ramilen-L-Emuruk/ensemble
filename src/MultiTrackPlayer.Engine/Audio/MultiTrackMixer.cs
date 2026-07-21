@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Runtime.InteropServices;
 using NAudio.Wave;
 
@@ -21,12 +22,16 @@ public class MultiTrackMixer : IWaveProvider
     public Action? OnRead;
 
     /// <summary>
-    /// true の間、トラックバッファに実データがあっても Read() は無音を返す（バッファ自体は裏で埋まり続ける）。
+    /// true の間、トラックバッファに実データがあっても Read() は無音を返す。バッファ自体は
+    /// 通常どおり消費し続ける（消費まで止めると、AudioDecodeThread の充填ゲートが
+    /// この Read() の消費待ちで永久に抜けられなくなり、シーク処理自体がデッドロックする）。
     /// シーク直後、映像側のプリロール（キーフレーム→目標地点の破棄デコード）が完了するまで音声出力を
     /// 保留するために使う。これが無いと音声だけ先に実時間で進んでクロックが映像を置き去りにし、
     /// 映像が追いつこうとして大量ドロップ（早送りに見える）が発生する。
     /// </summary>
     public volatile bool HoldOutput;
+
+    private long _lastHoldOutputLogTicks;
 
     public MultiTrackMixer()
     {
@@ -45,17 +50,33 @@ public class MultiTrackMixer : IWaveProvider
         var outFloats = MemoryMarshal.Cast<byte, float>(buffer.AsSpan(offset, count));
         outFloats.Clear();
 
-        int common = HoldOutput ? 0 : ComputeCommonAvailableBytes(count);
-        if (common > 0)
-            MixCommonBytes(common, outFloats);
+        bool holding = HoldOutput;
+        int common = ComputeCommonAvailableBytes(count);
+        if (holding) LogHoldOutputStall(common);
 
-        long audioFrames = common / _blockAlign;
-        long silenceFrames = (count - common) / _blockAlign;
+        if (common > 0)
+            MixCommonBytes(common, outFloats, holding);
+
+        long audioFrames = holding ? 0 : common / _blockAlign;
+        long silenceFrames = holding ? count / _blockAlign : (count - common) / _blockAlign;
         if (audioFrames > 0) OnAudioWritten?.Invoke(audioFrames);
         if (silenceFrames > 0) OnSilenceWritten?.Invoke(silenceFrames);
 
         OnRead?.Invoke();
         return count;
+    }
+
+    /// <summary>回帰検知用診断ログ: HoldOutput が長時間解除されない異常ケースを検出するため、
+    /// HoldOutput 中の消費量とトラックのバッファ残量を一定間隔で記録する。</summary>
+    private void LogHoldOutputStall(int consumedBytes)
+    {
+        long nowTicks = Environment.TickCount64;
+        if (nowTicks - _lastHoldOutputLogTicks < 2000) return;
+        _lastHoldOutputLogTicks = nowTicks;
+
+        string bufferedByTrack = string.Join(",", _tracks.Select(t => t.Buffer.BufferedBytes));
+        Diagnostics.DiagnosticLog.Write("mixer-hold",
+            $"HoldOutput 中 出力保留（バッファ消費は継続） consumedBytes={consumedBytes} trackBufferedBytes=[{bufferedByTrack}]");
     }
 
     /// <summary>
@@ -83,7 +104,12 @@ public class MultiTrackMixer : IWaveProvider
         return Math.Max(0, common);
     }
 
-    private void MixCommonBytes(int common, Span<float> outFloats)
+    /// <summary>
+    /// holding=true の間はトラックバッファの消費（Read）だけ行い、出力には混ぜない。
+    /// HoldOutput 中でも消費自体は止めないことで、AudioDecodeThread の充填ゲートが
+    /// 塞がれ続けるのを防ぐ（HoldOutput のコメント参照）。
+    /// </summary>
+    private void MixCommonBytes(int common, Span<float> outFloats, bool holding)
     {
         EnsureScratchCapacity(common);
         var scratchBytes = _scratch;
@@ -91,7 +117,7 @@ public class MultiTrackMixer : IWaveProvider
         foreach (var track in _tracks)
         {
             int read = track.Buffer.Read(scratchBytes, 0, common);
-            if (track.IsMuted) continue;
+            if (holding || track.IsMuted) continue;
 
             float vol = track.Volume * _masterVolume;
             if (vol == 0f) continue;
@@ -100,6 +126,8 @@ public class MultiTrackMixer : IWaveProvider
             for (int i = 0; i < srcFloats.Length; i++)
                 outFloats[i] += srcFloats[i] * vol;
         }
+
+        if (holding) return; // 出力には混ぜない（消費だけ行った）
 
         int floatCount = common / sizeof(float);
         for (int i = 0; i < floatCount; i++)
