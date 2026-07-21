@@ -198,14 +198,32 @@ public sealed unsafe class AudioDecodeThread
         }
     }
 
+    // 通常運用でも充填ゲートの出入り自体は頻発するため、その都度はログしない。
+    // ここでの滞留はミキサー側の消費停止（HoldOutput 等）を示す異常シグナルなので、
+    // 一定時間を超えて抜けられない場合だけ記録する
+    private static readonly TimeSpan GateStallLogThreshold = TimeSpan.FromSeconds(2.0);
+
     private void AddWithGate(int trackIndex, byte[] pcm, int offset, int count)
     {
         var track = _states[trackIndex];
-        while (track.Buffer.BufferedDuration > FillGateThreshold)
+        if (track.Buffer.BufferedDuration > FillGateThreshold)
         {
-            if (_stopRequested) return;
-            _wake.Wait(FillGatePollInterval);
-            _wake.Reset();
+            long enterTicks = Environment.TickCount64;
+            long lastLogElapsedMs = 0;
+            while (track.Buffer.BufferedDuration > FillGateThreshold)
+            {
+                if (_stopRequested) return;
+                _wake.Wait(FillGatePollInterval);
+                _wake.Reset();
+
+                long elapsedMs = Environment.TickCount64 - enterTicks;
+                if (elapsedMs - lastLogElapsedMs >= GateStallLogThreshold.TotalMilliseconds)
+                {
+                    lastLogElapsedMs = elapsedMs;
+                    Diagnostics.DiagnosticLog.Write("audio-gate",
+                        $"充填ゲート滞留中 track={trackIndex} elapsedMs={elapsedMs} bufferedDuration={track.Buffer.BufferedDuration.TotalSeconds:F3}");
+                }
+            }
         }
         if (_anchorNotifyPending)
         {
