@@ -23,15 +23,15 @@ public partial class PlaylistViewModel : ObservableObject
 
     public string? MoveNext()
     {
-        if (Files.Count == 0) return null;
-        CurrentIndex = (CurrentIndex + 1) % Files.Count;
+        if (Files.Count == 0 || CurrentIndex >= Files.Count - 1) return null;
+        CurrentIndex++;
         return Files[CurrentIndex];
     }
 
     public string? MovePrevious()
     {
-        if (Files.Count == 0) return null;
-        CurrentIndex = CurrentIndex <= 0 ? Files.Count - 1 : CurrentIndex - 1;
+        if (Files.Count == 0 || CurrentIndex <= 0) return null;
+        CurrentIndex--;
         return Files[CurrentIndex];
     }
 

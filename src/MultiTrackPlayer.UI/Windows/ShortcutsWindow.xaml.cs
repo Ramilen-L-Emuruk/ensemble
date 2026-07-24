@@ -51,6 +51,7 @@ public partial class ShortcutsWindow : Window
     private static readonly ShortcutItem[] TrackShortcuts =
     {
         new("1〜9+M", "該当トラックのミュート切替"),
+        new("1〜9+S", "該当トラックのソロ切替"),
         new("1〜9+↑", "該当トラックの音量を上げる"),
         new("1〜9+↓", "該当トラックの音量を下げる"),
     };
@@ -62,6 +63,7 @@ public partial class ShortcutsWindow : Window
             .Select(b => new ShortcutItem(FormatKey(b.Key), FormatCommand(b.Value)))
             .Concat(TrackShortcuts)
             .ToList();
+        SubWindowKeyHandling.AttachEscapeAndShortcutForwarding(this);
     }
 
     private static string FormatKey(string keyStr)

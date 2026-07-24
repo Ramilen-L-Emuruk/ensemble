@@ -7,7 +7,8 @@ public class AudioTrackState
     public BufferedWaveProvider Buffer { get; }
     public volatile float Volume = 1.0f;
     public volatile bool IsMuted = false;
-    // P3 の AudioDecodeThread が EOF ドレイン完了時に立てる。ミキサーの drained 判定に使用（現時点では未使用）
+    // AudioDecodeThread が EOF ドレイン完了時に立てる。MediaEngine の再生完了検出（CheckPlaybackEnded）と、
+    // MultiTrackMixer が全トラックEOF後の末尾無音でクロックを凍結させないための判定に使用する
     public volatile bool IsEof = false;
 
     public AudioTrackState()

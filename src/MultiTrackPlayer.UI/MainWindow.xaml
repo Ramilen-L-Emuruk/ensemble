@@ -37,8 +37,8 @@
                           ToolTip="このフォルダのファイルを次回以降開いたとき、いまミュートしているトラック番号を最初からミュートで開きます（未設定のフォルダはトラック1のみ再生で開きます）"/>
             </MenuItem>
             <MenuItem Header="再生(_P)">
-                <MenuItem Header="再生/一時停止" InputGestureText="Space" Click="MenuPlayPause_Click"/>
-                <MenuItem Header="停止" InputGestureText="S" Click="MenuStop_Click"/>
+                <MenuItem Header="再生/一時停止" InputGestureText="Space / S" Click="MenuPlayPause_Click"/>
+                <MenuItem Header="停止" Click="MenuStop_Click"/>
                 <Separator/>
                 <MenuItem Header="コマ送り" InputGestureText="." Click="MenuStepFwd_Click"/>
                 <MenuItem Header="コマ戻し" InputGestureText="," Click="MenuStepBwd_Click"/>
