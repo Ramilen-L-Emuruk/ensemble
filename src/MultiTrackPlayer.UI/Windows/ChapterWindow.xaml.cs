@@ -15,6 +15,7 @@ public partial class ChapterWindow : Window
         InitializeComponent();
         DataContext = vm;
         _vm = vm;
+        SubWindowKeyHandling.AttachEscapeAndShortcutForwarding(this);
     }
 
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
