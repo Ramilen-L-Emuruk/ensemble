@@ -111,12 +111,18 @@ MultiTrackPlayer（マルチトラック対応 Windows 動画プレイヤー）�
 
 - ワークフローの内容: `windows-latest` ランナーで `dotnet publish -c Release -o publish` を実行し、タグ名（または手動実行時の入力値）を `/p:Version=` で注入 → `publish/` フォルダ一式を zip 化 → GitHub Release を作成しリリースノートを自動生成した上で zip を添付する
 - **exe 単体では動作しない**。FFmpeg のネイティブ DLL（`runtimes/win-x64/native/avcodec-60.dll` 等）や NAudio・CommunityToolkit.Mvvm の依存 DLL が必要なため、`publish/` フォルダ一式を zip 化して配布する形にしている（single-file 化は未対応）
-- ローカルで発行物を手元確認したいだけの場合は、従来通り以下も使える（GitHub Release は作られない）:
-  ```bash
-  dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o publish
-  ```
-  - 出力先はリポジトリルート直下の `publish/` に固定する（`-o publish`）。`bin/Release/net6.0-windows/...` のようなバージョン・ランタイム別のネストしたパスには出力しない。
-  - `publish/` は `.gitignore` 済み（コミット対象外）。
+
+### リリース時に必ず行うこと: ローカル publish
+
+**タグ push（＝GitHub Actions 経由のリリース）を行った際は、それだけで終わらせず、必ずローカルでも同じ `dotnet publish` を実行すること。** GitHub Actions 側のビルドはクラウド上で完結し、ユーザーの手元の実行ファイルには一切反映されない。ユーザーがすぐに手元で動作確認できるよう、ローカルにも発行物を用意するのが release フローの一部。
+
+```bash
+dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o publish
+```
+
+- 出力先はリポジトリルート直下の `publish/` に固定する（`-o publish`）。`bin/Release/net6.0-windows/...` のようなバージョン・ランタイム別のネストしたパスには出力しない。
+- `publish/` は `.gitignore` 済み（コミット対象外）。GitHub Release は作られない（ローカル確認専用）。
+- リリースを伴わずローカルの発行物だけ欲しい場合も、同じコマンドをそのまま使ってよい。
 
 ## コメント・ドキュメント整合性チェック
 
