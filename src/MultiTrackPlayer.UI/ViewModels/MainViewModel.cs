@@ -85,6 +85,20 @@ public partial class MainViewModel : ObservableObject, IDisposable
         DiagnosticLog.Write("ui", $"既定ミュート保存 dir={directory} tracks=[{string.Join(",", mutedTracks)}]");
     }
 
+    private void OnAudioTrackMuteOrSoloChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(AudioTrackViewModel.IsMuted) || e.PropertyName == nameof(AudioTrackViewModel.IsSolo))
+            UpdateSoloMuting();
+    }
+
+    /// <summary>いずれかのトラックがソロ中なら、ソロ対象以外を実効的にミュートしてエンジンへ反映する。</summary>
+    private void UpdateSoloMuting()
+    {
+        bool anySolo = AudioTracks.Any(t => t.IsSolo);
+        foreach (var t in AudioTracks)
+            Engine.SetTrackMute(t.TrackNumber, anySolo ? !t.IsSolo : t.IsMuted);
+    }
+
     [ObservableProperty] private double _positionRatio;
 
     partial void OnPositionRatioChanged(double value)
@@ -119,6 +133,24 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _osdTimer.Start();
     }
 
+    /// <summary>単一ファイルを開く操作（ファイルを開くダイアログ・単一ファイルのドラッグ&amp;ドロップ・
+    /// 起動時引数）の入口。同じフォルダ内の対応拡張子ファイルを自動的にプレイリストへ読み込むことで、
+    /// 明示的にプレイリストを組んでいなくても次の動画へ自動的に進めるようにする。</summary>
+    public void OpenFileWithFolderPlaylist(string path)
+    {
+        string directory = System.IO.Path.GetDirectoryName(path) ?? string.Empty;
+        var siblings = System.IO.Directory.Exists(directory)
+            ? System.IO.Directory.EnumerateFiles(directory)
+                .Where(f => SupportedVideoExtensions.Extensions.Contains(System.IO.Path.GetExtension(f).ToLowerInvariant()))
+                .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                .ToList()
+            : new List<string>();
+
+        Playlist.Files.Clear();
+        Playlist.AddFiles(siblings.Count > 0 ? siblings : new[] { path });
+        OpenFile(path);
+    }
+
     public void OpenFile(string path)
     {
         Engine.Open(path);
@@ -137,17 +169,20 @@ public partial class MainViewModel : ObservableObject, IDisposable
         AudioTracks.Clear();
         foreach (var track in info.AudioTracks)
         {
-            var trackVm = new AudioTrackViewModel(track, Engine.SetTrackVolume, Engine.SetTrackMute);
+            var trackVm = new AudioTrackViewModel(track, Engine.SetTrackVolume);
             // このフォルダに保存済みの既定ミュートがあればそれを、無ければトラック1のみ再生する既定値を適用する
             trackVm.IsMuted = hasSavedDefault
                 ? mutedTracks!.Contains(trackVm.TrackNumber)
                 : trackVm.TrackNumber != 1;
+            trackVm.PropertyChanged += OnAudioTrackMuteOrSoloChanged;
             AudioTracks.Add(trackVm);
         }
+        UpdateSoloMuting();
 
         RefreshChapters();
         Engine.Play();
         PlaybackState = PlaybackState.Playing;
+        ShowOsd(System.IO.Path.GetFileName(path));
     }
 
     public void RefreshChapters()
@@ -267,13 +302,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
     public void PlayNext()
     {
         var next = Playlist.MoveNext();
-        if (next != null) { OpenFile(next); ShowOsd("次のファイル"); }
+        if (next != null) OpenFile(next);
     }
 
     public void PlayPrevious()
     {
         var prev = Playlist.MovePrevious();
-        if (prev != null) { OpenFile(prev); ShowOsd("前のファイル"); }
+        if (prev != null) OpenFile(prev);
     }
 
     private void OnPlaybackEnded()

@@ -53,18 +53,27 @@ public partial class MainWindow : Window
         {
             _overlayHideTimer.Stop();
             FullscreenOverlay.Visibility = Visibility.Collapsed;
+            Cursor = Cursors.None;
         };
         MouseMove += (_, _) => { if (_vm.IsFullscreen) ShowFullscreenOverlay(); };
 
         CompositionTarget.Rendering += OnRendering;
 
-        // コマンドライン引数で渡された動画ファイルを起動時に開く
+        // コマンドライン引数で渡された動画ファイルを起動時に開く。
+        // 1件だけ渡された場合はフォルダ内の他の動画も自動でプレイリストに読み込む
         Loaded += (_, _) =>
         {
             var files = App.StartupArgs.Where(System.IO.File.Exists).ToArray();
             if (files.Length == 0) return;
-            _vm.Playlist.AddFiles(files);
-            _vm.OpenFile(files[0]);
+            if (files.Length == 1)
+            {
+                _vm.OpenFileWithFolderPlaylist(files[0]);
+            }
+            else
+            {
+                _vm.Playlist.AddFiles(files);
+                _vm.OpenFile(files[0]);
+            }
             UpdateSeekBarChapters();
         };
     }
@@ -145,6 +154,14 @@ public partial class MainWindow : Window
         }
         if (_vm.IsFullscreen) ShowFullscreenOverlay();
 
+        HandleShortcutKey(e);
+    }
+
+    /// <summary>キーバインドに従いショートカットコマンドを実行する。サブウィンドウ表示中も
+    /// メインウィンドウのショートカットが使えるよう、各サブウィンドウのキー入力からも呼び出される。</summary>
+    public void HandleShortcutKey(KeyEventArgs e)
+    {
+        if (e.IsRepeat) { e.Handled = true; return; }
         if (TryHandleTrackKey(e)) { e.Handled = true; return; }
 
         string keyStr = BuildKeyStr(e);
@@ -174,6 +191,10 @@ public partial class MainWindow : Window
             case Key.M:
                 track.IsMuted = !track.IsMuted;
                 _vm.ShowOsd($"{track.Name} {(track.IsMuted ? "ミュート" : "ミュート解除")}");
+                return true;
+            case Key.S:
+                track.IsSolo = !track.IsSolo;
+                _vm.ShowOsd($"{track.Name} {(track.IsSolo ? "ソロ" : "ソロ解除")}");
                 return true;
             case Key.Up:
                 track.Volume = Math.Min(200, track.Volume + 5);
@@ -262,14 +283,10 @@ public partial class MainWindow : Window
 
     private void OpenFileDialog()
     {
-        var dlg = new OpenFileDialog
-        {
-            Filter = "動画ファイル|*.mkv;*.mp4;*.avi;*.mov;*.ts;*.m2ts;*.webm;*.flv|すべてのファイル|*.*"
-        };
+        var dlg = new OpenFileDialog { Filter = SupportedVideoExtensions.OpenFileDialogFilter };
         if (dlg.ShowDialog() == true)
         {
-            _vm.Playlist.AddFiles(new[] { dlg.FileName });
-            _vm.OpenFile(dlg.FileName);
+            _vm.OpenFileWithFolderPlaylist(dlg.FileName);
             UpdateSeekBarChapters();
         }
     }
@@ -298,14 +315,17 @@ public partial class MainWindow : Window
             _vm.IsFullscreen = false;
             _overlayHideTimer.Stop();
             FullscreenOverlay.Visibility = Visibility.Collapsed;
+            Cursor = Cursors.Arrow;
             _vm.ShowOsd("フルスクリーン解除");
         }
     }
 
-    /// <summary>フルスクリーン中にシークバー＋現在時刻/長さのオーバーレイを表示し、無操作タイマーをリセットする。</summary>
+    /// <summary>フルスクリーン中にシークバー＋現在時刻/長さのオーバーレイを表示し、無操作タイマーをリセットする。
+    /// マウスカーソルも無操作タイマーと連動して非表示/再表示する。</summary>
     private void ShowFullscreenOverlay()
     {
         FullscreenOverlay.Visibility = Visibility.Visible;
+        Cursor = Cursors.Arrow;
         _overlayHideTimer.Stop();
         _overlayHideTimer.Start();
     }
@@ -351,12 +371,18 @@ public partial class MainWindow : Window
 
     private void Window_Drop(object sender, DragEventArgs e)
     {
-        if (e.Data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
+        if (e.Data.GetData(DataFormats.FileDrop) is not string[] files || files.Length == 0) return;
+
+        if (files.Length == 1)
+        {
+            _vm.OpenFileWithFolderPlaylist(files[0]);
+        }
+        else
         {
             _vm.Playlist.AddFiles(files);
             _vm.OpenFile(files[0]);
-            UpdateSeekBarChapters();
         }
+        UpdateSeekBarChapters();
     }
 
     // ── Sub-windows (lazy) ──
