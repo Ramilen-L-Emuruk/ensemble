@@ -9,6 +9,7 @@ public partial class MixerWindow : Window
     {
         InitializeComponent();
         DataContext = vm;
+        SubWindowKeyHandling.AttachEscapeAndShortcutForwarding(this);
     }
 
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)

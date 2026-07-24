@@ -13,6 +13,7 @@ public partial class PlaylistWindow : Window
         InitializeComponent();
         DataContext = vm;
         _vm = vm;
+        SubWindowKeyHandling.AttachEscapeAndShortcutForwarding(this);
     }
 
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
@@ -32,7 +33,7 @@ public partial class PlaylistWindow : Window
 
     private void Add_Click(object sender, RoutedEventArgs e)
     {
-        var dlg = new OpenFileDialog { Multiselect = true, Filter = "動画ファイル|*.mkv;*.mp4;*.avi;*.mov;*.ts;*.m2ts;*.webm;*.flv|すべてのファイル|*.*" };
+        var dlg = new OpenFileDialog { Multiselect = true, Filter = SupportedVideoExtensions.OpenFileDialogFilter };
         if (dlg.ShowDialog() == true)
             _vm.Playlist.AddFiles(dlg.FileNames);
     }

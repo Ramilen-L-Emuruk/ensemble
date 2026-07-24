@@ -14,7 +14,9 @@ public class KeyBindings
     private static Dictionary<string, string> DefaultBindings() => new()
     {
         ["Space"]        = "PlayPause",
-        ["S"]            = "Stop",
+        // サブウィンドウ表示中に Space を押すとフォーカス中のボタンが押されてしまい
+        // 再生/一時停止に届かないことがあるため、ボタンのアクセスキーと衝突しにくい S にも割り当てる
+        ["S"]            = "PlayPause",
         ["OemPeriod"]    = "StepForward",
         ["OemComma"]     = "StepBackward",
         ["Right"]        = "Skip+10",

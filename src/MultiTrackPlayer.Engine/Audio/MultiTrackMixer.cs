@@ -59,6 +59,18 @@ public class MultiTrackMixer : IWaveProvider
 
         long audioFrames = holding ? 0 : common / _blockAlign;
         long silenceFrames = holding ? count / _blockAlign : (count - common) / _blockAlign;
+
+        // 全トラックが EOF に達した後の無音は、アンダーラン/priming待ちの無音とは違い
+        // 二度と実データが来ない。ここで OnSilenceWritten のままクロックを凍結させ続けると、
+        // 音声より僅かに長い映像側の末尾フレームが永遠に「期限到来」と判定されず、
+        // 再生完了検出（IsEofDrained）が働かなくなる（次の動画へ進めないバグの原因）。
+        // 実時間で進め続けるべき区間なので OnAudioWritten 側に計上する
+        if (!holding && silenceFrames > 0 && _tracks.Count > 0 && _tracks.All(t => t.IsEof))
+        {
+            audioFrames += silenceFrames;
+            silenceFrames = 0;
+        }
+
         if (audioFrames > 0) OnAudioWritten?.Invoke(audioFrames);
         if (silenceFrames > 0) OnSilenceWritten?.Invoke(silenceFrames);
 
@@ -88,16 +100,21 @@ public class MultiTrackMixer : IWaveProvider
     {
         if (_tracks.Count == 0) return 0;
 
-        // EOF 済みトラックは可用量の下限計算から除外する（残量ゼロの EOF トラックが
-        // 常に common=0 を強制し、他トラックの音声まで止めてしまうのを防ぐ）。
-        // Read 自体は全トラックに対して行うので、EOF トラックの残りも消費される
+        // EOF かつ残量も尽きたトラックだけを下限計算から除外する（そうしないと、
+        // 完全に消費し終えたEOFトラックの残量ゼロが常に common=0 を強制し、他トラックの
+        // 音声まで止めてしまう）。EOF でもまだ残量があるトラックは、その末尾を実時間で
+        // ドレインし切る必要があるため通常どおり min 計算に含める。ここで除外してしまうと
+        // 全トラックが同時に EOF になった瞬間 common が強制的に 0 になり、MixCommonBytes が
+        // 呼ばれなくなって各トラックの末尾未消費データが二度と読み出されず、
+        // BufferedBytes が 0 に落ちきらないまま再生完了検出（CheckPlaybackEnded）が
+        // 永久に成立しなくなる不具合があった
         int common = int.MaxValue;
         foreach (var track in _tracks)
         {
-            if (track.IsEof) continue;
+            if (track.IsEof && track.Buffer.BufferedBytes == 0) continue;
             common = Math.Min(common, track.Buffer.BufferedBytes);
         }
-        if (common == int.MaxValue) common = 0; // 全トラック EOF
+        if (common == int.MaxValue) common = 0; // 全トラック EOF かつ残量ゼロ
 
         common = Math.Min(common, count);
         common -= common % _blockAlign;
