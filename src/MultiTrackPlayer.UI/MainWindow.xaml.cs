@@ -7,6 +7,7 @@ using System.Windows.Threading;
 using Microsoft.Win32;
 using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.UI.Rendering;
 using MultiTrackPlayer.UI.Settings;
 using MultiTrackPlayer.UI.ViewModels;
 using MultiTrackPlayer.UI.Windows;
@@ -23,6 +24,7 @@ public partial class MainWindow : Window
     private ShortcutsWindow? _shortcutsWindow;
     private DebugWindow? _debugWindow;
     private WriteableBitmap? _bitmap;
+    private D3DImagePresenter? _presenter;
     private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
     private WindowState _prevWindowState;
     private WindowStyle _prevWindowStyle;
@@ -36,6 +38,23 @@ public partial class MainWindow : Window
         InitializeComponent();
         DataContext = _vm;
         _kb.Load();
+
+        // GPU が利用可能なら D3DImage による GPU ゼロコピー描画経路を使う。
+        // RenderCapability.Tier の上位 16bit が 0 の場合はソフトウェアレンダリングのため従来の
+        // WriteableBitmap 経路にフォールバックする。初期化に失敗した場合も同様にフォールバックする。
+        if (RenderCapability.Tier >> 16 > 0)
+        {
+            try
+            {
+                _presenter = new D3DImagePresenter();
+                VideoImage.Source = _presenter.D3DImage;
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("d3dPresenter", $"初期化失敗のため WriteableBitmap にフォールバック: {ex.Message}");
+                _presenter = null;
+            }
+        }
 
         // SpeedBox はプリセット項目の静的な ComboBox で PlaybackSpeed に双方向バインドしていないため、
         // キーボードショートカットやメニューからの速度変更を選択表示へ手動で反映する
@@ -78,8 +97,9 @@ public partial class MainWindow : Window
         };
     }
 
-    // 映像フレームをエンジンからプルする。VideoFrameLease は byte[] を経由せず
-    // ネイティブバッファから直接 WritePixels するため、毎フレームの確保が発生しない。
+    // 映像フレームをエンジンからプルする。VideoFrameLease は byte[] を経由せずネイティブバッファを
+    // 直接扱うため、毎フレームの確保が発生しない。描画先は GPU 経路（D3DImagePresenter）優先で、
+    // GPU 非対応・初期化失敗時のみ WriteableBitmap にフォールバックする。
     private void OnRendering(object? sender, EventArgs e)
     {
         long t0 = Stopwatch.GetTimestamp();
@@ -93,24 +113,35 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_bitmap is null || _bitmap.PixelWidth != lease.Width || _bitmap.PixelHeight != lease.Height)
-            _bitmap = new WriteableBitmap(lease.Width, lease.Height, 96, 96, PixelFormats.Bgra32, null);
+        if (_presenter != null)
+        {
+            // GPU ゼロコピー経路: Present 内でネイティブバッファを GPU テクスチャへ同期コピーする。
+            _presenter.Present(lease);
+        }
+        else
+        {
+            // フォールバック経路: WriteableBitmap へ CPU コピーする。
+            if (_bitmap is null || _bitmap.PixelWidth != lease.Width || _bitmap.PixelHeight != lease.Height)
+                _bitmap = new WriteableBitmap(lease.Width, lease.Height, 96, 96, PixelFormats.Bgra32, null);
 
-        _bitmap.WritePixels(
-            new Int32Rect(0, 0, lease.Width, lease.Height),
-            lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
-        VideoImage.Source = _bitmap;
+            _bitmap.WritePixels(
+                new Int32Rect(0, 0, lease.Width, lease.Height),
+                lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
+            VideoImage.Source = _bitmap;
+        }
         long t2 = Stopwatch.GetTimestamp();
         _lastRenderedPts = lease.Pts;
 
         _vm.Engine.ReturnFrame(lease);
 
         double tryGetFrameMs = (t1 - t0) * 1000.0 / Stopwatch.Frequency;
-        double writePixelsMs = (t2 - t1) * 1000.0 / Stopwatch.Frequency;
-        if (tryGetFrameMs + writePixelsMs > RenderCostLogThresholdMs)
+        // t1〜t2 の計測対象は、GPU 経路では Present 全体、フォールバックでは WritePixels。
+        // ラベルは両経路を包含する意味で uploadMs とする（旧名 writePixels から意味変更）。
+        double uploadMs = (t2 - t1) * 1000.0 / Stopwatch.Frequency;
+        if (tryGetFrameMs + uploadMs > RenderCostLogThresholdMs)
         {
             DiagnosticLog.Write("renderCost",
-                $"total={tryGetFrameMs + writePixelsMs:F1}ms tryGetFrame={tryGetFrameMs:F1}ms writePixels={writePixelsMs:F1}ms w={lease.Width} h={lease.Height}");
+                $"total={tryGetFrameMs + uploadMs:F1}ms tryGetFrame={tryGetFrameMs:F1}ms uploadMs={uploadMs:F1}ms w={lease.Width} h={lease.Height}");
         }
     }
 
@@ -400,6 +431,7 @@ public partial class MainWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         CompositionTarget.Rendering -= OnRendering;
+        _presenter?.Dispose();
         _vm.Dispose();
         base.OnClosed(e);
     }
