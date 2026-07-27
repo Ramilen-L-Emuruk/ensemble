@@ -17,6 +17,9 @@ public unsafe class VideoDecoder : IDisposable
     private readonly int _streamIndex;
     private readonly AVRational _timeBase;
     private bool _useHw;
+    // get_format コールバックの実体。ネイティブ側から関数ポインタ経由で呼ばれるため、
+    // GC に回収されないようインスタンスの生存期間中フィールドで保持する。
+    private AVCodecContext_get_format? _getFormatDelegate;
 
     public int StreamIndex => _streamIndex;
 
@@ -38,6 +41,11 @@ public unsafe class VideoDecoder : IDisposable
         {
             _ctx->hw_device_ctx = av_buffer_ref(_hwCtx);
             _useHw = true;
+
+            // HW デコードが実際に選択されるかを診断するため get_format を差し込む。
+            // 候補フォーマットをログし、D3D11 が提示されればそれを選ぶ（無ければ SW フォールバック）。
+            _getFormatDelegate = SelectPixelFormat;
+            _ctx->get_format = _getFormatDelegate;
         }
 
         int ret = avcodec_open2(_ctx, codec, null);
@@ -56,6 +64,29 @@ public unsafe class VideoDecoder : IDisposable
         if (ret != -EAGAIN && ret != AVERROR_EOF)
             DiagnosticLog.Write("error", $"映像デコードエラー ret={ret} ({FFmpegError.Describe(ret)})");
         return false;
+    }
+
+    /// <summary>
+    /// デコーダが提示するピクセルフォーマット候補から使用するものを選ぶ get_format コールバック。
+    /// 候補と選択結果を診断ログに残し、D3D11 が提示されれば HW デコード経路を維持する。
+    /// D3D11 が候補になければソフトウェアデコードにフォールバックする。
+    /// </summary>
+    private AVPixelFormat SelectPixelFormat(AVCodecContext* ctx, AVPixelFormat* fmt)
+    {
+        var offered = new List<AVPixelFormat>();
+        for (AVPixelFormat* p = fmt; *p != AVPixelFormat.None; p++)
+            offered.Add(*p);
+
+        bool hasD3d11 = offered.Contains(AVPixelFormat.D3d11);
+        AVPixelFormat selected = hasD3d11
+            ? AVPixelFormat.D3d11
+            : (offered.Count > 0 ? offered[0] : AVPixelFormat.None);
+
+        DiagnosticLog.Write("hwDecode",
+            $"get_format 候補=[{string.Join(", ", offered)}] 選択={selected} " +
+            $"({(hasD3d11 ? "D3D11=HWデコード有効" : "D3D11非提示=SWフォールバック")})");
+
+        return selected;
     }
 
     public double GetPtsSeconds(AVFrame* frame)
