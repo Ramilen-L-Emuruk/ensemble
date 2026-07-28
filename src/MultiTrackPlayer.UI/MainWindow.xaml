@@ -3,6 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:ctrl="clr-namespace:MultiTrackPlayer.UI.Controls"
         xmlns:local="clr-namespace:MultiTrackPlayer.UI"
+        xmlns:rendering="clr-namespace:MultiTrackPlayer.UI.Rendering"
         Title="{Binding Title}" Width="960" Height="600"
         Icon="app.ico"
         AllowDrop="True" Drop="Window_Drop" DragOver="Window_DragOver"
@@ -10,7 +11,6 @@
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVis"/>
         <local:NullToVisibilityConverter x:Key="NullToVis"/>
-        <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVis"/>
     </Window.Resources>
     <DockPanel>
         <!-- Menu -->
@@ -101,35 +101,20 @@
         </StackPanel>
 
         <!-- Video area -->
-        <Grid Background="Black">
+        <Grid x:Name="VideoArea" Background="Black" SizeChanged="VideoArea_SizeChanged">
+            <!-- 案Y: GPU デコード時はこの子ウィンドウのスワップチェーンに vout スレッドが直接 Present する。
+                 airspace により子ウィンドウは最前面になるため、下の WPF オーバーレイ（OSD 等）は段階2 で別途対応。
+                 アスペクト維持: 子ウィンドウを映像アスペクト比の矩形にして中央寄せし、周囲は Grid の黒を残す（段階2-1）。 -->
+            <rendering:VideoHwndHost x:Name="VideoHost"
+                                     HorizontalAlignment="Center" VerticalAlignment="Center"/>
             <Image x:Name="VideoImage" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
             <TextBlock x:Name="DropHint" Text="ファイルをドロップして開く"
                        HorizontalAlignment="Center" VerticalAlignment="Center"
                        Foreground="Gray" FontSize="18"
                        Visibility="{Binding CurrentMedia, Converter={StaticResource NullToVis}}"/>
 
-            <!-- 操作 OSD: 何か操作を行うたび一瞬だけ内容を表示する（無操作で自動的に消える） -->
-            <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="16,16,0,0"
-                    Background="#B0000000" CornerRadius="4" Padding="14,6" IsHitTestVisible="False"
-                    Visibility="{Binding OsdText, Converter={StaticResource EmptyStringToVis}}">
-                <TextBlock Text="{Binding OsdText}" Foreground="White" FontSize="16"/>
-            </Border>
-
-            <!-- フルスクリーン時のオーバーレイ: マウス移動・キー操作で一時表示し、無操作で自動的に消える -->
-            <Border x:Name="FullscreenOverlay" VerticalAlignment="Bottom"
-                    Background="#CC000000" Padding="8,6" Visibility="Collapsed">
-                <StackPanel>
-                    <ctrl:SeekBarControl x:Name="FullscreenSeekBar" Margin="0,0,0,4"
-                                         PositionRatio="{Binding PositionRatio, Mode=TwoWay}"
-                                         Duration="{Binding Duration}"
-                                         ThumbnailSheet="{Binding ThumbnailSheet}"/>
-                    <TextBlock Foreground="White" FontFamily="Consolas" FontSize="12" HorizontalAlignment="Center">
-                        <Run Text="{Binding Position, StringFormat={}{0:hh\\:mm\\:ss}}"/>
-                        <Run Text=" / "/>
-                        <Run Text="{Binding Duration, StringFormat={}{0:hh\\:mm\\:ss}}"/>
-                    </TextBlock>
-                </StackPanel>
-            </Border>
+            <!-- OSD・フルスクリーン時のオーバーレイ（シークバー）は airspace で映像子ウィンドウに隠れるため、
+                 透過オーバーレイ（AirspaceOverlayWindow）側へ移設した（段階2-2a: OSD / 段階2-2b: フルスクリーン）。 -->
         </Grid>
     </DockPanel>
 </Window>

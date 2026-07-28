@@ -6,7 +6,9 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using MultiTrackPlayer.Core.Enums;
+using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.UI.Rendering;
 using MultiTrackPlayer.UI.Settings;
 using MultiTrackPlayer.UI.ViewModels;
 using MultiTrackPlayer.UI.Windows;
@@ -23,10 +25,16 @@ public partial class MainWindow : Window
     private ShortcutsWindow? _shortcutsWindow;
     private DebugWindow? _debugWindow;
     private WriteableBitmap? _bitmap;
+    private D3DImagePresenter? _presenter;
+    private AirspaceOverlayWindow? _overlay;
     private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
+    // VideoHost（airspace の都合で常に最前面に来るネイティブ子ウィンドウ）の現在の表示状態。
+    // vout 非稼働（CPU 経路）時に表示したままだと、下の VideoImage に描画される映像を覆い隠して
+    // 黒画面に見えてしまうため、GPU/CPU 経路の切り替わりに追従して表示・非表示を同期する。
+    // null で初期化し、初回の OnRendering で必ず実際の状態へ同期させる。
+    private bool? _videoHostVisible;
     private WindowState _prevWindowState;
     private WindowStyle _prevWindowStyle;
-    private readonly DispatcherTimer _overlayHideTimer = new() { Interval = TimeSpan.FromSeconds(2.5) };
     // OnRendering 1回の処理時間調査用（ドロップ調査ログ専用）。1フレーム予算(60fpsで約16.7ms)の
     // 半分を超えたときだけ記録し、TryGetFrame と WritePixels のどちらが重いか切り分ける
     private const double RenderCostLogThresholdMs = 8.0;
@@ -37,25 +45,44 @@ public partial class MainWindow : Window
         DataContext = _vm;
         _kb.Load();
 
+        // GPU が利用可能なら D3DImage による GPU ゼロコピー描画経路を使う。
+        // RenderCapability.Tier の上位 16bit が 0 の場合はソフトウェアレンダリングのため従来の
+        // WriteableBitmap 経路にフォールバックする。初期化に失敗した場合も同様にフォールバックする。
+        if (RenderCapability.Tier >> 16 > 0)
+        {
+            try
+            {
+                _presenter = new D3DImagePresenter();
+                VideoImage.Source = _presenter.D3DImage;
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("d3dPresenter", $"初期化失敗のため WriteableBitmap にフォールバック: {ex.Message}");
+                _presenter = null;
+            }
+        }
+
         // SpeedBox はプリセット項目の静的な ComboBox で PlaybackSpeed に双方向バインドしていないため、
         // キーボードショートカットやメニューからの速度変更を選択表示へ手動で反映する
         _vm.PropertyChanged += (_, e) =>
         {
             if (e.PropertyName == nameof(MainViewModel.PlaybackSpeed)) SyncSpeedBox();
+            // ファイル切替で映像サイズ（アスペクト比）が変わるため、映像面のレターボックス矩形を再計算する（段階2-1）。
+            // オーバーレイの追従先もこの矩形（VideoArea 基準）なので同時に再計算する。CPU 経路では VideoHost が
+            // Collapsed になり SizeChanged が発火しないため、UpdateOverlayBounds はここで明示的に呼ぶ必要がある。
+            else if (e.PropertyName == nameof(MainViewModel.CurrentMedia))
+            {
+                // 動画切替時は前フレームの残像を残さないよう、再描画判定用の直近 PTS をリセットする
+                // （新動画の最初のフレームが前動画と同一 PTS でも確実に描き直させる）。
+                _lastRenderedPts = TimeSpan.MinValue;
+                UpdateVideoHostLayout();
+                UpdateOverlayBounds();
+            }
         };
 
         SeekBar.Seeking += (_, ratio) =>
             _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
-        FullscreenSeekBar.Seeking += (_, ratio) =>
-            _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
-
-        _overlayHideTimer.Tick += (_, _) =>
-        {
-            _overlayHideTimer.Stop();
-            FullscreenOverlay.Visibility = Visibility.Collapsed;
-            Cursor = Cursors.None;
-        };
-        MouseMove += (_, _) => { if (_vm.IsFullscreen) ShowFullscreenOverlay(); };
+        // フルスクリーン時のシークバー・無操作タイマー・マウス移動検知は AirspaceOverlayWindow 側へ移設した（段階2-2b）。
 
         CompositionTarget.Rendering += OnRendering;
 
@@ -63,6 +90,20 @@ public partial class MainWindow : Window
         // 1件だけ渡された場合はフォルダ内の他の動画も自動でプレイリストに読み込む
         Loaded += (_, _) =>
         {
+            // 案Y: 映像子ウィンドウの HWND をエンジンへ接続する。GPU デコード経路の再生開始時に
+            // この HWND へスワップチェーンが張られ、vout スレッドが vsync で Present する。
+            _vm.Engine.AttachVideoOutput(VideoHost.Hwnd);
+
+            // 案Y: 映像子ウィンドウが airspace で最前面になり OSD が隠れるため、透過オーバーレイを
+            // その上に重ねて追従表示する（段階2-2a）。VideoHost のサイズ・ウィンドウ位置・状態変化で再配置する。
+            _overlay = new AirspaceOverlayWindow { Owner = this, DataContext = _vm };
+            // フルスクリーン中はオーバーレイが前面に来るため、万一オーバーレイ側にキーが渡っても
+            // 本ウィンドウのショートカット処理へ転送してキー操作を失わないようにする
+            _overlay.KeyDown += Window_KeyDown;
+            LocationChanged += (_, _) => UpdateOverlayBounds();
+            StateChanged += (_, _) => UpdateOverlayBounds();
+            UpdateOverlayBounds();
+
             var files = App.StartupArgs.Where(System.IO.File.Exists).ToArray();
             if (files.Length == 0) return;
             if (files.Length == 1)
@@ -78,10 +119,17 @@ public partial class MainWindow : Window
         };
     }
 
-    // 映像フレームをエンジンからプルする。VideoFrameLease は byte[] を経由せず
-    // ネイティブバッファから直接 WritePixels するため、毎フレームの確保が発生しない。
+    // 映像フレームをエンジンからプルする。VideoFrameLease は byte[] を経由せずネイティブバッファを
+    // 直接扱うため、毎フレームの確保が発生しない。描画先は GPU 経路（D3DImagePresenter）優先で、
+    // GPU 非対応・初期化失敗時のみ WriteableBitmap にフォールバックする。
     private void OnRendering(object? sender, EventArgs e)
     {
+        bool videoOutputActive = _vm.Engine.IsVideoOutputActive;
+        SyncVideoHostVisibility(videoOutputActive);
+
+        // vout（スワップチェーン）稼働中は映像提示を専用スレッドが担うため、UI プルは行わない（案Y）。
+        if (videoOutputActive) return;
+
         long t0 = Stopwatch.GetTimestamp();
         var lease = _vm.Engine.TryGetFrame(_vm.Engine.Position);
         long t1 = Stopwatch.GetTimestamp();
@@ -93,25 +141,138 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_bitmap is null || _bitmap.PixelWidth != lease.Width || _bitmap.PixelHeight != lease.Height)
-            _bitmap = new WriteableBitmap(lease.Width, lease.Height, 96, 96, PixelFormats.Bgra32, null);
+        if (_presenter != null)
+        {
+            // D3DImage 経路: Present が Kind に応じて GPU ゼロコピー / CPU アップロードへ振り分ける。
+            _presenter.Present(lease);
+        }
+        else if (lease.Kind == FrameKind.Cpu)
+        {
+            // フォールバック経路: WriteableBitmap へ CPU コピーする。
+            if (_bitmap is null || _bitmap.PixelWidth != lease.Width || _bitmap.PixelHeight != lease.Height)
+                _bitmap = new WriteableBitmap(lease.Width, lease.Height, 96, 96, PixelFormats.Bgra32, null);
 
-        _bitmap.WritePixels(
-            new Int32Rect(0, 0, lease.Width, lease.Height),
-            lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
-        VideoImage.Source = _bitmap;
+            _bitmap.WritePixels(
+                new Int32Rect(0, 0, lease.Width, lease.Height),
+                lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
+            VideoImage.Source = _bitmap;
+        }
+        // else: presenter 無し（WPF ソフトウェアレンダリング）かつ GPU リースは D3D を持たず表示できないため、
+        // この稀な組み合わせでは当該フレームをスキップする（クラッシュ回避）。
         long t2 = Stopwatch.GetTimestamp();
         _lastRenderedPts = lease.Pts;
 
         _vm.Engine.ReturnFrame(lease);
 
         double tryGetFrameMs = (t1 - t0) * 1000.0 / Stopwatch.Frequency;
-        double writePixelsMs = (t2 - t1) * 1000.0 / Stopwatch.Frequency;
-        if (tryGetFrameMs + writePixelsMs > RenderCostLogThresholdMs)
+        // t1〜t2 の計測対象は、GPU 経路では Present 全体、フォールバックでは WritePixels。
+        // ラベルは両経路を包含する意味で uploadMs とする（旧名 writePixels から意味変更）。
+        double uploadMs = (t2 - t1) * 1000.0 / Stopwatch.Frequency;
+        if (tryGetFrameMs + uploadMs > RenderCostLogThresholdMs)
         {
             DiagnosticLog.Write("renderCost",
-                $"total={tryGetFrameMs + writePixelsMs:F1}ms tryGetFrame={tryGetFrameMs:F1}ms writePixels={writePixelsMs:F1}ms w={lease.Width} h={lease.Height}");
+                $"total={tryGetFrameMs + uploadMs:F1}ms tryGetFrame={tryGetFrameMs:F1}ms uploadMs={uploadMs:F1}ms w={lease.Width} h={lease.Height}");
         }
+    }
+
+    private void VideoArea_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        UpdateVideoHostLayout();
+        UpdateOverlayBounds();
+    }
+
+    // VideoHost は airspace により WPF 要素（VideoImage）より必ず手前に来るネイティブ子ウィンドウのため、
+    // vout（スワップチェーン提示）が稼働していないとき（CPU フォールバック経路や、GPU 経路でも swapchain
+    // 生成に失敗した場合）に表示したままにすると、実際に映像が描画されている VideoImage を覆い隠して
+    // 「デコードは進んでいるのに画面は黒いまま」に見えてしまう。vout の稼働状態と表示・非表示を同期する。
+    private void SyncVideoHostVisibility(bool videoOutputActive)
+    {
+        if (_videoHostVisible == videoOutputActive) return;
+        _videoHostVisible = videoOutputActive;
+        // GPU 経路（vout 稼働）では VideoHost に映像を描画し VideoImage は使わない。CPU 経路では逆。
+        // 両者を排他表示にして、使っていない側のレイヤーに残る旧映像が見えないようにする
+        // （アスペクト比の異なる動画へ切り替えたとき、旧映像がはみ出して層状に重なって見える問題への対処）。
+        VideoHost.Visibility = videoOutputActive ? Visibility.Visible : Visibility.Collapsed;
+        VideoImage.Visibility = videoOutputActive ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    // 映像面（VideoHost 子ウィンドウ）を映像アスペクト比のレターボックス矩形に合わせて中央配置する（段階2-1）。
+    // swapchain は映像サイズ + Scaling.Stretch のままで、子ウィンドウのアスペクトを映像に一致させることで歪みを防ぐ。
+    // 周囲は親 Grid（VideoArea）の黒背景がそのまま黒帯になる。
+    private void UpdateVideoHostLayout()
+    {
+        var media = _vm.CurrentMedia;
+        if (media == null || media.Width <= 0 || media.Height <= 0)
+        {
+            // 未オープン（ドロップ待ち）時は映像面を出さない
+            VideoHost.Width = 0;
+            VideoHost.Height = 0;
+            return;
+        }
+
+        double areaW = VideoArea.ActualWidth;
+        double areaH = VideoArea.ActualHeight;
+        if (areaW <= 0 || areaH <= 0) return;
+
+        ComputeLetterbox(areaW, areaH, media.Width, media.Height, out double hostW, out double hostH);
+        VideoHost.Width = hostW;
+        VideoHost.Height = hostH;
+    }
+
+    // 映像アスペクト比を維持したレターボックス矩形（VideoArea 内での表示サイズ）を求める。
+    // VideoHost（GPU 経路の子ウィンドウ）と VideoImage（CPU 経路の Stretch=Uniform）はどちらも
+    // この矩形に映像を出すため、オーバーレイの追従先計算（UpdateOverlayBounds）と共通で使う。
+    private static void ComputeLetterbox(double areaW, double areaH, int videoW, int videoH,
+        out double rectW, out double rectH)
+    {
+        double videoAspect = (double)videoW / videoH;
+        double areaAspect = areaW / areaH;
+        if (areaAspect > videoAspect)
+        {
+            // 領域が横長 → 高さ基準（左右に黒帯）
+            rectH = areaH;
+            rectW = areaH * videoAspect;
+        }
+        else
+        {
+            // 領域が縦長 → 幅基準（上下に黒帯）
+            rectW = areaW;
+            rectH = areaW / videoAspect;
+        }
+    }
+
+    // 透過オーバーレイ（AirspaceOverlayWindow）を映像の実表示矩形（レターボックス）のスクリーン座標・サイズへ
+    // 追従させる（段階2-2a）。GPU 経路の VideoHost / CPU 経路の VideoImage はどちらも VideoArea 内の中央
+    // レターボックス矩形に映像を出すため、VideoHost ではなく VideoArea を基準に算出する。
+    // （CPU 経路では VideoHost が Collapsed で ActualWidth=0 になるため、VideoHost 基準だとオーバーレイが常に隠れてしまう）
+    private void UpdateOverlayBounds()
+    {
+        if (_overlay == null) return;
+        var source = PresentationSource.FromVisual(VideoArea);
+        if (source == null) return;
+
+        var media = _vm.CurrentMedia;
+        double areaW = VideoArea.ActualWidth;
+        double areaH = VideoArea.ActualHeight;
+        if (media == null || media.Width <= 0 || media.Height <= 0 || areaW <= 0 || areaH <= 0)
+        {
+            if (_overlay.IsVisible) _overlay.Hide();
+            return;
+        }
+
+        // 映像の実表示矩形を VideoArea 内で算出し、中央配置（VideoHost/VideoImage とも中央寄せ）のオフセットを求める。
+        ComputeLetterbox(areaW, areaH, media.Width, media.Height, out double rectW, out double rectH);
+        double offsetX = (areaW - rectW) / 2.0;
+        double offsetY = (areaH - rectH) / 2.0;
+
+        // PointToScreen はデバイスピクセル、Window.Left/Top はデバイス非依存単位のため DPI 変換する
+        Point deviceTopLeft = VideoArea.PointToScreen(new Point(offsetX, offsetY));
+        Point dipTopLeft = source.CompositionTarget.TransformFromDevice.Transform(deviceTopLeft);
+        _overlay.Left = dipTopLeft.X;
+        _overlay.Top = dipTopLeft.Y;
+        _overlay.Width = rectW;
+        _overlay.Height = rectH;
+        if (!_overlay.IsVisible) _overlay.Show();
     }
 
     private void SyncSpeedBox()
@@ -152,7 +313,7 @@ public partial class MainWindow : Window
             e.Handled = true;
             return;
         }
-        if (_vm.IsFullscreen) ShowFullscreenOverlay();
+        if (_vm.IsFullscreen) _overlay?.PokeFullscreenBar();
 
         HandleShortcutKey(e);
     }
@@ -303,7 +464,10 @@ public partial class MainWindow : Window
             AppMenu.Visibility = Visibility.Collapsed;
             TransportBar.Visibility = Visibility.Collapsed;
             _vm.IsFullscreen = true;
-            ShowFullscreenOverlay(); // 切替直後は一旦見せて、無操作なら自動的に消える
+            _overlay?.EnterFullscreen(); // 切替直後は一旦見せて、無操作なら自動的に消える
+            // オーバーレイが前面に来てもキーボード入力は本ウィンドウで受けるよう、アクティブ状態を取り戻す
+            Activate();
+            Focus();
             _vm.ShowOsd("フルスクリーン");
         }
         else
@@ -313,21 +477,9 @@ public partial class MainWindow : Window
             AppMenu.Visibility = Visibility.Visible;
             TransportBar.Visibility = Visibility.Visible;
             _vm.IsFullscreen = false;
-            _overlayHideTimer.Stop();
-            FullscreenOverlay.Visibility = Visibility.Collapsed;
-            Cursor = Cursors.Arrow;
+            _overlay?.ExitFullscreen();
             _vm.ShowOsd("フルスクリーン解除");
         }
-    }
-
-    /// <summary>フルスクリーン中にシークバー＋現在時刻/長さのオーバーレイを表示し、無操作タイマーをリセットする。
-    /// マウスカーソルも無操作タイマーと連動して非表示/再表示する。</summary>
-    private void ShowFullscreenOverlay()
-    {
-        FullscreenOverlay.Visibility = Visibility.Visible;
-        Cursor = Cursors.Arrow;
-        _overlayHideTimer.Stop();
-        _overlayHideTimer.Start();
     }
 
     // ── Menu handlers ──
@@ -400,6 +552,8 @@ public partial class MainWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         CompositionTarget.Rendering -= OnRendering;
+        _overlay?.Close();
+        _presenter?.Dispose();
         _vm.Dispose();
         base.OnClosed(e);
     }

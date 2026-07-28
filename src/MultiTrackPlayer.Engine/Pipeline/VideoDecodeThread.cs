@@ -11,7 +11,7 @@ public sealed unsafe class VideoDecodeThread
 {
     private readonly VideoDecoder _decoder;
     private readonly VideoPacketQueue _queue;
-    private readonly VideoFrameRing _ring;
+    private readonly IVideoFrameSink _sink;
     private readonly Func<double> _getPtsSyncOffset;
     private readonly double _frameDurationSeconds;
     private readonly Action? _onFirstFrameAfterFlush;
@@ -33,12 +33,12 @@ public sealed unsafe class VideoDecodeThread
     // 残りフレームは全てシーク前の残骸なので、4K変換を行わずに捨てる
     private bool _abandonUntilFlush;
 
-    public VideoDecodeThread(VideoDecoder decoder, VideoPacketQueue queue, VideoFrameRing ring,
+    public VideoDecodeThread(VideoDecoder decoder, VideoPacketQueue queue, IVideoFrameSink sink,
         Func<double> getPtsSyncOffset, double frameDurationSeconds, Action? onFirstFrameAfterFlush = null)
     {
         _decoder = decoder;
         _queue = queue;
-        _ring = ring;
+        _sink = sink;
         _getPtsSyncOffset = getPtsSyncOffset;
         _frameDurationSeconds = frameDurationSeconds;
         _onFirstFrameAfterFlush = onFirstFrameAfterFlush;
@@ -80,6 +80,13 @@ public sealed unsafe class VideoDecodeThread
                 }
             }
         }
+        catch (Exception ex)
+        {
+            // デコード／GPU 相互運用で想定外の例外が出ても、専用スレッドの未処理例外として
+            // プロセス全体を fail-fast で巻き込まない（連続ファイル切替時の破棄競合など）。
+            // 握り潰しではなく異常は必ずログに残し、このスレッドは安全に終了する。
+            Diagnostics.DiagnosticLog.Write("video", $"デコードスレッド異常終了（以降の映像処理を停止）: {ex}");
+        }
         finally
         {
             av_frame_free(&frame);
@@ -91,7 +98,7 @@ public sealed unsafe class VideoDecodeThread
         _decoder.FlushBuffers();
         // demux スレッドがシーク時に既に ring.Flush 済み（デッドロック解消のため）。
         // ここでもう一度呼び、demux の Flush 後にコミットされ得た残骸 Ready も掃除する
-        _ring.Flush();
+        _sink.Flush();
         _abandonUntilFlush = false;
         _prerollSerial = serial;
         lock (_seekTargetLock)
@@ -113,7 +120,7 @@ public sealed unsafe class VideoDecodeThread
     {
         _decoder.SendPacket(null);
         DrainAvailable(frame);
-        _ring.MarkEof();
+        _sink.MarkEof();
     }
 
     private void HandlePacket(AVPacket* pkt, AVFrame* frame)
@@ -129,7 +136,8 @@ public sealed unsafe class VideoDecodeThread
 
     private void DrainAvailable(AVFrame* frame)
     {
-        while (_decoder.TryReceiveFrame(frame))
+        // 停止要求後はフレームを取り出して処理しない（EmitFrame → GPU テクスチャ生成に入らせない）。
+        while (!_stopRequested && _decoder.TryReceiveFrame(frame))
         {
             EmitFrame(frame);
             av_frame_unref(frame);
@@ -170,15 +178,18 @@ public sealed unsafe class VideoDecodeThread
             _onFirstFrameAfterFlush?.Invoke();
         }
 
-        int slot = _ring.BeginWrite(frame->width, frame->height);
-        if (slot == VideoFrameRing.SlotClosed) return;
-        if (slot == VideoFrameRing.SlotFlushed) { _abandonUntilFlush = true; return; }
+        // 停止要求後は新規スロットの GPU テクスチャ生成（CreateSlotTexture）に入らない。
+        // Teardown（RequestStop → ring.Close → Join）と破棄済み D3D リソースへのアクセスを競合させないため。
+        if (_stopRequested) return;
 
-        IntPtr dst = _ring.GetWriteBuffer(slot);
-        int stride = frame->width * 4;
-        if (_decoder.ConvertInto(frame, dst, stride, out _, out _))
-            _ring.CommitWrite(slot, normalizedPts);
+        int slot = _sink.BeginWrite(frame->width, frame->height);
+        if (slot == SlotSequencer.SlotClosed) return;
+        if (slot == SlotSequencer.SlotFlushed) { _abandonUntilFlush = true; return; }
+
+        // 変換手段（CPU sws_scale / GPU VideoProcessor）は sink 実装に委譲する。
+        if (_sink.WriteFrame(frame, slot))
+            _sink.CommitWrite(slot, normalizedPts);
         else
-            _ring.AbortWrite(slot);
+            _sink.AbortWrite(slot);
     }
 }
