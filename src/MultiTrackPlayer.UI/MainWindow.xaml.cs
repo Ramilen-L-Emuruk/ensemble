@@ -30,7 +30,6 @@ public partial class MainWindow : Window
     private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
     private WindowState _prevWindowState;
     private WindowStyle _prevWindowStyle;
-    private readonly DispatcherTimer _overlayHideTimer = new() { Interval = TimeSpan.FromSeconds(2.5) };
     // OnRendering 1回の処理時間調査用（ドロップ調査ログ専用）。1フレーム予算(60fpsで約16.7ms)の
     // 半分を超えたときだけ記録し、TryGetFrame と WritePixels のどちらが重いか切り分ける
     private const double RenderCostLogThresholdMs = 8.0;
@@ -69,16 +68,7 @@ public partial class MainWindow : Window
 
         SeekBar.Seeking += (_, ratio) =>
             _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
-        FullscreenSeekBar.Seeking += (_, ratio) =>
-            _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
-
-        _overlayHideTimer.Tick += (_, _) =>
-        {
-            _overlayHideTimer.Stop();
-            FullscreenOverlay.Visibility = Visibility.Collapsed;
-            Cursor = Cursors.None;
-        };
-        MouseMove += (_, _) => { if (_vm.IsFullscreen) ShowFullscreenOverlay(); };
+        // フルスクリーン時のシークバー・無操作タイマー・マウス移動検知は AirspaceOverlayWindow 側へ移設した（段階2-2b）。
 
         CompositionTarget.Rendering += OnRendering;
 
@@ -93,6 +83,9 @@ public partial class MainWindow : Window
             // 案Y: 映像子ウィンドウが airspace で最前面になり OSD が隠れるため、透過オーバーレイを
             // その上に重ねて追従表示する（段階2-2a）。VideoHost のサイズ・ウィンドウ位置・状態変化で再配置する。
             _overlay = new AirspaceOverlayWindow { Owner = this, DataContext = _vm };
+            // フルスクリーン中はオーバーレイが前面に来るため、万一オーバーレイ側にキーが渡っても
+            // 本ウィンドウのショートカット処理へ転送してキー操作を失わないようにする
+            _overlay.KeyDown += Window_KeyDown;
             VideoHost.SizeChanged += (_, _) => UpdateOverlayBounds();
             LocationChanged += (_, _) => UpdateOverlayBounds();
             StateChanged += (_, _) => UpdateOverlayBounds();
@@ -271,7 +264,7 @@ public partial class MainWindow : Window
             e.Handled = true;
             return;
         }
-        if (_vm.IsFullscreen) ShowFullscreenOverlay();
+        if (_vm.IsFullscreen) _overlay?.PokeFullscreenBar();
 
         HandleShortcutKey(e);
     }
@@ -422,7 +415,10 @@ public partial class MainWindow : Window
             AppMenu.Visibility = Visibility.Collapsed;
             TransportBar.Visibility = Visibility.Collapsed;
             _vm.IsFullscreen = true;
-            ShowFullscreenOverlay(); // 切替直後は一旦見せて、無操作なら自動的に消える
+            _overlay?.EnterFullscreen(); // 切替直後は一旦見せて、無操作なら自動的に消える
+            // オーバーレイが前面に来てもキーボード入力は本ウィンドウで受けるよう、アクティブ状態を取り戻す
+            Activate();
+            Focus();
             _vm.ShowOsd("フルスクリーン");
         }
         else
@@ -432,21 +428,9 @@ public partial class MainWindow : Window
             AppMenu.Visibility = Visibility.Visible;
             TransportBar.Visibility = Visibility.Visible;
             _vm.IsFullscreen = false;
-            _overlayHideTimer.Stop();
-            FullscreenOverlay.Visibility = Visibility.Collapsed;
-            Cursor = Cursors.Arrow;
+            _overlay?.ExitFullscreen();
             _vm.ShowOsd("フルスクリーン解除");
         }
-    }
-
-    /// <summary>フルスクリーン中にシークバー＋現在時刻/長さのオーバーレイを表示し、無操作タイマーをリセットする。
-    /// マウスカーソルも無操作タイマーと連動して非表示/再表示する。</summary>
-    private void ShowFullscreenOverlay()
-    {
-        FullscreenOverlay.Visibility = Visibility.Visible;
-        Cursor = Cursors.Arrow;
-        _overlayHideTimer.Stop();
-        _overlayHideTimer.Start();
     }
 
     // ── Menu handlers ──
