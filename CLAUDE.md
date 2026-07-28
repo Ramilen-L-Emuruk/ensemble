@@ -69,10 +69,11 @@ MultiTrackPlayer（マルチトラック対応 Windows 動画プレイヤー）�
 ## コミット
 
 - **Conventional Commits**（`feat` / `fix` / `refactor` / `docs` / `chore` / `perf` / `ci`）。説明は日本語。
-- コミットメッセージ末尾に必ず付与:
+- コミットメッセージ末尾に必ず付与する。**モデル名はその時作業している Claude モデルに合わせる**（ハーネスが指定するモデル名を使用する。特定モデルに固定しない）:
   ```
-  Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+  Co-Authored-By: Claude <モデル名> <noreply@anthropic.com>
   ```
+  例（Sonnet 5 で作業時）: `Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>`
 - Windows 環境のため `LF will be replaced by CRLF` の警告が出るが正常（無視してよい）。
 - ワークツリー内のコミットではバージョンフィールドを変更しない（下記「バージョン管理」参照）。
 - **コミット前に必ずユーザーに確認を取る。省略しない**。同一セッション内で別の修正のコミット許可をもらっていても、その修正のコミット許可を個別にもらっていない場合は確認する。
@@ -137,6 +138,10 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
 - 処理の「単位」「対象範囲」「条件」を書いたコメントは、実装変更時に必ず追従させる。
 - 「A または B」「A の場合のみ」のような条件を述べるコメントは、実コードの条件式と突き合わせて確認する。
 - 古い識別子・旧実装の痕跡（クラス名・変数名・関数名）がコメントに残っていないか確認する。
+
+### ドキュメントのプロジェクト構成ツリー
+- `README.md` にプロジェクト構成ツリーがある場合、新ファイルを追加した際は必ず追記する。
+- 削除・リネームしたファイルも同様に更新する。
 
 ## 補助コマンド
 
