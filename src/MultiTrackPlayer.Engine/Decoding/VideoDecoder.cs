@@ -31,9 +31,9 @@ public unsafe class VideoDecoder : IDisposable
     public bool IsHardwareAccelerated => _useHw;
 
     /// <param name="stream">対象の映像ストリーム。</param>
-    /// <param name="sharedDevicePtr">描画と共有する自前 <c>ID3D11Device</c> の生ポインタ。
-    /// <see cref="IntPtr.Zero"/> の場合は従来どおり FFmpeg に D3D11VA デバイスを自前生成させる。</param>
-    public VideoDecoder(AVStream* stream, IntPtr sharedDevicePtr = default)
+    /// <param name="sharedHwDeviceCtx">全デコーダで共有する FFmpeg D3D11VA デバイスコンテキスト
+    /// （<c>av_buffer_ref</c> で参照を1つ取る）。null の場合は従来どおり FFmpeg に D3D11VA デバイスを自前生成させる。</param>
+    public VideoDecoder(AVStream* stream, AVBufferRef* sharedHwDeviceCtx = null)
     {
         _streamIndex = stream->index;
         _timeBase = stream->time_base;
@@ -46,11 +46,13 @@ public unsafe class VideoDecoder : IDisposable
 
         avcodec_parameters_to_context(_ctx, stream->codecpar);
 
-        // 共有デバイスが渡されていれば注入版を優先。失敗（null）や未指定なら従来の自前生成へフォールバックする。
+        // 共有 HW デバイスコンテキストが渡されていれば参照共有版を優先。未指定（null）や失敗時は従来の自前生成へフォールバックする。
         bool usedSharedDevice = false;
-        if (sharedDevicePtr != IntPtr.Zero)
+        if (sharedHwDeviceCtx != null)
         {
-            _hwCtx = HardwareAccel.CreateD3D11VAContextFromDevice(sharedDevicePtr);
+            // 共有コンテキストへの参照を1つ取るだけ（av_hwdevice_ctx_init は呼ばない）。ファイル切替ごとに
+            // init/uninit を繰り返すとネイティブヒープを破損させ、連続 D&D でクラッシュしていたための共有化。
+            _hwCtx = av_buffer_ref(sharedHwDeviceCtx);
             usedSharedDevice = _hwCtx != null;
         }
         if (_hwCtx == null)
