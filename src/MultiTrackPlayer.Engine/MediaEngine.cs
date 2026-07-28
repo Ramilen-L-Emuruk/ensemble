@@ -5,6 +5,7 @@ using MultiTrackPlayer.Engine.Audio;
 using MultiTrackPlayer.Engine.Decoding;
 using MultiTrackPlayer.Engine.Diagnostics;
 using MultiTrackPlayer.Engine.Pipeline;
+using MultiTrackPlayer.Engine.Rendering;
 using MultiTrackPlayer.Engine.Sync;
 using MultiTrackPlayer.Engine.Utilities;
 using MultiTrackPlayer.Engine.Video;
@@ -20,6 +21,14 @@ namespace MultiTrackPlayer.Engine;
 public unsafe class MediaEngine : IMediaEngine
 {
     private AVFormatContext* _fmtCtx;
+    // 描画・デコードで共有する自前 D3D11 デバイス。初回 Open 時に一度だけ遅延生成し、ファイル切替では作り直さない。
+    // GPU 無し環境等で生成に失敗した場合は null のままとし、VideoDecoder は従来の FFmpeg 自前生成経路へフォールバックする。
+    private GpuDeviceContext? _gpuDevice;
+    private bool _gpuDeviceInitAttempted;
+    // FFmpeg の HW デバイスコンテキスト（D3D11VA）。共有 D3D11 デバイスと同様に初回 Open 時に一度だけ生成して使い回す。
+    // ファイル切替のたびに av_hwdevice_ctx_init/uninit を繰り返すとネイティブヒープを破損させ連続 D&D でクラッシュしたため、
+    // 1つを全 VideoDecoder が av_buffer_ref で参照共有する。GPU 無し環境等では null のままとしフォールバックする。
+    private AVBufferRef* _sharedHwDeviceCtx;
     private VideoDecoder? _videoDecoder;
     private readonly List<AudioDecoder> _audioDecoders = new();
     private readonly List<AudioTrackState> _audioStates = new();
@@ -30,7 +39,10 @@ public unsafe class MediaEngine : IMediaEngine
     // ffplay 型パイプライン: demux/デコードは各専用スレッドが担当し、AVFormatContext は DemuxThread が唯一専有する
     private VideoPacketQueue? _videoQueue;
     private AudioPacketQueue? _audioQueue;
-    private VideoFrameRing? _videoRing;
+    // 映像フレームリング（読み出し側の共通契約）。HW デコード時は GPU ゼロコピー版、そうでなければ CPU 版。
+    private IVideoFrameRing? _videoRing;
+    // GPU 経路でのみ生成される色変換器（enumerator/processor を所有）。CPU 経路では null。
+    private GpuFrameConverter? _videoConverter;
     private DemuxThread? _demuxThread;
     private VideoDecodeThread? _videoDecodeThread;
     private AudioDecodeThread? _audioDecodeThread;
@@ -39,6 +51,14 @@ public unsafe class MediaEngine : IMediaEngine
     private Thread? _audioDecodeThreadHandle;
     private Timer? _statusTimer;
     private volatile bool _playbackEndedFired;
+
+    // 案Y: 映像を子ウィンドウのスワップチェーンへ vsync Present する vout（GPU デコード経路のときのみ稼働）。
+    // 稼働中は UI の CompositionTarget.Rendering プルを使わず、専用スレッドが vsync（waitable）ごとに提示する。
+    private IntPtr _videoOutputHwnd;
+    private SwapChainVideoPresenter? _swapPresenter;
+    private Thread? _voutThreadHandle;
+    private volatile bool _voutRunning;
+    private long _lastVoutPull;
 
     // Paused 中に表示するフレーム（Step/Seek で更新）。Playing 中は使わず TryLeaseDue を直接使う
     private VideoFrameLease? _heldLease;
@@ -112,7 +132,7 @@ public unsafe class MediaEngine : IMediaEngine
             var stream = _fmtCtx->streams[i];
             if (stream->codecpar->codec_type == AVMediaType.Video && _videoDecoder == null)
             {
-                _videoDecoder = new VideoDecoder(stream);
+                _videoDecoder = new VideoDecoder(stream, EnsureSharedHwDeviceCtx());
             }
             else if (stream->codecpar->codec_type == AVMediaType.Audio)
             {
@@ -193,6 +213,43 @@ public unsafe class MediaEngine : IMediaEngine
         SetupAudio();
     }
 
+    /// <summary>
+    /// 共有 D3D11 デバイスを初回のみ遅延生成し、その注入用生ポインタを返す。生成に失敗した場合や
+    /// GPU 無し環境では <see cref="IntPtr.Zero"/> を返し、VideoDecoder 側は従来の FFmpeg 自前生成経路へフォールバックする。
+    /// </summary>
+    private IntPtr EnsureGpuDevicePointer()
+    {
+        if (!_gpuDeviceInitAttempted)
+        {
+            _gpuDeviceInitAttempted = true;
+            try
+            {
+                _gpuDevice = new GpuDeviceContext();
+            }
+            catch (Exception ex)
+            {
+                _gpuDevice = null;
+                DiagnosticLog.Write("gpuDevice",
+                    $"自前 D3D11 デバイス生成に失敗（従来の FFmpeg 自前生成経路へフォールバック）: {ex.Message}");
+            }
+        }
+        return _gpuDevice?.NativeDevicePointer ?? IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// 共有 HW デバイスコンテキスト（FFmpeg D3D11VA）を初回のみ生成して返す。共有 D3D11 デバイスと同じく使い回すことで、
+    /// ファイル切替のたびに <c>av_hwdevice_ctx_init</c>/<c>uninit</c> を繰り返してネイティブヒープを破損させる問題
+    /// （連続 D&amp;D クラッシュ）を防ぐ。GPU 無し環境や生成失敗時は null を返し、VideoDecoder 側が従来の FFmpeg 自前生成経路へフォールバックする。
+    /// </summary>
+    private AVBufferRef* EnsureSharedHwDeviceCtx()
+    {
+        IntPtr devicePtr = EnsureGpuDevicePointer();
+        if (devicePtr == IntPtr.Zero) return null;
+        if (_sharedHwDeviceCtx == null)
+            _sharedHwDeviceCtx = HardwareAccel.CreateD3D11VAContextFromDevice(devicePtr);
+        return _sharedHwDeviceCtx;
+    }
+
     private void SetupAudio()
     {
         _mixer = new MultiTrackMixer();
@@ -238,7 +295,12 @@ public unsafe class MediaEngine : IMediaEngine
         ReleaseHeldFrame();
         EnsurePipelineStarted();
         if (wasStopped)
+        {
+            // 新規再生の開始点で提示統計をリセットし、この再生1本ごとのドロップ率を UI に表示する（性能検証・実運用の可視性）。
+            _droppedFrames = 0;
+            _displayedFrames = 0;
             RequestAnchor(0.0);
+        }
         _wasapiOut?.Play();
     }
 
@@ -394,19 +456,19 @@ public unsafe class MediaEngine : IMediaEngine
                 : (pullNow - _lastPullTimestamp) * 1000.0 / Stopwatch.Frequency;
             _lastPullTimestamp = pullNow;
 
-            bool got = _videoRing.TryLeaseDue(position.TotalSeconds, _videoFrameDuration, out var raw, out int dropped);
+            bool got = _videoRing.TryLeaseDue(position.TotalSeconds, _videoFrameDuration, out var lease, out int dropped);
             _droppedFrames += dropped;
             if (dropped > 0)
             {
                 DiagnosticLog.Write("videoDrop",
                     $"dropped={dropped} gapSincePrevPullMs={gapSincePrevPullMs:F1} frameDurationMs={_videoFrameDuration * 1000.0:F1} clock={position.TotalSeconds:F3} ring={_videoRing.DescribeSlots()}");
             }
-            if (!got) return null;
+            if (!got || lease == null) return null;
 
             _displayedFrames++;
-            _lastVideoLagSec = raw.PtsSeconds - position.TotalSeconds;
+            _lastVideoLagSec = lease.Pts.TotalSeconds - position.TotalSeconds;
             _lastFrameServedTicks = Environment.TickCount64;
-            return new VideoFrameLease(raw.SlotIndex, raw.Buffer, raw.Width, raw.Height, raw.Stride, TimeSpan.FromSeconds(raw.PtsSeconds));
+            return lease;
         }
 
         if (_heldLease is { } held && !_heldFrameConsumed)
@@ -437,9 +499,9 @@ public unsafe class MediaEngine : IMediaEngine
     private void TryHoldNextFrame(TimeSpan timeout, int minSerial)
     {
         if (_videoRing == null) return;
-        if (!_videoRing.TryLeaseOldest(timeout, minSerial, out var raw)) return;
+        if (!_videoRing.TryLeaseOldest(timeout, minSerial, out var lease) || lease == null) return;
 
-        _heldLease = new VideoFrameLease(raw.SlotIndex, raw.Buffer, raw.Width, raw.Height, raw.Stride, TimeSpan.FromSeconds(raw.PtsSeconds));
+        _heldLease = lease;
         _heldFrameConsumed = false;
         PositionChanged?.Invoke(this, _heldLease.Pts);
     }
@@ -526,15 +588,18 @@ public unsafe class MediaEngine : IMediaEngine
 
         _videoQueue = new VideoPacketQueue(maxCount: 512, maxBytes: 40 * 1024 * 1024);
         _audioQueue = new AudioPacketQueue(maxCount: 256 * trackCount, maxBytes: 4 * 1024 * 1024 * trackCount);
-        _videoRing = new VideoFrameRing();
+
+        // HW デコード（D3D11VA）かつ VideoProcessor が使える環境なら GPU ゼロコピー経路、
+        // そうでなければ従来の CPU（sws_scale）経路のリング・書き込み戦略（sink）を構築する。
+        IVideoFrameSink? videoSink = BuildVideoRingAndSink();
 
         _demuxThread = new DemuxThread(
             _fmtCtx, videoStreamIndex, _audioStreamToTrack,
             _videoQueue, _audioQueue, PublishSeekTarget);
 
-        if (_videoDecoder != null)
+        if (_videoDecoder != null && videoSink != null)
             _videoDecodeThread = new VideoDecodeThread(
-                _videoDecoder, _videoQueue, _videoRing,
+                _videoDecoder, _videoQueue, videoSink,
                 () => _demuxThread!.PtsSyncOffset, _videoFrameDuration,
                 onFirstFrameAfterFlush: OnVideoPrerollReady);
 
@@ -553,6 +618,41 @@ public unsafe class MediaEngine : IMediaEngine
             _videoDecodeThreadHandle = StartBackgroundThread(_videoDecodeThread.Run);
         _audioDecodeThreadHandle = StartBackgroundThread(_audioDecodeThread.Run);
         _statusTimer ??= new Timer(_ => StatusTick(), null, 100, 100);
+
+        StartVideoOutputIfPossible();
+    }
+
+    /// <summary>
+    /// 映像デコーダの HW/SW 実効性に応じて、フレームリング（<see cref="_videoRing"/>）と書き込み戦略（sink）を構築する。
+    /// HW デコード（D3D11VA）かつ VideoProcessor 利用可なら GPU ゼロコピー経路、そうでなければ CPU（sws_scale）経路。
+    /// 映像ストリームが無い場合は null を返す（リングも作らない）。
+    /// </summary>
+    private IVideoFrameSink? BuildVideoRingAndSink()
+    {
+        if (_videoDecoder == null)
+        {
+            _videoRing = null;
+            _videoConverter = null;
+            return null;
+        }
+
+        if (_videoDecoder.IsHardwareAccelerated && _gpuDevice?.VideoDevice != null)
+        {
+            var gpuRing = new GpuVideoFrameRing(_gpuDevice);
+            var converter = new GpuFrameConverter(_gpuDevice);
+            _videoRing = gpuRing;
+            _videoConverter = converter;
+            DiagnosticLog.Write("gpuConvert", "映像リング=GPU ゼロコピー経路（HW デコード + VideoProcessor）");
+            return new GpuFrameSink(_videoDecoder, gpuRing, converter);
+        }
+
+        var cpuRing = new VideoFrameRing();
+        _videoRing = cpuRing;
+        _videoConverter = null;
+        DiagnosticLog.Write("gpuConvert",
+            $"映像リング=CPU 経路（hwAccel={_videoDecoder.IsHardwareAccelerated} " +
+            $"videoDevice={(_gpuDevice?.VideoDevice != null ? "有" : "無")}）");
+        return new CpuFrameSink(_videoDecoder, cpuRing);
     }
 
     private static Thread StartBackgroundThread(ThreadStart action)
@@ -560,6 +660,146 @@ public unsafe class MediaEngine : IMediaEngine
         var thread = new Thread(action) { IsBackground = true };
         thread.Start();
         return thread;
+    }
+
+    // ── 映像出力（案Y: スワップチェーン + vout スレッド。GPU デコード経路のみ）──
+
+    /// <summary>
+    /// 映像出力先の子ウィンドウ（HWND）を接続する。HW デコード（GPU リング）経路のときのみ、次の再生開始で
+    /// この HWND にスワップチェーンを張り、専用 vout スレッドが vsync（waitable object）で Present する。
+    /// </summary>
+    public void AttachVideoOutput(IntPtr hwnd) => _videoOutputHwnd = hwnd;
+
+    /// <summary>映像出力先の HWND を切り離す。</summary>
+    public void DetachVideoOutput() => _videoOutputHwnd = IntPtr.Zero;
+
+    /// <summary>vout（スワップチェーン提示）が稼働中か。UI 側はこの間、CompositionTarget.Rendering での映像プルを行わない。</summary>
+    public bool IsVideoOutputActive => _swapPresenter != null;
+
+    /// <summary>GPU デコード経路かつ HWND 接続済みなら、映像サイズでスワップチェーンを張り vout スレッドを起動する。</summary>
+    private void StartVideoOutputIfPossible()
+    {
+        if (_videoRing is not GpuVideoFrameRing) return; // GPU 経路のみ（CPU 経路は従来の UI プル）
+        if (_videoOutputHwnd == IntPtr.Zero || _gpuDevice == null) return;
+        if (_currentMedia == null || _currentMedia.Width <= 0 || _currentMedia.Height <= 0) return;
+
+        try
+        {
+            _swapPresenter = new SwapChainVideoPresenter(
+                _gpuDevice, _videoOutputHwnd, _currentMedia.Width, _currentMedia.Height);
+        }
+        catch (Exception ex)
+        {
+            _swapPresenter = null;
+            DiagnosticLog.Write("d3dPresenter", $"swapchain 生成失敗（vout 無効・UI プル経路へフォールバック）: {ex.Message}");
+            return;
+        }
+
+        _voutRunning = true;
+        _lastVoutPull = 0;
+        _voutThreadHandle = StartBackgroundThread(VideoOutputLoop);
+        DiagnosticLog.Write("d3dPresenter", "vout スレッド開始");
+    }
+
+    /// <summary>
+    /// vout スレッド本体。vsync（waitable object）ごとに起床し、再生中はクロックに対して due なフレームを
+    /// リースしてバックバッファへコピー・Present する。UI 合成に依存しないためフレーム間引きが起きにくい。
+    /// </summary>
+    private void VideoOutputLoop()
+    {
+        var presenter = _swapPresenter;
+        if (presenter == null) return;
+        if (_videoRing is not GpuVideoFrameRing ring)
+        {
+            // 通常は StartVideoOutputIfPossible が GPU リング以外で presenter を作らないため到達しないが、
+            // presenter だけ生成された異常時もここで確実に解放して漏らさない。
+            presenter.Dispose();
+            return;
+        }
+
+        int currentSlot = -1;     // 現在 backbuffer に出しているスロット
+        bool ownedByVout = false; // Playing 中に vout がリースしたスロットか（返却責任が vout 側にある）
+
+        try
+        {
+            while (_voutRunning)
+            {
+                presenter.WaitForVBlank();
+                if (!_voutRunning) break;
+
+                long pullNow = Stopwatch.GetTimestamp();
+                double gapMs = _lastVoutPull == 0 ? 0.0 : (pullNow - _lastVoutPull) * 1000.0 / Stopwatch.Frequency;
+                _lastVoutPull = pullNow;
+
+                if (_state == CorePlaybackState.Playing)
+                {
+                    double clock = GetMasterClockSeconds();
+                    if (ring.TryLeaseDue(clock, _videoFrameDuration, out var lease, out int dropped) && lease != null)
+                    {
+                        _droppedFrames += dropped;
+                        if (dropped > 0)
+                            DiagnosticLog.Write("videoDrop",
+                                $"dropped={dropped} gapMs={gapMs:F1} frameDurationMs={_videoFrameDuration * 1000.0:F1} clock={clock:F3} ring={ring.DescribeSlots()}");
+
+                        if (ownedByVout && currentSlot >= 0) ring.ReturnLease(currentSlot);
+                        currentSlot = lease.SlotIndex;
+                        ownedByVout = true;
+                        _displayedFrames++;
+                        _lastFrameServedTicks = Environment.TickCount64;
+                        _lastVideoLagSec = lease.Pts.TotalSeconds - clock;
+                    }
+                    // due 無し: currentSlot を維持し、下で前フレームを再提示する。
+                }
+                else
+                {
+                    // Paused/Stopped: Playing 中にリースしたスロットは返し、保持フレーム（held）へ切り替える。
+                    if (ownedByVout && currentSlot >= 0) { ring.ReturnLease(currentSlot); ownedByVout = false; }
+                    currentSlot = _heldLease is { Kind: FrameKind.Gpu } held ? held.SlotIndex : -1;
+                }
+
+                // 停止要求後は Render/Present に入らず即脱出する（破棄途中の swapchain を触らせない）。
+                if (!_voutRunning) break;
+
+                if (currentSlot >= 0)
+                    presenter.Render(ring, currentSlot);
+
+                // frame latency waitable object は「待機と Present が 1:1」でないと枯渇してブロックする。
+                // そのため due が無い vsync でも必ず Present する（前フレームを再提示する）。
+                presenter.Present();
+            }
+
+            if (ownedByVout && currentSlot >= 0) ring.ReturnLease(currentSlot);
+        }
+        catch (Exception ex)
+        {
+            // D3D 提示中の想定外例外で、専用スレッドの未処理例外→プロセス fail-fast に巻き込まれないようにする。
+            DiagnosticLog.Write("d3dPresenter", $"vout スレッド異常終了（映像提示を停止）: {ex}");
+        }
+        finally
+        {
+            // swapchain の破棄は所有する vout スレッド自身が行う。メイン側(StopVideoOutput)は Join するだけで
+            // Dispose しないため、Present の vsync 待ちで Join がタイムアウトしても「破棄済み swapchain を
+            // ゾンビ vout が触る」レースが原理的に発生しない。
+            presenter.Dispose();
+        }
+    }
+
+    /// <summary>vout スレッドを停止する（リング破棄より先に呼ぶこと）。スワップチェーンの破棄は vout スレッド自身に委譲する。</summary>
+    private void StopVideoOutput()
+    {
+        _voutRunning = false;
+        var handle = _voutThreadHandle;
+        if (handle != null)
+        {
+            // swapchain の破棄は vout スレッドの finally が行う。Join できれば破棄も完了している。
+            // Present の vsync 待ちで稀に時間がかかるため長めに待つ。タイムアウト時もメインからは Dispose せず
+            // （ゾンビが握るオブジェクトを消さない）、スレッド復帰後の自己破棄に委ねる。
+            if (!handle.Join(TimeSpan.FromSeconds(5)))
+                DiagnosticLog.Write("d3dPresenter", "vout スレッドの停止待ちがタイムアウト（swapchain 破棄はスレッド側に委譲）");
+        }
+        _voutThreadHandle = null;
+        // 参照だけ手放す。実体の破棄は vout スレッドの finally が担う。
+        _swapPresenter = null;
     }
 
     // demux スレッドがシーク実行直後（各キューへ FlushMarker を入れる前）に呼ぶ
@@ -583,10 +823,24 @@ public unsafe class MediaEngine : IMediaEngine
 
     private void TeardownPipeline()
     {
+        // StatusTick はスレッドプールで走り _positionSource(WASAPI COM) / _videoRing(D3D) 等のネイティブ資源を
+        // 触るため、以降の破棄より先に走行中コールバックの完了を待ってタイマーを確実に止める。
+        // （Change(Infinite) や引数なし Dispose は走行中コールバックを止めないため、連続ファイル切替で
+        //   破棄済みネイティブ資源へアクセスしてプロセスが不正終了する原因になっていた。）
+        if (_statusTimer != null)
+        {
+            using var timerStopped = new ManualResetEvent(false);
+            _statusTimer.Dispose(timerStopped);
+            timerStopped.WaitOne(TimeSpan.FromSeconds(2));
+            _statusTimer = null;
+        }
+
+        // vout はリング・スワップチェーンを使うため、他の停止・破棄より先に止める。
+        StopVideoOutput();
+
         _demuxThread?.RequestStop();
         _videoDecodeThread?.RequestStop();
         _audioDecodeThread?.RequestStop();
-        _statusTimer?.Change(Timeout.Infinite, Timeout.Infinite);
 
         _videoQueue?.Close();
         _audioQueue?.Close();
@@ -599,8 +853,10 @@ public unsafe class MediaEngine : IMediaEngine
 
         _videoQueue?.DrainAndDispose();
         _audioQueue?.DrainAndDispose();
+        // リング（OutputView を保持）を先に破棄し、その後 enumerator/processor を持つ converter を破棄する。
+        // どちらも GpuDeviceContext より先（GpuDeviceContext はエンジン破棄時に解放）。
         _videoRing?.Dispose();
-        _statusTimer?.Dispose();
+        _videoConverter?.Dispose();
 
         _demuxThread = null;
         _videoDecodeThread = null;
@@ -608,10 +864,10 @@ public unsafe class MediaEngine : IMediaEngine
         _videoQueue = null;
         _audioQueue = null;
         _videoRing = null;
+        _videoConverter = null;
         _demuxThreadHandle = null;
         _videoDecodeThreadHandle = null;
         _audioDecodeThreadHandle = null;
-        _statusTimer = null;
     }
 
     // ── ステータス通知（100ms 周期。映像フレーム配送は UI 側の CompositionTarget.Rendering がプルする）──
@@ -688,5 +944,19 @@ public unsafe class MediaEngine : IMediaEngine
         _fmtCtx = null;
     }
 
-    public void Dispose() { Stop(); DisposeDecoders(); }
+    public void Dispose()
+    {
+        Stop();
+        DisposeDecoders();
+        // 共有 HW デバイスコンテキストを解放する。内部で共有 D3D11 デバイスを Release するため、デバイス破棄より先に行う。
+        if (_sharedHwDeviceCtx != null)
+        {
+            AVBufferRef* h = _sharedHwDeviceCtx;
+            av_buffer_unref(&h);
+            _sharedHwDeviceCtx = null;
+        }
+        // 共有 D3D11 デバイスはファイル切替で作り直さないため、エンジン破棄時に一度だけ解放する。
+        _gpuDevice?.Dispose();
+        _gpuDevice = null;
+    }
 }
