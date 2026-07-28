@@ -62,6 +62,8 @@ public partial class MainWindow : Window
         _vm.PropertyChanged += (_, e) =>
         {
             if (e.PropertyName == nameof(MainViewModel.PlaybackSpeed)) SyncSpeedBox();
+            // ファイル切替で映像サイズ（アスペクト比）が変わるため、映像面のレターボックス矩形を再計算する（段階2-1）
+            else if (e.PropertyName == nameof(MainViewModel.CurrentMedia)) UpdateVideoHostLayout();
         };
 
         SeekBar.Seeking += (_, ratio) =>
@@ -153,6 +155,47 @@ public partial class MainWindow : Window
             DiagnosticLog.Write("renderCost",
                 $"total={tryGetFrameMs + uploadMs:F1}ms tryGetFrame={tryGetFrameMs:F1}ms uploadMs={uploadMs:F1}ms w={lease.Width} h={lease.Height}");
         }
+    }
+
+    private void VideoArea_SizeChanged(object sender, SizeChangedEventArgs e) => UpdateVideoHostLayout();
+
+    // 映像面（VideoHost 子ウィンドウ）を映像アスペクト比のレターボックス矩形に合わせて中央配置する（段階2-1）。
+    // swapchain は映像サイズ + Scaling.Stretch のままで、子ウィンドウのアスペクトを映像に一致させることで歪みを防ぐ。
+    // 周囲は親 Grid（VideoArea）の黒背景がそのまま黒帯になる。
+    private void UpdateVideoHostLayout()
+    {
+        var media = _vm.CurrentMedia;
+        if (media == null || media.Width <= 0 || media.Height <= 0)
+        {
+            // 未オープン（ドロップ待ち）時は映像面を出さない
+            VideoHost.Width = 0;
+            VideoHost.Height = 0;
+            return;
+        }
+
+        double areaW = VideoArea.ActualWidth;
+        double areaH = VideoArea.ActualHeight;
+        if (areaW <= 0 || areaH <= 0) return;
+
+        double videoAspect = (double)media.Width / media.Height;
+        double areaAspect = areaW / areaH;
+
+        double hostW, hostH;
+        if (areaAspect > videoAspect)
+        {
+            // 領域が横長 → 高さ基準（左右に黒帯）
+            hostH = areaH;
+            hostW = areaH * videoAspect;
+        }
+        else
+        {
+            // 領域が縦長 → 幅基準（上下に黒帯）
+            hostW = areaW;
+            hostH = areaW / videoAspect;
+        }
+
+        VideoHost.Width = hostW;
+        VideoHost.Height = hostH;
     }
 
     private void SyncSpeedBox()
