@@ -1,4 +1,5 @@
 using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.Engine.Rendering;
 using MultiTrackPlayer.Engine.Utilities;
 using Sdcb.FFmpeg.Raw;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
@@ -22,6 +23,12 @@ public unsafe class VideoDecoder : IDisposable
     private AVCodecContext_get_format? _getFormatDelegate;
 
     public int StreamIndex => _streamIndex;
+
+    /// <summary>
+    /// HW デコード経路（D3D11VA デバイスコンテキスト注入済み）か。true の場合、デコード出力は D3D11 テクスチャで
+    /// 得られ、<see cref="TryGetHwTexture"/> でゼロコピー描画へ渡せる。false の場合は CPU 経路（<see cref="ConvertInto"/>）を使う。
+    /// </summary>
+    public bool IsHardwareAccelerated => _useHw;
 
     /// <param name="stream">対象の映像ストリーム。</param>
     /// <param name="sharedDevicePtr">描画と共有する自前 <c>ID3D11Device</c> の生ポインタ。
@@ -110,6 +117,46 @@ public unsafe class VideoDecoder : IDisposable
         long pts = frame->best_effort_timestamp;
         if (pts == long.MinValue) pts = 0; // AV_NOPTS_VALUE
         return Math.Max(0.0, pts * av_q2d(_timeBase));
+    }
+
+    /// <summary>
+    /// HW デコード出力フレームから D3D11 テクスチャ（と色空間情報）を取り出す。GPU ゼロコピー描画経路で使う。
+    /// D3D11VA サーフェスでない（＝SW フォールバック等）場合は false を返す。
+    /// </summary>
+    /// <param name="frame">デコード済みフレーム。</param>
+    /// <param name="texturePtr">D3D11 テクスチャ配列（<c>ID3D11Texture2D*</c>）の生ポインタ。</param>
+    /// <param name="subResourceIndex">テクスチャ配列内の ArraySlice 番号。</param>
+    /// <param name="color">入力の色空間（YCbCr マトリクス・レンジ）。</param>
+    /// <returns>D3D11 テクスチャを取り出せたら true。</returns>
+    public bool TryGetHwTexture(AVFrame* frame, out IntPtr texturePtr, out int subResourceIndex, out ColorInfo color)
+    {
+        texturePtr = IntPtr.Zero;
+        subResourceIndex = 0;
+        color = ColorInfo.Default;
+
+        var fmt = (AVPixelFormat)frame->format;
+        if (fmt != AVPixelFormat.D3d11) return false;
+
+        // D3D11VA では data[0] が ID3D11Texture2D 配列、data[1] が配列内の ArraySlice 番号を表す。
+        texturePtr = (IntPtr)frame->data[0];
+        subResourceIndex = (int)frame->data[1];
+        if (texturePtr == IntPtr.Zero) return false;
+
+        color = ResolveColorInfo(frame);
+        return true;
+    }
+
+    /// <summary>フレームのメタデータから色変換マトリクス・レンジを推定する。不明時は <see cref="ColorInfo.Default"/>（BT.709/Limited）。</summary>
+    private static ColorInfo ResolveColorInfo(AVFrame* frame)
+    {
+        // BT.601 系（SD 由来）だけ明示的に false、それ以外（BT.709・未指定）は既定の BT.709 とみなす。
+        var cs = frame->colorspace;
+        bool isBt709 = !(cs == AVColorSpace.Bt470bg || cs == AVColorSpace.Smpte170m || cs == AVColorSpace.Fcc);
+
+        // color_range: JPEG=フルレンジ(0-255)、それ以外(MPEG/未指定)=リミテッド(16-235)。
+        bool isFullRange = frame->color_range == AVColorRange.Jpeg;
+
+        return new ColorInfo(isBt709, isFullRange);
     }
 
     /// <summary>

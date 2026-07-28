@@ -43,6 +43,7 @@ public sealed class VideoFrameRingTests : IDisposable
         for (int i = 0; i < 4; i++)
         {
             Assert.True(_ring.TryLeaseOldest(TimeSpan.Zero, 0, out var f));
+            Assert.NotNull(f);
             leases.Add(f.SlotIndex);
         }
 
@@ -80,7 +81,8 @@ public sealed class VideoFrameRingTests : IDisposable
         Assert.True(slot >= 0);
         _ring.CommitWrite(slot, 5.0);
         Assert.True(_ring.TryLeaseOldest(TimeSpan.Zero, 0, out var frame));
-        Assert.Equal(5.0, frame.PtsSeconds);
+        Assert.NotNull(frame);
+        Assert.Equal(5.0, frame.Pts.TotalSeconds);
     }
 
     [Fact]
@@ -99,7 +101,8 @@ public sealed class VideoFrameRingTests : IDisposable
 
         // Assert: 新世代のフレームだけが返る
         Assert.True(_ring.TryLeaseOldest(TimeSpan.Zero, minSerial: nextSerial, out var frame));
-        Assert.Equal(2.0, frame.PtsSeconds);
+        Assert.NotNull(frame);
+        Assert.Equal(2.0, frame.Pts.TotalSeconds);
     }
 
     [Fact]
@@ -108,6 +111,7 @@ public sealed class VideoFrameRingTests : IDisposable
         // Arrange: 4枚 Ready → 1枚リース
         for (int i = 0; i < 4; i++) CommitOne(pts: i);
         Assert.True(_ring.TryLeaseOldest(TimeSpan.Zero, 0, out var frame));
+        Assert.NotNull(frame);
 
         // Act: 返却すると空きができ、次の BeginWrite が即座に成功する
         _ring.ReturnLease(frame.SlotIndex);
@@ -124,6 +128,7 @@ public sealed class VideoFrameRingTests : IDisposable
         // Arrange: 1枚リース中（UI が一時停止フレームを保持している状況）
         CommitOne(pts: 1.0);
         Assert.True(_ring.TryLeaseOldest(TimeSpan.Zero, 0, out var held));
+        Assert.NotNull(held);
 
         // Act
         _ring.Flush();

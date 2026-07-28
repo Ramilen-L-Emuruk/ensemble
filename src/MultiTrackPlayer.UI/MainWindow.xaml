@@ -3,6 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:ctrl="clr-namespace:MultiTrackPlayer.UI.Controls"
         xmlns:local="clr-namespace:MultiTrackPlayer.UI"
+        xmlns:rendering="clr-namespace:MultiTrackPlayer.UI.Rendering"
         Title="{Binding Title}" Width="960" Height="600"
         Icon="app.ico"
         AllowDrop="True" Drop="Window_Drop" DragOver="Window_DragOver"
@@ -102,6 +103,9 @@
 
         <!-- Video area -->
         <Grid Background="Black">
+            <!-- 案Y: GPU デコード時はこの子ウィンドウのスワップチェーンに vout スレッドが直接 Present する。
+                 airspace により子ウィンドウは最前面になるため、下の WPF オーバーレイ（OSD 等）は段階2 で別途対応。 -->
+            <rendering:VideoHwndHost x:Name="VideoHost"/>
             <Image x:Name="VideoImage" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
             <TextBlock x:Name="DropHint" Text="ファイルをドロップして開く"
                        HorizontalAlignment="Center" VerticalAlignment="Center"
