@@ -5,6 +5,7 @@ using MultiTrackPlayer.Engine.Audio;
 using MultiTrackPlayer.Engine.Decoding;
 using MultiTrackPlayer.Engine.Diagnostics;
 using MultiTrackPlayer.Engine.Pipeline;
+using MultiTrackPlayer.Engine.Rendering;
 using MultiTrackPlayer.Engine.Sync;
 using MultiTrackPlayer.Engine.Utilities;
 using MultiTrackPlayer.Engine.Video;
@@ -20,6 +21,10 @@ namespace MultiTrackPlayer.Engine;
 public unsafe class MediaEngine : IMediaEngine
 {
     private AVFormatContext* _fmtCtx;
+    // 描画・デコードで共有する自前 D3D11 デバイス。初回 Open 時に一度だけ遅延生成し、ファイル切替では作り直さない。
+    // GPU 無し環境等で生成に失敗した場合は null のままとし、VideoDecoder は従来の FFmpeg 自前生成経路へフォールバックする。
+    private GpuDeviceContext? _gpuDevice;
+    private bool _gpuDeviceInitAttempted;
     private VideoDecoder? _videoDecoder;
     private readonly List<AudioDecoder> _audioDecoders = new();
     private readonly List<AudioTrackState> _audioStates = new();
@@ -112,7 +117,7 @@ public unsafe class MediaEngine : IMediaEngine
             var stream = _fmtCtx->streams[i];
             if (stream->codecpar->codec_type == AVMediaType.Video && _videoDecoder == null)
             {
-                _videoDecoder = new VideoDecoder(stream);
+                _videoDecoder = new VideoDecoder(stream, EnsureGpuDevicePointer());
             }
             else if (stream->codecpar->codec_type == AVMediaType.Audio)
             {
@@ -191,6 +196,29 @@ public unsafe class MediaEngine : IMediaEngine
         };
 
         SetupAudio();
+    }
+
+    /// <summary>
+    /// 共有 D3D11 デバイスを初回のみ遅延生成し、その注入用生ポインタを返す。生成に失敗した場合や
+    /// GPU 無し環境では <see cref="IntPtr.Zero"/> を返し、VideoDecoder 側は従来の FFmpeg 自前生成経路へフォールバックする。
+    /// </summary>
+    private IntPtr EnsureGpuDevicePointer()
+    {
+        if (!_gpuDeviceInitAttempted)
+        {
+            _gpuDeviceInitAttempted = true;
+            try
+            {
+                _gpuDevice = new GpuDeviceContext();
+            }
+            catch (Exception ex)
+            {
+                _gpuDevice = null;
+                DiagnosticLog.Write("gpuDevice",
+                    $"自前 D3D11 デバイス生成に失敗（従来の FFmpeg 自前生成経路へフォールバック）: {ex.Message}");
+            }
+        }
+        return _gpuDevice?.NativeDevicePointer ?? IntPtr.Zero;
     }
 
     private void SetupAudio()
@@ -688,5 +716,12 @@ public unsafe class MediaEngine : IMediaEngine
         _fmtCtx = null;
     }
 
-    public void Dispose() { Stop(); DisposeDecoders(); }
+    public void Dispose()
+    {
+        Stop();
+        DisposeDecoders();
+        // 共有 D3D11 デバイスはファイル切替で作り直さないため、エンジン破棄時に一度だけ解放する。
+        _gpuDevice?.Dispose();
+        _gpuDevice = null;
+    }
 }

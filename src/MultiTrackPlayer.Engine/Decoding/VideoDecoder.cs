@@ -23,7 +23,10 @@ public unsafe class VideoDecoder : IDisposable
 
     public int StreamIndex => _streamIndex;
 
-    public VideoDecoder(AVStream* stream)
+    /// <param name="stream">対象の映像ストリーム。</param>
+    /// <param name="sharedDevicePtr">描画と共有する自前 <c>ID3D11Device</c> の生ポインタ。
+    /// <see cref="IntPtr.Zero"/> の場合は従来どおり FFmpeg に D3D11VA デバイスを自前生成させる。</param>
+    public VideoDecoder(AVStream* stream, IntPtr sharedDevicePtr = default)
     {
         _streamIndex = stream->index;
         _timeBase = stream->time_base;
@@ -36,7 +39,20 @@ public unsafe class VideoDecoder : IDisposable
 
         avcodec_parameters_to_context(_ctx, stream->codecpar);
 
-        _hwCtx = HardwareAccel.TryCreateD3D11VAContext();
+        // 共有デバイスが渡されていれば注入版を優先。失敗（null）や未指定なら従来の自前生成へフォールバックする。
+        bool usedSharedDevice = false;
+        if (sharedDevicePtr != IntPtr.Zero)
+        {
+            _hwCtx = HardwareAccel.CreateD3D11VAContextFromDevice(sharedDevicePtr);
+            usedSharedDevice = _hwCtx != null;
+        }
+        if (_hwCtx == null)
+            _hwCtx = HardwareAccel.TryCreateD3D11VAContext();
+
+        DiagnosticLog.Write("gpuDevice",
+            $"VideoDecoder HW デバイス経路: {(usedSharedDevice ? "自前デバイス注入版" : "FFmpeg 自前生成版(従来)")} " +
+            $"(hwCtx={(_hwCtx != null ? "有効" : "無効=SW")})");
+
         if (_hwCtx != null)
         {
             _ctx->hw_device_ctx = av_buffer_ref(_hwCtx);
