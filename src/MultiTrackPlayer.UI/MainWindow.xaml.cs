@@ -72,6 +72,9 @@ public partial class MainWindow : Window
             // Collapsed になり SizeChanged が発火しないため、UpdateOverlayBounds はここで明示的に呼ぶ必要がある。
             else if (e.PropertyName == nameof(MainViewModel.CurrentMedia))
             {
+                // 動画切替時は前フレームの残像を残さないよう、再描画判定用の直近 PTS をリセットする
+                // （新動画の最初のフレームが前動画と同一 PTS でも確実に描き直させる）。
+                _lastRenderedPts = TimeSpan.MinValue;
                 UpdateVideoHostLayout();
                 UpdateOverlayBounds();
             }
@@ -186,7 +189,11 @@ public partial class MainWindow : Window
     {
         if (_videoHostVisible == videoOutputActive) return;
         _videoHostVisible = videoOutputActive;
+        // GPU 経路（vout 稼働）では VideoHost に映像を描画し VideoImage は使わない。CPU 経路では逆。
+        // 両者を排他表示にして、使っていない側のレイヤーに残る旧映像が見えないようにする
+        // （アスペクト比の異なる動画へ切り替えたとき、旧映像がはみ出して層状に重なって見える問題への対処）。
         VideoHost.Visibility = videoOutputActive ? Visibility.Visible : Visibility.Collapsed;
+        VideoImage.Visibility = videoOutputActive ? Visibility.Collapsed : Visibility.Visible;
     }
 
     // 映像面（VideoHost 子ウィンドウ）を映像アスペクト比のレターボックス矩形に合わせて中央配置する（段階2-1）。
