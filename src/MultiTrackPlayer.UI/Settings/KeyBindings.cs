@@ -25,6 +25,8 @@ public class KeyBindings
         ["Shift+Left"]   = "Skip-3",
         ["Ctrl+Right"]   = "Skip+60",
         ["Ctrl+Left"]    = "Skip-60",
+        ["Home"]         = "JumpToStart",
+        ["End"]          = "JumpToEnd",
         ["Up"]           = "VolumeUp",
         ["Down"]         = "VolumeDown",
         ["M"]            = "Mute",
