@@ -198,50 +198,64 @@ public partial class MainWindow : Window
         double areaH = VideoArea.ActualHeight;
         if (areaW <= 0 || areaH <= 0) return;
 
-        double videoAspect = (double)media.Width / media.Height;
-        double areaAspect = areaW / areaH;
-
-        double hostW, hostH;
-        if (areaAspect > videoAspect)
-        {
-            // 領域が横長 → 高さ基準（左右に黒帯）
-            hostH = areaH;
-            hostW = areaH * videoAspect;
-        }
-        else
-        {
-            // 領域が縦長 → 幅基準（上下に黒帯）
-            hostW = areaW;
-            hostH = areaW / videoAspect;
-        }
-
+        ComputeLetterbox(areaW, areaH, media.Width, media.Height, out double hostW, out double hostH);
         VideoHost.Width = hostW;
         VideoHost.Height = hostH;
     }
 
-    // 透過オーバーレイ（AirspaceOverlayWindow）を映像子ウィンドウ（VideoHost）のスクリーン座標・サイズへ
-    // 追従させる（段階2-2a）。映像未オープンで VideoHost が 0×0 のときはオーバーレイを隠す。
+    // 映像アスペクト比を維持したレターボックス矩形（VideoArea 内での表示サイズ）を求める。
+    // VideoHost（GPU 経路の子ウィンドウ）と VideoImage（CPU 経路の Stretch=Uniform）はどちらも
+    // この矩形に映像を出すため、オーバーレイの追従先計算（UpdateOverlayBounds）と共通で使う。
+    private static void ComputeLetterbox(double areaW, double areaH, int videoW, int videoH,
+        out double rectW, out double rectH)
+    {
+        double videoAspect = (double)videoW / videoH;
+        double areaAspect = areaW / areaH;
+        if (areaAspect > videoAspect)
+        {
+            // 領域が横長 → 高さ基準（左右に黒帯）
+            rectH = areaH;
+            rectW = areaH * videoAspect;
+        }
+        else
+        {
+            // 領域が縦長 → 幅基準（上下に黒帯）
+            rectW = areaW;
+            rectH = areaW / videoAspect;
+        }
+    }
+
+    // 透過オーバーレイ（AirspaceOverlayWindow）を映像の実表示矩形（レターボックス）のスクリーン座標・サイズへ
+    // 追従させる（段階2-2a）。GPU 経路の VideoHost / CPU 経路の VideoImage はどちらも VideoArea 内の中央
+    // レターボックス矩形に映像を出すため、VideoHost ではなく VideoArea を基準に算出する。
+    // （CPU 経路では VideoHost が Collapsed で ActualWidth=0 になるため、VideoHost 基準だとオーバーレイが常に隠れてしまう）
     private void UpdateOverlayBounds()
     {
         if (_overlay == null) return;
-        var source = PresentationSource.FromVisual(VideoHost);
+        var source = PresentationSource.FromVisual(VideoArea);
         if (source == null) return;
 
-        double width = VideoHost.ActualWidth;
-        double height = VideoHost.ActualHeight;
-        if (width <= 0 || height <= 0)
+        var media = _vm.CurrentMedia;
+        double areaW = VideoArea.ActualWidth;
+        double areaH = VideoArea.ActualHeight;
+        if (media == null || media.Width <= 0 || media.Height <= 0 || areaW <= 0 || areaH <= 0)
         {
             if (_overlay.IsVisible) _overlay.Hide();
             return;
         }
 
+        // 映像の実表示矩形を VideoArea 内で算出し、中央配置（VideoHost/VideoImage とも中央寄せ）のオフセットを求める。
+        ComputeLetterbox(areaW, areaH, media.Width, media.Height, out double rectW, out double rectH);
+        double offsetX = (areaW - rectW) / 2.0;
+        double offsetY = (areaH - rectH) / 2.0;
+
         // PointToScreen はデバイスピクセル、Window.Left/Top はデバイス非依存単位のため DPI 変換する
-        Point deviceTopLeft = VideoHost.PointToScreen(new Point(0, 0));
+        Point deviceTopLeft = VideoArea.PointToScreen(new Point(offsetX, offsetY));
         Point dipTopLeft = source.CompositionTarget.TransformFromDevice.Transform(deviceTopLeft);
         _overlay.Left = dipTopLeft.X;
         _overlay.Top = dipTopLeft.Y;
-        _overlay.Width = width;
-        _overlay.Height = height;
+        _overlay.Width = rectW;
+        _overlay.Height = rectH;
         if (!_overlay.IsVisible) _overlay.Show();
     }
 
