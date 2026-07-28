@@ -162,7 +162,7 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
 
     public void Close() => _seq.Close();
 
-    /// <summary>Close 後に解放する。Leased 中のスロットは UI がまだ参照している可能性があるため <see cref="ReturnLease"/> 時に解放する。</summary>
+    /// <summary>Close 後に解放する。Leased 中のスロットは UI または vout スレッドがまだ参照している可能性があるため <see cref="ReturnLease"/> 時に解放する。</summary>
     public void Dispose()
     {
         Close();

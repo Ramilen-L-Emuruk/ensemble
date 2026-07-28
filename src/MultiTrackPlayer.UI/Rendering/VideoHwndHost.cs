@@ -8,7 +8,7 @@ namespace MultiTrackPlayer.UI.Rendering;
 /// 直接 Present することで、D3DImage（DWM 合成）を経由せず提示レートを vsync に安定させる（案Y・段階1）。
 ///
 /// airspace の制約により、この子ウィンドウ領域には WPF 要素を重ねられない（OSD・フルスクリーンオーバーレイは
-/// 段階2 で透過レイヤードウィンドウにより別途対応する）。
+/// 透過レイヤードウィンドウ <c>AirspaceOverlayWindow</c> で対応済み）。
 ///
 /// スレッド契約: 生成・破棄は UI スレッドで行う。子ウィンドウのハンドル（<see cref="Hwnd"/>）に対する
 /// スワップチェーン生成も UI スレッドで行い、Present だけを別スレッド（vout）から呼ぶ想定。

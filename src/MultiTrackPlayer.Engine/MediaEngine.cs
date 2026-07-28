@@ -636,7 +636,7 @@ public unsafe class MediaEngine : IMediaEngine
             return null;
         }
 
-        if (_videoDecoder.IsHardwareAccelerated && _gpuDevice?.VideoDevice != null)
+        if (_videoDecoder.IsHardwareAccelerated && _gpuDevice?.VideoDevice != null && _gpuDevice?.VideoContext != null)
         {
             var gpuRing = new GpuVideoFrameRing(_gpuDevice);
             var converter = new GpuFrameConverter(_gpuDevice);

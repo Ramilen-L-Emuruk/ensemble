@@ -111,7 +111,7 @@ public unsafe class VideoDecoder : IDisposable
 
     /// <summary>
     /// 指定 codec_id のデコーダを選ぶ。既定デコーダが D3D11VA 非対応の場合、同じ codec_id で D3D11VA に対応する
-    /// 別のデコーダを優先する（例: AV1 で既定が SW の libdav1d のとき、D3D11VA 対応の内蔵 av1 デコーダへ切り替える）。
+    /// 別のデコーダを優先する（例: AV1 で既定が SW の libdav1d のとき、D3D11VA 対応の内蔵 av1 デコーダへ切り替える。実機検証で確認済み）。
     /// これにより既定が SW デコーダのコーデックでもハードウェアデコード経路へ載せられる。対応デコーダが無ければ既定を返す。
     /// </summary>
     private static AVCodec* PickBestDecoder(AVCodecID codecId)
