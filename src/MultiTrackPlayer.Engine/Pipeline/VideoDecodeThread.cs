@@ -80,6 +80,13 @@ public sealed unsafe class VideoDecodeThread
                 }
             }
         }
+        catch (Exception ex)
+        {
+            // デコード／GPU 相互運用で想定外の例外が出ても、専用スレッドの未処理例外として
+            // プロセス全体を fail-fast で巻き込まない（連続ファイル切替時の破棄競合など）。
+            // 握り潰しではなく異常は必ずログに残し、このスレッドは安全に終了する。
+            Diagnostics.DiagnosticLog.Write("video", $"デコードスレッド異常終了（以降の映像処理を停止）: {ex}");
+        }
         finally
         {
             av_frame_free(&frame);
@@ -129,7 +136,8 @@ public sealed unsafe class VideoDecodeThread
 
     private void DrainAvailable(AVFrame* frame)
     {
-        while (_decoder.TryReceiveFrame(frame))
+        // 停止要求後はフレームを取り出して処理しない（EmitFrame → GPU テクスチャ生成に入らせない）。
+        while (!_stopRequested && _decoder.TryReceiveFrame(frame))
         {
             EmitFrame(frame);
             av_frame_unref(frame);
@@ -169,6 +177,10 @@ public sealed unsafe class VideoDecodeThread
             // ミキサーの音声出力保留（HoldOutput）を解除する（早送りバグの根治）
             _onFirstFrameAfterFlush?.Invoke();
         }
+
+        // 停止要求後は新規スロットの GPU テクスチャ生成（CreateSlotTexture）に入らない。
+        // Teardown（RequestStop → ring.Close → Join）と破棄済み D3D リソースへのアクセスを競合させないため。
+        if (_stopRequested) return;
 
         int slot = _sink.BeginWrite(frame->width, frame->height);
         if (slot == SlotSequencer.SlotClosed) return;
