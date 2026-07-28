@@ -5,12 +5,10 @@ using Vortice.Direct3D11;
 namespace MultiTrackPlayer.Engine.Rendering;
 
 /// <summary>
-/// GPU ゼロコピー描画 Sub-phase 2.1（デバイス統一）の土台。描画・色変換・FFmpeg デコードで共有する
-/// 単一の <see cref="ID3D11Device"/> を自前で生成して保持する。
-///
-/// この段階では「自前デバイスを 1 つ作り、その生ポインタを FFmpeg のデコードに注入できる状態」を用意する
-/// だけで、色変換（sws_scale）や <c>ID3D11VideoProcessor</c> の実処理はまだ行わない（後続 2.2 以降）。
-/// <see cref="VideoDevice"/> / <see cref="VideoContext"/> は後続フェーズで使うため生成のみ行う。
+/// GPU ゼロコピー描画で、描画・色変換・FFmpeg デコードが共有する単一の <see cref="ID3D11Device"/> を
+/// 自前で生成して保持する。生ポインタ（<see cref="NativeDevicePointer"/>）を FFmpeg のデコードに注入し、
+/// <see cref="VideoDevice"/> / <see cref="VideoContext"/> は <c>GpuFrameConverter</c> の
+/// <c>ID3D11VideoProcessor</c> による YCbCr→BGRA 色変換に使う。
 ///
 /// スレッド契約: 生成・<see cref="Dispose"/> は所有者（<c>MediaEngine</c>）のスレッドで呼ぶ。デバイス自体は
 /// FFmpeg のデコードスレッドと跨って使われうるため、生成直後に <c>ID3D11Multithread.SetMultithreadProtected(true)</c>
@@ -18,7 +16,7 @@ namespace MultiTrackPlayer.Engine.Rendering;
 /// </summary>
 public sealed class GpuDeviceContext : IDisposable
 {
-    // BgraSupport=D3D9 共有テクスチャ（B8G8R8A8）用、VideoSupport=後続の ID3D11VideoProcessor 用。
+    // BgraSupport=D3D9 共有テクスチャ（B8G8R8A8）用、VideoSupport=ID3D11VideoProcessor（GpuFrameConverter の色変換）用。
     private const DeviceCreationFlags CreationFlags =
         DeviceCreationFlags.BgraSupport | DeviceCreationFlags.VideoSupport;
 
@@ -42,10 +40,10 @@ public sealed class GpuDeviceContext : IDisposable
     /// <summary>即時（immediate）デバイスコンテキスト。</summary>
     public ID3D11DeviceContext ImmediateContext => _immediateContext;
 
-    /// <summary>後続 2.2 の色変換で使う VideoDevice（取得できない環境では null）。</summary>
+    /// <summary>色変換（<c>GpuFrameConverter</c>）で使う VideoDevice（取得できない環境では null）。</summary>
     public ID3D11VideoDevice? VideoDevice => _videoDevice;
 
-    /// <summary>後続 2.2 の色変換で使う VideoContext（取得できない環境では null）。</summary>
+    /// <summary>色変換（<c>GpuFrameConverter</c>）で使う VideoContext（取得できない環境では null）。</summary>
     public ID3D11VideoContext? VideoContext => _videoContext;
 
     /// <summary>FFmpeg（AVD3D11VADeviceContext.device）へ注入するための <see cref="ID3D11Device"/> の生ポインタ。</summary>
@@ -61,7 +59,7 @@ public sealed class GpuDeviceContext : IDisposable
 
         FeatureLevel level = _device.FeatureLevel;
 
-        // 後続 2.2 で使う VideoDevice / VideoContext を取得（この環境で無ければ null のまま続行）。
+        // 色変換（GpuFrameConverter）で使う VideoDevice / VideoContext を取得（この環境で無ければ null のまま続行）。
         _videoDevice = _device.QueryInterfaceOrNull<ID3D11VideoDevice>();
         _videoContext = _immediateContext.QueryInterfaceOrNull<ID3D11VideoContext>();
 
