@@ -718,7 +718,8 @@ public unsafe class MediaEngine : IMediaEngine
         }
 
         int currentSlot = -1;     // 現在 backbuffer に出しているスロット
-        bool ownedByVout = false; // Playing 中に vout がリースしたスロットか（返却責任が vout 側にある）
+        bool ownedByVout = false; // vout 自身がリース中で、返却責任が vout 側にあるスロットか
+        var prevState = _state;  // 直前ループの状態（Paused→Playing 遷移の検出用）
 
         try
         {
@@ -731,8 +732,22 @@ public unsafe class MediaEngine : IMediaEngine
                 double gapMs = _lastVoutPull == 0 ? 0.0 : (pullNow - _lastVoutPull) * 1000.0 / Stopwatch.Frequency;
                 _lastVoutPull = pullNow;
 
-                if (_state == CorePlaybackState.Playing)
+                var state = _state;
+
+                if (state == CorePlaybackState.Playing)
                 {
+                    if (prevState != CorePlaybackState.Playing)
+                    {
+                        // Paused/Stopped → Playing 遷移直後。Pause 中に vout 自身が保持し続けていたスロットは
+                        // ここで返却し、currentSlot は一旦無効化する。Play() 側の ReleaseHeldFrame が
+                        // _heldLease のスロットを既に Free 化している場合があり、それをリセットせず
+                        // currentSlot に残したまま下の due 判定に進むと、Free 化されデコードスレッドに
+                        // 上書きされ得るスロットをそのまま誤って Render してしまう恐れがあるため。
+                        if (ownedByVout && currentSlot >= 0) ring.ReturnLease(currentSlot);
+                        currentSlot = -1;
+                        ownedByVout = false;
+                    }
+
                     double clock = GetMasterClockSeconds();
                     if (ring.TryLeaseDue(clock, _videoFrameDuration, out var lease, out int dropped) && lease != null)
                     {
@@ -752,10 +767,25 @@ public unsafe class MediaEngine : IMediaEngine
                 }
                 else
                 {
-                    // Paused/Stopped: Playing 中にリースしたスロットは返し、保持フレーム（held）へ切り替える。
-                    if (ownedByVout && currentSlot >= 0) { ring.ReturnLease(currentSlot); ownedByVout = false; }
-                    currentSlot = _heldLease is { Kind: FrameKind.Gpu } held ? held.SlotIndex : -1;
+                    // Paused/Stopped: Step/Seek で _heldLease が更新されていればそちらへ乗り換える。
+                    // まだ _heldLease が無ければ（Pause 直後で Step/Seek 未実行）、Playing 中に vout が
+                    // リースしていたスロットを返却せずそのまま保持・提示し続ける。ここで即返却して
+                    // currentSlot を -1 にすると、次に Render すべきフレームが無いまま Present だけが
+                    // 続き、FlipDiscard の2枚バックバッファが交互に出て映像が震えて見える不具合があった。
+                    if (_heldLease is { Kind: FrameKind.Gpu } held)
+                    {
+                        if (ownedByVout && currentSlot >= 0 && currentSlot != held.SlotIndex)
+                            ring.ReturnLease(currentSlot);
+                        currentSlot = held.SlotIndex;
+                        ownedByVout = false;
+                    }
+                    else if (!ownedByVout)
+                    {
+                        currentSlot = -1;
+                    }
                 }
+
+                prevState = state;
 
                 // 停止要求後は Render/Present に入らず即脱出する（破棄途中の swapchain を触らせない）。
                 if (!_voutRunning) break;
