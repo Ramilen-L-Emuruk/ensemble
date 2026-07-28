@@ -28,6 +28,11 @@ public partial class MainWindow : Window
     private D3DImagePresenter? _presenter;
     private AirspaceOverlayWindow? _overlay;
     private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
+    // VideoHost（airspace の都合で常に最前面に来るネイティブ子ウィンドウ）の現在の表示状態。
+    // vout 非稼働（CPU 経路）時に表示したままだと、下の VideoImage に描画される映像を覆い隠して
+    // 黒画面に見えてしまうため、GPU/CPU 経路の切り替わりに追従して表示・非表示を同期する。
+    // null で初期化し、初回の OnRendering で必ず実際の状態へ同期させる。
+    private bool? _videoHostVisible;
     private WindowState _prevWindowState;
     private WindowStyle _prevWindowStyle;
     // OnRendering 1回の処理時間調査用（ドロップ調査ログ専用）。1フレーム予算(60fpsで約16.7ms)の
@@ -111,8 +116,11 @@ public partial class MainWindow : Window
     // GPU 非対応・初期化失敗時のみ WriteableBitmap にフォールバックする。
     private void OnRendering(object? sender, EventArgs e)
     {
+        bool videoOutputActive = _vm.Engine.IsVideoOutputActive;
+        SyncVideoHostVisibility(videoOutputActive);
+
         // vout（スワップチェーン）稼働中は映像提示を専用スレッドが担うため、UI プルは行わない（案Y）。
-        if (_vm.Engine.IsVideoOutputActive) return;
+        if (videoOutputActive) return;
 
         long t0 = Stopwatch.GetTimestamp();
         var lease = _vm.Engine.TryGetFrame(_vm.Engine.Position);
@@ -160,6 +168,17 @@ public partial class MainWindow : Window
     }
 
     private void VideoArea_SizeChanged(object sender, SizeChangedEventArgs e) => UpdateVideoHostLayout();
+
+    // VideoHost は airspace により WPF 要素（VideoImage）より必ず手前に来るネイティブ子ウィンドウのため、
+    // vout（スワップチェーン提示）が稼働していないとき（CPU フォールバック経路や、GPU 経路でも swapchain
+    // 生成に失敗した場合）に表示したままにすると、実際に映像が描画されている VideoImage を覆い隠して
+    // 「デコードは進んでいるのに画面は黒いまま」に見えてしまう。vout の稼働状態と表示・非表示を同期する。
+    private void SyncVideoHostVisibility(bool videoOutputActive)
+    {
+        if (_videoHostVisible == videoOutputActive) return;
+        _videoHostVisible = videoOutputActive;
+        VideoHost.Visibility = videoOutputActive ? Visibility.Visible : Visibility.Collapsed;
+    }
 
     // 映像面（VideoHost 子ウィンドウ）を映像アスペクト比のレターボックス矩形に合わせて中央配置する（段階2-1）。
     // swapchain は映像サイズ + Scaling.Stretch のままで、子ウィンドウのアスペクトを映像に一致させることで歪みを防ぐ。
