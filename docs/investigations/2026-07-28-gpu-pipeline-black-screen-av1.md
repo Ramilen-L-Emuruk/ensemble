@@ -2,7 +2,9 @@
 
 - 調査日: 2026-07-28
 - 対象ブランチ: `worktree/chore/dotnet10-migration`
-- 未修正（調査結果のみ。開発機側で修正予定）
+- 状態: 上記の黒画面は修正済み（コミット参照）。ただし修正の副作用で
+  **CPU 経路再生時にオーバーレイ（OSD・シークバー）が表示されなくなる既知の問題が残っている**
+  （「追記」参照・未修正）。
 
 ## 現象
 
@@ -74,3 +76,44 @@ D3D11VA ハードウェアデコードの候補が提示されない、または
 
 コーデック確認は `ffprobe` が手元になかったため、ファイル先頭 2MB を走査して
 `av01` fourcc の出現を確認する簡易チェックで行った（`av1C` 設定ボックスも同時に確認）。
+
+## 追記（同日）: 黒画面の修正と、新たに判明した副作用
+
+### 黒画面の一次修正
+
+上記「原因」の 2〜3 に対応する修正を実施（`fix: HWデコード非対応コーデック(AV1等)で黒画面になる問題を解消`）。
+`VideoDecoder.IsHardwareAccelerated` が `get_format` の実際の選択結果（D3D11 が選ばれたか）を
+反映するようになり、AV1 のような SW フォールバックのファイルは最初から CPU 経路（`CpuFrameSink`）
+が選ばれるようになった。
+
+### 二次的に発覚した問題: airspace で VideoHost が VideoImage を覆い隠す
+
+上記修正後も実機確認で「デコードは進んでいるのに画面が黒い」という報告があり、再調査したところ
+別原因が見つかった。
+
+- `VideoHost`（[MainWindow.xaml.cs](../../src/MultiTrackPlayer.UI/MainWindow.xaml.cs) 内 `VideoHwndHost`）は
+  airspace の性質上、XAML の重ね順に関わらず常に WPF 要素（`VideoImage`）より手前に描画される。
+- vout（GPU スワップチェーン提示）が動いているときは `VideoHost` 自体に映像が描画されるので問題ないが、
+  CPU 経路（`vout` 非稼働）のときは `VideoImage` に描画された映像が `VideoHost`（何も描かれていない
+  ネイティブウィンドウ）に覆い隠され、黒画面に見えていた。
+
+**この分は修正済み**（`fix: CPU経路映像がairspaceでVideoHostに隠れ黒画面になる問題を解消`）。
+`OnRendering` で `Engine.IsVideoOutputActive`（vout 稼働中＝GPU 経路）の状態に追従して
+`VideoHost.Visibility` を Visible/Collapsed で切り替えるようにした
+（`SyncVideoHostVisibility`、[MainWindow.xaml.cs](../../src/MultiTrackPlayer.UI/MainWindow.xaml.cs)）。
+
+### 既知の問題（未修正）: CPU 経路でオーバーレイ（OSD・シークバー）が出なくなった
+
+上記の `VideoHost.Visibility = Collapsed` の副作用として、CPU 経路の動画再生中は
+**フルスクリーンの OSD・シークバーオーバーレイ（`AirspaceOverlayWindow`）が表示されなくなっている**。
+
+原因: `UpdateOverlayBounds()`（[MainWindow.xaml.cs:224](../../src/MultiTrackPlayer.UI/MainWindow.xaml.cs#L224)）は
+`VideoHost.ActualWidth` / `ActualHeight` を見てオーバーレイの位置・サイズを追従させており、
+`width <= 0 || height <= 0` のときはオーバーレイを `Hide()` する実装になっている
+（[MainWindow.xaml.cs:230-236](../../src/MultiTrackPlayer.UI/MainWindow.xaml.cs#L230-L236)）。
+`VideoHost` を `Collapsed` にすると `ActualWidth`/`ActualHeight` が 0 になるため、
+CPU 経路のときは常にこの条件に該当してオーバーレイが隠れたままになる。
+
+**修正方針（案）**: オーバーレイの位置・サイズ計算の基準を `VideoHost` ではなく `VideoArea`
+（またはレターボックス矩形を保持する別の値）に変更する。`VideoHost` の可視状態と
+オーバーレイの表示可否を結び付けている現状の実装が、今回の Visibility 切り替えと衝突している。
