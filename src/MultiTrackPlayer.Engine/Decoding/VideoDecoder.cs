@@ -2,6 +2,7 @@ using MultiTrackPlayer.Engine.Diagnostics;
 using MultiTrackPlayer.Engine.Rendering;
 using MultiTrackPlayer.Engine.Utilities;
 using Sdcb.FFmpeg.Raw;
+using System.Runtime.InteropServices;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
 
 namespace MultiTrackPlayer.Engine.Decoding;
@@ -38,7 +39,7 @@ public unsafe class VideoDecoder : IDisposable
         _streamIndex = stream->index;
         _timeBase = stream->time_base;
 
-        var codec = avcodec_find_decoder(stream->codecpar->codec_id);
+        var codec = PickBestDecoder(stream->codecpar->codec_id);
         if (codec == null) throw new InvalidOperationException("Video codec not found");
 
         _ctx = avcodec_alloc_context3(codec);
@@ -107,6 +108,34 @@ public unsafe class VideoDecoder : IDisposable
         }
         return false;
     }
+
+    /// <summary>
+    /// 指定 codec_id のデコーダを選ぶ。既定デコーダが D3D11VA 非対応の場合、同じ codec_id で D3D11VA に対応する
+    /// 別のデコーダを優先する（例: AV1 で既定が SW の libdav1d のとき、D3D11VA 対応の内蔵 av1 デコーダへ切り替える）。
+    /// これにより既定が SW デコーダのコーデックでもハードウェアデコード経路へ載せられる。対応デコーダが無ければ既定を返す。
+    /// </summary>
+    private static AVCodec* PickBestDecoder(AVCodecID codecId)
+    {
+        AVCodec* def = avcodec_find_decoder(codecId);
+        if (def == null) return null;
+        if (SupportsD3d11vaDecode(def)) return def;
+
+        // 既定が D3D11VA 非対応。全デコーダを走査し、同じ codec_id で D3D11VA 対応のものがあれば優先する。
+        void* iter = null;
+        for (AVCodec* c = av_codec_iterate(&iter); c != null; c = av_codec_iterate(&iter))
+        {
+            if (c->id == codecId && av_codec_is_decoder(c) != 0 && SupportsD3d11vaDecode(c))
+            {
+                DiagnosticLog.Write("hwDecode",
+                    $"D3D11VA 対応デコーダへ切替: {GetCodecName(def)} → {GetCodecName(c)} (codec_id={codecId})");
+                return c;
+            }
+        }
+        return def;
+    }
+
+    private static string GetCodecName(AVCodec* codec)
+        => codec != null && codec->name != null ? Marshal.PtrToStringUTF8((IntPtr)codec->name) ?? "?" : "?";
 
     /// <summary>デコーダへパケットを送る（pkt に null を渡すと EOF フラッシュ）。avcodec_send_packet の戻り値をそのまま返す。</summary>
     public int SendPacket(AVPacket* pkt) => avcodec_send_packet(_ctx, pkt);
