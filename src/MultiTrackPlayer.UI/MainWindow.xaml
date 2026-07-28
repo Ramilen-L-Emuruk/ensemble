@@ -103,7 +103,7 @@
         <!-- Video area -->
         <Grid x:Name="VideoArea" Background="Black" SizeChanged="VideoArea_SizeChanged">
             <!-- 案Y: GPU デコード時はこの子ウィンドウのスワップチェーンに vout スレッドが直接 Present する。
-                 airspace により子ウィンドウは最前面になるため、下の WPF オーバーレイ（OSD 等）は段階2 で別途対応。
+                 airspace により子ウィンドウは最前面になるため、OSD 等のオーバーレイは透過の AirspaceOverlayWindow で重ねる。
                  アスペクト維持: 子ウィンドウを映像アスペクト比の矩形にして中央寄せし、周囲は Grid の黒を残す（段階2-1）。 -->
             <rendering:VideoHwndHost x:Name="VideoHost"
                                      HorizontalAlignment="Center" VerticalAlignment="Center"/>

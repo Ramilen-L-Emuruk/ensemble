@@ -160,17 +160,28 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
 - `src/MultiTrackPlayer.Engine/`: FFmpeg デコード・NAudio ミキサー（unsafe コード有）
   - `Pipeline/`: ffplay 型スレッド分離パイプライン。`DemuxThread` が `AVFormatContext` を唯一専有し、
     `VideoDecodeThread`/`AudioDecodeThread` が `VideoPacketQueue`/`AudioPacketQueue`（serial・Flush/EOF
-    番兵付き有界キュー）経由でデコードする。シークは `DemuxThread.RequestSeek` でコアレスされ非同期処理される
-  - `Video/VideoFrameRing.cs`: 4スロットのネイティブ BGRA リング。`TryLeaseDue`/`TryLeaseOldest` +
-    `ReturnLease` の真のリース方式（`IMediaEngine.TryGetFrame`/`ReturnFrame` の裏側）
+    番兵付き有界キュー）経由でデコードする。シークは `DemuxThread.RequestSeek` でコアレスされ非同期処理される。
+    映像の書き込み戦略は sink（`IVideoFrameSink`）に委譲し、HW デコード時は `GpuFrameSink`（GPU 色変換）、
+    SW デコード時は `CpuFrameSink`（`sws_scale`）を使う
+  - `Decoding/VideoDecoder.cs`: 既定デコーダが D3D11VA 非対応なら、同一 codec_id の D3D11VA 対応デコーダ
+    （AV1 なら内蔵 `av1`）を `avcodec_get_hw_config` で探して優先選択する（AV1 の SW フォールバック黒画面対策）
+  - `Rendering/`: GPU ゼロコピー描画の中核。`GpuDeviceContext`（描画・デコード共有の単一 D3D11 デバイス）、
+    `GpuFrameConverter`（`ID3D11VideoProcessor` による YCbCr→BGRA 変換）、`SwapChainVideoPresenter`
+    （映像子ウィンドウのスワップチェーンへ vsync Present）
+  - `Video/`: 映像フレームリング。`GpuVideoFrameRing`（GPU 共有テクスチャ）/`VideoFrameRing`（CPU BGRA）と、
+    スロット状態機械 `SlotSequencer`（Free/Writing/Ready/Leased・serial 世代・`TryLeaseDue`/`TryLeaseOldest`+
+    `ReturnLease` のリース方式）・due 選択 `FrameSelector` に分割されている
   - `Sync/PlaybackClock.cs`: audio-master クロック（mixer 出力サンプル軸のセグメントマップ）。
     `WasapiPositionSource`（`IWavePosition` ベース、異常検知で `FallbackPositionSource` へ自動切替）と組み合わせて
     `MediaEngine.Position` を算出する
-  - 映像描画は push（イベント）ではなく pull 型: UI 側の `CompositionTarget.Rendering` が毎フレーム
-    `TryGetFrame`/`ReturnFrame` を呼ぶ
-- `src/MultiTrackPlayer.UI/`: WPF アプリ・MVVM ViewModel・XAML ビュー
+  - 映像提示は経路で二系統: GPU デコード時は専用 vout スレッドが `SwapChainVideoPresenter` で vsync 直接提示
+    する（`IsVideoOutputActive`）。CPU デコード時は従来どおり pull 型で、UI 側の `CompositionTarget.Rendering`
+    が毎フレーム `TryGetFrame`/`ReturnFrame` を呼ぶ
+- `src/MultiTrackPlayer.UI/`: WPF アプリ・MVVM ViewModel・XAML ビュー。GPU 経路は `Rendering/VideoHwndHost`
+  （映像子ウィンドウ）へ直接提示し、airspace で隠れる OSD 等は透過の `Windows/AirspaceOverlayWindow` で重ねる。
+  CPU 経路は `Rendering/D3DImagePresenter`（D3D9Ex↔D3D11 共有）で `D3DImage` へ表示する
 - `tests/MultiTrackPlayer.Tests/`: xUnit。純ロジック（`BoundedSerialQueue`/`PlaybackClock`/
-  `PrerollCalculator`/`FrameSelector`）のみを対象とし、unsafe/FFmpeg 依存のパイプライン本体は対象外
+  `PrerollCalculator`/`FrameSelector`/`SlotSequencer`）のみを対象とし、unsafe/FFmpeg 依存のパイプライン本体は対象外
 - チャプター永続化: `%APPDATA%\MultiTrackPlayer\chapters\{MD5}.json`
 - キーバインド設定: `%APPDATA%\MultiTrackPlayer\keybindings.json`
 - ファイルオープン（`avformat_open_input`/`avformat_find_stream_info`）は UI スレッドで同期実行される

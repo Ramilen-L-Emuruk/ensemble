@@ -12,8 +12,9 @@ namespace MultiTrackPlayer.Engine.Rendering;
 /// 提示レートが vsync（frame latency waitable object）で安定し、CompositionTarget.Rendering のジッタに
 /// 起因するフレーム間引きが原理的に消える。
 ///
-/// バックバッファは映像サイズで確保し、ウィンドウへの表示は <see cref="Scaling.Stretch"/> に委ねる
-/// （段階1 ではアスペクト維持のレターボックスは未実装。段階2 以降で VideoProcessor 経由に置き換える）。
+/// バックバッファは映像サイズで確保し、ウィンドウへの表示は <see cref="Scaling.Stretch"/> に委ねる。
+/// アスペクト維持のレターボックスは swapchain 側では行わず、映像子ウィンドウ（<c>VideoHost</c>）自体を
+/// 映像アスペクト比の矩形へリサイズ・中央配置する方式（<c>MainWindow.ComputeLetterbox</c>）で対応済み。
 ///
 /// スレッド契約: 生成・<see cref="Dispose"/> は所有スレッド（MediaEngine）から。<see cref="WaitForVBlank"/>・
 /// <see cref="Render"/>・<see cref="Present"/> は vout スレッドから呼ぶ。D3D11 デバイスは
