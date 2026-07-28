@@ -1,11 +1,9 @@
+using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Rendering;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 
 namespace MultiTrackPlayer.Engine.Video;
-
-/// <summary>リースされた GPU フレームの参照（UI へ渡す用）。SlotIndex と SharedHandle で共有テクスチャを特定する。</summary>
-public readonly record struct GpuRingFrame(int SlotIndex, IntPtr SharedHandle, int Width, int Height, double PtsSeconds);
 
 /// <summary>
 /// GPU ゼロコピー描画用の固定長リング。各スロットは共有可能な BGRA テクスチャ（<see cref="Format.B8G8R8A8_UNorm"/>,
@@ -20,7 +18,7 @@ public readonly record struct GpuRingFrame(int SlotIndex, IntPtr SharedHandle, i
 /// 所有する。循環依存を避けるため、本クラスは Converter を参照せず、Converter から <see cref="SetEnumerator"/> で enumerator を
 /// 借用し、<see cref="GetOutputView"/> 内で遅延生成する（依存は Converter → Ring の一方向のみ）。
 /// </summary>
-public sealed class GpuVideoFrameRing : IDisposable
+public sealed class GpuVideoFrameRing : IVideoFrameRing
 {
     private const int SlotCount = 4;
 
@@ -112,33 +110,38 @@ public sealed class GpuVideoFrameRing : IDisposable
         return p.OutputView;
     }
 
+    /// <summary>スロットの共有 BGRA テクスチャを返す（vout の swapchain 提示でバックバッファへコピーする用。未確保なら null）。</summary>
+    internal ID3D11Texture2D? GetSlotTexture(int slotIndex) => _payloads[slotIndex].Texture;
+
     public void CommitWrite(int slotIndex, double ptsSeconds) => _seq.CommitWrite(slotIndex, ptsSeconds);
 
     public void AbortWrite(int slotIndex) => _seq.AbortWrite(slotIndex);
 
     /// <summary>クロック位置に対して due な最新フレームを1枚リースする。何も due でなければ false。読み終えたら必ず <see cref="ReturnLease"/> すること。</summary>
-    public bool TryLeaseDue(double clockPositionSeconds, double frameDurationSeconds, out GpuRingFrame frame, out int droppedCount)
+    public bool TryLeaseDue(double clockPositionSeconds, double frameDurationSeconds, out VideoFrameLease? lease, out int droppedCount)
     {
         if (_seq.TryLeaseDue(clockPositionSeconds, frameDurationSeconds, out int idx, out double pts, out droppedCount))
         {
             var p = _payloads[idx];
-            frame = new GpuRingFrame(idx, p.SharedHandle, p.Width, p.Height, pts);
+            lease = new VideoFrameLease(idx, FrameKind.Gpu, PixelBuffer: IntPtr.Zero, p.Width, p.Height,
+                Stride: 0, p.SharedHandle, TimeSpan.FromSeconds(pts));
             return true;
         }
-        frame = default;
+        lease = null;
         return false;
     }
 
     /// <summary>最も古い Ready フレームを1枚リースする（クロック非依存。Step・一時停止中シーク用）。timeout 内に無ければ false。</summary>
-    public bool TryLeaseOldest(TimeSpan timeout, int minSerial, out GpuRingFrame frame)
+    public bool TryLeaseOldest(TimeSpan timeout, int minSerial, out VideoFrameLease? lease)
     {
         if (_seq.TryLeaseOldest(timeout, minSerial, out int idx, out double pts))
         {
             var p = _payloads[idx];
-            frame = new GpuRingFrame(idx, p.SharedHandle, p.Width, p.Height, pts);
+            lease = new VideoFrameLease(idx, FrameKind.Gpu, PixelBuffer: IntPtr.Zero, p.Width, p.Height,
+                Stride: 0, p.SharedHandle, TimeSpan.FromSeconds(pts));
             return true;
         }
-        frame = default;
+        lease = null;
         return false;
     }
 

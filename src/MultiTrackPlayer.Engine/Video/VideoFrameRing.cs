@@ -1,27 +1,7 @@
 using System.Runtime.InteropServices;
+using MultiTrackPlayer.Core.Models;
 
 namespace MultiTrackPlayer.Engine.Video;
-
-/// <summary>リースされたフレームの生データ（エンジン内部用）。</summary>
-public readonly struct RingFrame
-{
-    public int SlotIndex { get; }
-    public IntPtr Buffer { get; }
-    public int Width { get; }
-    public int Height { get; }
-    public int Stride { get; }
-    public double PtsSeconds { get; }
-
-    public RingFrame(int slotIndex, IntPtr buffer, int width, int height, int stride, double ptsSeconds)
-    {
-        SlotIndex = slotIndex;
-        Buffer = buffer;
-        Width = width;
-        Height = height;
-        Stride = stride;
-        PtsSeconds = ptsSeconds;
-    }
-}
 
 /// <summary>
 /// GPU→CPU 転送後の BGRA フレームを保持するネイティブメモリの固定長リング。
@@ -29,7 +9,7 @@ public readonly struct RingFrame
 /// due なフレームをリースして直接読み取り、読み終えたら ReturnLease で返す（プル型・ゼロコピー）。
 /// スロットの状態機械は <see cref="SlotSequencer"/> に委譲し、本クラスはネイティブバッファの確保・解放だけを担う。
 /// </summary>
-public sealed class VideoFrameRing : IDisposable
+public sealed class VideoFrameRing : IVideoFrameRing
 {
     private const int SlotCount = 4;
 
@@ -89,15 +69,16 @@ public sealed class VideoFrameRing : IDisposable
     /// クロック位置に対して due な最新フレームを1枚リースする。選ばれなかった古い Ready は破棄され
     /// droppedCount に計上される。何も due でなければ false。呼び出し側は読み終えたら必ず ReturnLease すること。
     /// </summary>
-    public bool TryLeaseDue(double clockPositionSeconds, double frameDurationSeconds, out RingFrame frame, out int droppedCount)
+    public bool TryLeaseDue(double clockPositionSeconds, double frameDurationSeconds, out VideoFrameLease? lease, out int droppedCount)
     {
         if (_seq.TryLeaseDue(clockPositionSeconds, frameDurationSeconds, out int idx, out double pts, out droppedCount))
         {
             var p = _payloads[idx];
-            frame = new RingFrame(idx, p.Buffer, p.Width, p.Height, p.Stride, pts);
+            lease = new VideoFrameLease(idx, FrameKind.Cpu, p.Buffer, p.Width, p.Height, p.Stride,
+                SharedSurfaceHandle: IntPtr.Zero, TimeSpan.FromSeconds(pts));
             return true;
         }
-        frame = default;
+        lease = null;
         return false;
     }
 
@@ -105,15 +86,16 @@ public sealed class VideoFrameRing : IDisposable
     /// 最も古い Ready フレームを1枚リースする（クロック非依存。Step・一時停止中シーク用）。
     /// minSerial 未満の世代（＝シーク前の残骸）は対象外。timeout 内に無ければ false。
     /// </summary>
-    public bool TryLeaseOldest(TimeSpan timeout, int minSerial, out RingFrame frame)
+    public bool TryLeaseOldest(TimeSpan timeout, int minSerial, out VideoFrameLease? lease)
     {
         if (_seq.TryLeaseOldest(timeout, minSerial, out int idx, out double pts))
         {
             var p = _payloads[idx];
-            frame = new RingFrame(idx, p.Buffer, p.Width, p.Height, p.Stride, pts);
+            lease = new VideoFrameLease(idx, FrameKind.Cpu, p.Buffer, p.Width, p.Height, p.Stride,
+                SharedSurfaceHandle: IntPtr.Zero, TimeSpan.FromSeconds(pts));
             return true;
         }
-        frame = default;
+        lease = null;
         return false;
     }
 

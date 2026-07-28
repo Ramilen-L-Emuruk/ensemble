@@ -11,12 +11,18 @@ using D9 = Vortice.Direct3D9;
 namespace MultiTrackPlayer.UI.Rendering;
 
 /// <summary>
-/// GPU ゼロコピー描画 Phase 1。エンジンのネイティブ BGRA フレームを D3D11 の Dynamic テクスチャに
-/// 行単位でアップロードし、Shared テクスチャ経由で D3D9Ex サーフェスへ渡して WPF の <see cref="D3DImage"/>
-/// に表示する。CPU 側での中間 <c>byte[]</c> 確保や <c>WriteableBitmap.WritePixels</c> を回避する。
+/// D3D9Ex↔D3D11 共有サーフェス経由で WPF の <see cref="D3DImage"/> に映像を表示するブリッジ。
+/// フレームの受け渡し形態（<see cref="FrameKind"/>）に応じて 2 経路を持つ:
+///
+/// <list type="bullet">
+/// <item><see cref="FrameKind.Gpu"/>（GPU ゼロコピー）: エンジンが GPU 上で BGRA 変換済みの共有テクスチャを、
+/// その共有ハンドルから D3D9 サーフェスとして開いて <see cref="D3DImage"/> のバックバッファへ直結する。CPU コピーを一切行わない。</item>
+/// <item><see cref="FrameKind.Cpu"/>（SW フォールバック）: ネイティブ BGRA バッファを Staging テクスチャへ行単位で
+/// アップロードし、共有テクスチャへ GPU コピーして表示する（従来経路）。</item>
+/// </list>
 ///
 /// スレッド契約: 生成・<see cref="Present"/>・<see cref="Dispose"/> はすべて UI スレッド上で呼ぶこと。
-/// MediaEngine.TryGetFrame / ReturnFrame の UI スレッド専有契約に合わせ、Present 内で同期的にコピーを
+/// MediaEngine.TryGetFrame / ReturnFrame の UI スレッド専有契約に合わせ、Present 内で同期的に提示を
 /// 完了させる（フレームを非同期に保持しない＝リング枯渇を招かない）。
 /// </summary>
 public sealed class D3DImagePresenter : IDisposable
@@ -49,6 +55,14 @@ public sealed class D3DImagePresenter : IDisposable
     private int _width;
     private int _height;
     private bool _deviceLost;
+
+    // GPU 経路用。エンジンのスロット共有ハンドルごとに開いた D3D9 サーフェス（=StretchRect のコピー元）をキャッシュする
+    // （リングは 4 スロットなので通常 4 ハンドル。解像度変化時にまとめて破棄して開き直す）。
+    private int _gpuWidth;
+    private int _gpuHeight;
+    private readonly Dictionary<IntPtr, (D9.IDirect3DTexture9 Texture, D9.IDirect3DSurface9 Surface)> _gpuSurfaces = new();
+    // D3DImage のバックバッファに固定する 1 枚の RenderTarget（=StretchRect のコピー先）。SetBackBuffer は生成時に一度だけ呼ぶ。
+    private D9.IDirect3DSurface9? _gpuBackBuffer;
 
     /// <summary>WPF 側で <c>Image.Source</c> にバインドする描画先。<see cref="Present"/> のたびに中身を更新する。</summary>
     public D3DImage D3DImage { get; } = new();
@@ -199,8 +213,117 @@ public sealed class D3DImagePresenter : IDisposable
         DiagnosticLog.Write("d3dPresenter", $"サーフェス生成 {width}x{height}");
     }
 
-    /// <summary>1 フレームを GPU へアップロードして表示する。呼び出し直後に <c>ReturnFrame</c> できるよう同期完結する。</summary>
-    public unsafe void Present(VideoFrameLease lease)
+    /// <summary>1 フレームを表示する。<see cref="FrameKind"/> に応じて GPU ゼロコピー経路か CPU 経路へ振り分ける。呼び出し直後に <c>ReturnFrame</c> できるよう同期完結する。</summary>
+    public void Present(VideoFrameLease lease)
+    {
+        if (lease.Kind == FrameKind.Gpu)
+            PresentGpu(lease);
+        else
+            PresentCpu(lease);
+    }
+
+    /// <summary>
+    /// GPU 経路。エンジンが GPU 上で BGRA 変換済みの共有テクスチャ（<paramref name="lease"/> の共有ハンドル）から、
+    /// 固定バックバッファへ GPU 内 <c>StretchRect</c> でコピーして表示する。CPU コピーを行わない。
+    ///
+    /// バックバッファは 1 枚に固定し <see cref="D3DImage.SetBackBuffer"/> は生成時のみ呼ぶ。毎フレームの
+    /// SetBackBuffer 切替（WPF のコンポジションリソース載せ替え）を避け、UI スレッドの提示コストを抑える。
+    /// </summary>
+    private void PresentGpu(VideoFrameLease lease)
+    {
+        if (_deviceLost)
+        {
+            TryRecoverDevices();
+            if (_deviceLost) return;
+        }
+
+        // フロントバッファが利用不可（ロック画面・RDP 切断等）の間は描画をスキップする。
+        if (!D3DImage.IsFrontBufferAvailable) return;
+
+        try
+        {
+            // 解像度が変わったら旧サーフェス群は無効（エンジン側もスロットのテクスチャを作り直す）。まとめて破棄し、
+            // 固定バックバッファを作り直して SetBackBuffer し直す。
+            if (_gpuBackBuffer == null || _gpuWidth != lease.Width || _gpuHeight != lease.Height)
+            {
+                ReleaseGpuSurfaces();
+                CreateGpuBackBuffer(lease.Width, lease.Height);
+                _gpuWidth = lease.Width;
+                _gpuHeight = lease.Height;
+            }
+
+            D9.IDirect3DSurface9? source = GetOrOpenSharedSurface(lease.SharedSurfaceHandle, lease.Width, lease.Height);
+            if (source == null) return; // オープン失敗（ログ済み）。次フレームで再試行。
+
+            // 当該スロットの共有サーフェス → 固定バックバッファへ GPU 内コピー（CPU 不介入）。同解像度なので拡縮なし。
+            // 全面矩形（LTRB=0,0,w,h）を渡す。同サイズのため XYWH 解釈でも同値。
+            var full = new D9.Rect(0, 0, lease.Width, lease.Height);
+            _d3d9Device!.StretchRect(source, full, _gpuBackBuffer!, full, D9.TextureFilter.None);
+
+            // バックバッファは固定のまま。dirty 通知だけで WPF に再描画を促す（SetBackBuffer 切替はしない）。
+            D3DImage.Lock();
+            D3DImage.AddDirtyRect(new Int32Rect(0, 0, lease.Width, lease.Height));
+            D3DImage.Unlock();
+        }
+        catch (Exception ex)
+        {
+            _deviceLost = true;
+            DiagnosticLog.Write("d3dPresenter", $"GPU 提示失敗（デバイスロストとして扱う）: {ex.Message}");
+        }
+    }
+
+    /// <summary>D3DImage のバックバッファに固定する RenderTarget を 1 枚生成し、SetBackBuffer で一度だけ結びつける。</summary>
+    private void CreateGpuBackBuffer(int width, int height)
+    {
+        _gpuBackBuffer = _d3d9Device!.CreateRenderTarget(
+            (uint)width, (uint)height, D9SharedFormat, D9.MultisampleType.None, 0, lockable: false);
+
+        D3DImage.Lock();
+        D3DImage.SetBackBuffer(D3DResourceType.IDirect3DSurface9, _gpuBackBuffer.NativePointer);
+        D3DImage.Unlock();
+        DiagnosticLog.Write("d3dPresenter", $"GPU バックバッファ生成 {width}x{height}");
+    }
+
+    /// <summary>共有ハンドルに対応する D3D9 サーフェスを取得する（未オープンなら開いてキャッシュ）。オープンできなければ null。</summary>
+    private D9.IDirect3DSurface9? GetOrOpenSharedSurface(IntPtr sharedHandle, int width, int height)
+    {
+        if (sharedHandle == IntPtr.Zero) return null;
+        if (_gpuSurfaces.TryGetValue(sharedHandle, out var cached)) return cached.Surface;
+
+        try
+        {
+            // 別 D3D11 デバイス（エンジンの GpuDeviceContext）が作った共有テクスチャを、同一アダプタの D3D9 側で開く。
+            IntPtr openHandle = sharedHandle;
+            D9.IDirect3DTexture9 texture = _d3d9Device!.CreateTexture(
+                (uint)width, (uint)height, 1, D9.Usage.RenderTarget, D9SharedFormat, D9.Pool.Default, ref openHandle);
+            D9.IDirect3DSurface9 surface = texture.GetSurfaceLevel(0);
+            _gpuSurfaces[sharedHandle] = (texture, surface);
+            DiagnosticLog.Write("d3dPresenter", $"共有サーフェスを開いた {width}x{height} cache={_gpuSurfaces.Count}");
+            return surface;
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write("d3dPresenter", $"共有サーフェスのオープンに失敗: {ex.Message}");
+            return null;
+        }
+    }
+
+    private void ReleaseGpuSurfaces()
+    {
+        foreach (var entry in _gpuSurfaces.Values)
+        {
+            entry.Surface.Dispose();
+            entry.Texture.Dispose();
+        }
+        _gpuSurfaces.Clear();
+        _gpuBackBuffer?.Dispose();
+        _gpuBackBuffer = null;
+        _gpuWidth = 0;
+        _gpuHeight = 0;
+    }
+
+    /// <summary>CPU 経路（SW フォールバック）。ネイティブ BGRA バッファを Staging→共有テクスチャへコピーして表示する。</summary>
+    private unsafe void PresentCpu(VideoFrameLease lease)
     {
         if (_deviceLost)
         {
@@ -251,6 +374,8 @@ public sealed class D3DImagePresenter : IDisposable
         try
         {
             ReleaseSurfaces();
+            // GPU 経路のサーフェスは旧 D3D9 デバイス上にあるため、デバイス作り直し前に破棄して次フレームで開き直させる。
+            ReleaseGpuSurfaces();
             ReleaseDevices();
             InitDevices();
             _width = 0; // 次の Present で必ずサーフェスを作り直す
@@ -303,6 +428,7 @@ public sealed class D3DImagePresenter : IDisposable
         }
 
         ReleaseSurfaces();
+        ReleaseGpuSurfaces();
         ReleaseDevices();
     }
 }

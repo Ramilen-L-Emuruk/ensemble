@@ -6,6 +6,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using MultiTrackPlayer.Core.Enums;
+using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Diagnostics;
 using MultiTrackPlayer.UI.Rendering;
 using MultiTrackPlayer.UI.Settings;
@@ -82,6 +83,10 @@ public partial class MainWindow : Window
         // 1件だけ渡された場合はフォルダ内の他の動画も自動でプレイリストに読み込む
         Loaded += (_, _) =>
         {
+            // 案Y: 映像子ウィンドウの HWND をエンジンへ接続する。GPU デコード経路の再生開始時に
+            // この HWND へスワップチェーンが張られ、vout スレッドが vsync で Present する。
+            _vm.Engine.AttachVideoOutput(VideoHost.Hwnd);
+
             var files = App.StartupArgs.Where(System.IO.File.Exists).ToArray();
             if (files.Length == 0) return;
             if (files.Length == 1)
@@ -102,6 +107,9 @@ public partial class MainWindow : Window
     // GPU 非対応・初期化失敗時のみ WriteableBitmap にフォールバックする。
     private void OnRendering(object? sender, EventArgs e)
     {
+        // vout（スワップチェーン）稼働中は映像提示を専用スレッドが担うため、UI プルは行わない（案Y）。
+        if (_vm.Engine.IsVideoOutputActive) return;
+
         long t0 = Stopwatch.GetTimestamp();
         var lease = _vm.Engine.TryGetFrame(_vm.Engine.Position);
         long t1 = Stopwatch.GetTimestamp();
@@ -115,10 +123,10 @@ public partial class MainWindow : Window
 
         if (_presenter != null)
         {
-            // GPU ゼロコピー経路: Present 内でネイティブバッファを GPU テクスチャへ同期コピーする。
+            // D3DImage 経路: Present が Kind に応じて GPU ゼロコピー / CPU アップロードへ振り分ける。
             _presenter.Present(lease);
         }
-        else
+        else if (lease.Kind == FrameKind.Cpu)
         {
             // フォールバック経路: WriteableBitmap へ CPU コピーする。
             if (_bitmap is null || _bitmap.PixelWidth != lease.Width || _bitmap.PixelHeight != lease.Height)
@@ -129,6 +137,8 @@ public partial class MainWindow : Window
                 lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
             VideoImage.Source = _bitmap;
         }
+        // else: presenter 無し（WPF ソフトウェアレンダリング）かつ GPU リースは D3D を持たず表示できないため、
+        // この稀な組み合わせでは当該フレームをスキップする（クラッシュ回避）。
         long t2 = Stopwatch.GetTimestamp();
         _lastRenderedPts = lease.Pts;
 
