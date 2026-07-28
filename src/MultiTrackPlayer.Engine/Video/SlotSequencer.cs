@@ -118,11 +118,19 @@ public sealed class SlotSequencer
             }
 
             double chosenPts = _slots[chosen].PtsSeconds;
+            bool freedAny = false;
             foreach (var c in candidates)
                 if (c.SlotIndex != chosen && c.Pts <= chosenPts)
+                {
                     _slots[c.SlotIndex].State = SlotState.Free;
+                    freedAny = true;
+                }
 
             _slots[chosen].State = SlotState.Leased;
+            // drop で Free になったスロットを、Free 待ちでブロック中の BeginWrite（デコードスレッド）へ通知する。
+            // これが無いと、一時停止中にリングが満杯化 → 再生再開後の drop で Free ができても寝ている BeginWrite が
+            // 起床せず、デコードが再開しないまま映像が固まる（他の状態遷移は PulseAll するのに TryLeaseDue だけ抜けていた）。
+            if (freedAny) Monitor.PulseAll(_lock);
             slotIndex = chosen;
             ptsSeconds = _slots[chosen].PtsSeconds;
             return true;
