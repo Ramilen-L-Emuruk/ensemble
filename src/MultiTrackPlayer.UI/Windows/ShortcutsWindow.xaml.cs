@@ -17,6 +17,8 @@ public partial class ShortcutsWindow : Window
         ["Skip-3"]        = "3秒 巻き戻し",
         ["Skip+60"]       = "60秒 早送り",
         ["Skip-60"]       = "60秒 巻き戻し",
+        ["JumpToStart"]   = "先頭へ移動",
+        ["JumpToEnd"]     = "末尾へ移動",
         ["VolumeUp"]      = "音量を上げる",
         ["VolumeDown"]    = "音量を下げる",
         ["Mute"]          = "ミュート切替",

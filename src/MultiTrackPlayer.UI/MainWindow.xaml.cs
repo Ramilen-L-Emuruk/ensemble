@@ -422,6 +422,8 @@ public partial class MainWindow : Window
             case "Skip-3":        _vm.Skip(-3); break;
             case "Skip+60":       _vm.Skip(60); break;
             case "Skip-60":       _vm.Skip(-60); break;
+            case "JumpToStart":   _vm.Engine.Seek(TimeSpan.Zero); _vm.ShowOsd("先頭へ"); break;
+            case "JumpToEnd":     _vm.Engine.Seek(_vm.Duration); _vm.ShowOsd("末尾へ"); break;
             case "VolumeUp":      _vm.MasterVolume = Math.Min(100, _vm.MasterVolume + 5); break;
             case "VolumeDown":    _vm.MasterVolume = Math.Max(0, _vm.MasterVolume - 5); break;
             case "Mute":          _vm.ToggleMuteCommand.Execute(null); break;
