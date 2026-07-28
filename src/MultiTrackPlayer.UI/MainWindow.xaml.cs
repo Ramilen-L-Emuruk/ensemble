@@ -26,6 +26,7 @@ public partial class MainWindow : Window
     private DebugWindow? _debugWindow;
     private WriteableBitmap? _bitmap;
     private D3DImagePresenter? _presenter;
+    private AirspaceOverlayWindow? _overlay;
     private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
     private WindowState _prevWindowState;
     private WindowStyle _prevWindowStyle;
@@ -88,6 +89,14 @@ public partial class MainWindow : Window
             // 案Y: 映像子ウィンドウの HWND をエンジンへ接続する。GPU デコード経路の再生開始時に
             // この HWND へスワップチェーンが張られ、vout スレッドが vsync で Present する。
             _vm.Engine.AttachVideoOutput(VideoHost.Hwnd);
+
+            // 案Y: 映像子ウィンドウが airspace で最前面になり OSD が隠れるため、透過オーバーレイを
+            // その上に重ねて追従表示する（段階2-2a）。VideoHost のサイズ・ウィンドウ位置・状態変化で再配置する。
+            _overlay = new AirspaceOverlayWindow { Owner = this, DataContext = _vm };
+            VideoHost.SizeChanged += (_, _) => UpdateOverlayBounds();
+            LocationChanged += (_, _) => UpdateOverlayBounds();
+            StateChanged += (_, _) => UpdateOverlayBounds();
+            UpdateOverlayBounds();
 
             var files = App.StartupArgs.Where(System.IO.File.Exists).ToArray();
             if (files.Length == 0) return;
@@ -196,6 +205,32 @@ public partial class MainWindow : Window
 
         VideoHost.Width = hostW;
         VideoHost.Height = hostH;
+    }
+
+    // 透過オーバーレイ（AirspaceOverlayWindow）を映像子ウィンドウ（VideoHost）のスクリーン座標・サイズへ
+    // 追従させる（段階2-2a）。映像未オープンで VideoHost が 0×0 のときはオーバーレイを隠す。
+    private void UpdateOverlayBounds()
+    {
+        if (_overlay == null) return;
+        var source = PresentationSource.FromVisual(VideoHost);
+        if (source == null) return;
+
+        double width = VideoHost.ActualWidth;
+        double height = VideoHost.ActualHeight;
+        if (width <= 0 || height <= 0)
+        {
+            if (_overlay.IsVisible) _overlay.Hide();
+            return;
+        }
+
+        // PointToScreen はデバイスピクセル、Window.Left/Top はデバイス非依存単位のため DPI 変換する
+        Point deviceTopLeft = VideoHost.PointToScreen(new Point(0, 0));
+        Point dipTopLeft = source.CompositionTarget.TransformFromDevice.Transform(deviceTopLeft);
+        _overlay.Left = dipTopLeft.X;
+        _overlay.Top = dipTopLeft.Y;
+        _overlay.Width = width;
+        _overlay.Height = height;
+        if (!_overlay.IsVisible) _overlay.Show();
     }
 
     private void SyncSpeedBox()
@@ -484,6 +519,7 @@ public partial class MainWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         CompositionTarget.Rendering -= OnRendering;
+        _overlay?.Close();
         _presenter?.Dispose();
         _vm.Dispose();
         base.OnClosed(e);
