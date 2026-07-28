@@ -67,8 +67,14 @@ public partial class MainWindow : Window
         _vm.PropertyChanged += (_, e) =>
         {
             if (e.PropertyName == nameof(MainViewModel.PlaybackSpeed)) SyncSpeedBox();
-            // ファイル切替で映像サイズ（アスペクト比）が変わるため、映像面のレターボックス矩形を再計算する（段階2-1）
-            else if (e.PropertyName == nameof(MainViewModel.CurrentMedia)) UpdateVideoHostLayout();
+            // ファイル切替で映像サイズ（アスペクト比）が変わるため、映像面のレターボックス矩形を再計算する（段階2-1）。
+            // オーバーレイの追従先もこの矩形（VideoArea 基準）なので同時に再計算する。CPU 経路では VideoHost が
+            // Collapsed になり SizeChanged が発火しないため、UpdateOverlayBounds はここで明示的に呼ぶ必要がある。
+            else if (e.PropertyName == nameof(MainViewModel.CurrentMedia))
+            {
+                UpdateVideoHostLayout();
+                UpdateOverlayBounds();
+            }
         };
 
         SeekBar.Seeking += (_, ratio) =>
@@ -91,7 +97,6 @@ public partial class MainWindow : Window
             // フルスクリーン中はオーバーレイが前面に来るため、万一オーバーレイ側にキーが渡っても
             // 本ウィンドウのショートカット処理へ転送してキー操作を失わないようにする
             _overlay.KeyDown += Window_KeyDown;
-            VideoHost.SizeChanged += (_, _) => UpdateOverlayBounds();
             LocationChanged += (_, _) => UpdateOverlayBounds();
             StateChanged += (_, _) => UpdateOverlayBounds();
             UpdateOverlayBounds();
@@ -167,7 +172,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private void VideoArea_SizeChanged(object sender, SizeChangedEventArgs e) => UpdateVideoHostLayout();
+    private void VideoArea_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        UpdateVideoHostLayout();
+        UpdateOverlayBounds();
+    }
 
     // VideoHost は airspace により WPF 要素（VideoImage）より必ず手前に来るネイティブ子ウィンドウのため、
     // vout（スワップチェーン提示）が稼働していないとき（CPU フォールバック経路や、GPU 経路でも swapchain
