@@ -2,9 +2,8 @@
 
 - 調査日: 2026-07-28
 - 対象ブランチ: `worktree/chore/dotnet10-migration`
-- 状態: 上記の黒画面は修正済み（コミット参照）。ただし修正の副作用で
-  **CPU 経路再生時にオーバーレイ（OSD・シークバー）が表示されなくなる既知の問題が残っている**
-  （「追記」参照・未修正）。
+- 状態: 黒画面・オーバーレイ非表示・残像は修正済み（コミット参照）。
+  **新たに「一時停止→再生で映像が固まる（音声だけ進む）」問題を確認**（未調査・未修正、下記「追記2」）。
 
 ## 現象
 
@@ -135,3 +134,56 @@ CPU 経路のときは常にこの条件に該当してオーバーレイが隠�
 ファイル切替時にそれぞれのレイヤーが古い内容をクリアせず残す作りになっていないか、という点を
 疑うべきところから調査を始めるのが妥当と思われる（`VideoHost.Visibility` の Visible/Collapsed
 切り替え自体は前述の修正で入れたばかりのため、そこが絡んでいる可能性も含めて確認する）。
+
+## 追記2（同日）: 一時停止→再生で映像が固まる（未調査・未修正）
+
+### 現象
+
+`Replay 2026-07-28 17-54-24.mp4`（2160×3840・AV1・直近の修正で GPU 経路になったファイル）を再生中、
+一時停止 → 再生を行うと、**その後映像が完全に停止したまま進行しなくなる**。音声（クロック・再生位置）は
+そのまま正常に進み続ける。ログ: `session-20260728-194815.log`。
+
+### ログから読み取れる時系列
+
+```
+19:48:41.477 [engine] Pause pos=110.033
+19:48:42.167 [engine] Play wasStopped=False
+19:48:42.171 [videoDrop] ring ... [3:Leased pts=110.100 serial=10]  ← 再生再開直後、1回だけリースされる
+19:48:44.207 [stall] 映像 2000ms 以上停止 clock=112.163 ring=... [3:Leased pts=110.100 serial=10]（変化なし）
+19:48:45.149 [engine] Pause pos=113.106
+19:48:45.944 [engine] Play wasStopped=False
+19:48:48.008 [stall] 映像 2000ms 以上停止 clock=115.253 ring=...（変化なし）
+19:48:50.007 [stall] 映像 2000ms 以上停止 clock=117.254 ring=...（変化なし）
+```
+
+- 再開直後に1回だけ `videoDrop`（新しいフレームのリース）が発生した後、リング内の4スロット
+  （`GpuVideoFrameRing`）の内容が **`pos=110.05〜110.167` 付近のまま完全に固定** される。
+  `clock` はその後も 112 → 115 → 117 と正常に進み続けている（音声は生きている）。
+- `[stall] 映像 2000ms 以上停止` がログの最後（ログ末尾）まで繰り返し出続けており、映像側の
+  パイプラインが実質停止したまま復帰していない。
+- 一時停止前（再生開始〜複数回のシーク中）は `[gpuConvert] InputView 生成` 等が正常に出ており、
+  少なくとも最初の再生・複数回のシークでは映像パイプラインは機能していた。
+
+### 疑うべき箇所（未確認・仮説）
+
+- `MediaEngine.VideoOutputLoop()`（[MediaEngine.cs:708](../../src/MultiTrackPlayer.Engine/MediaEngine.cs#L708)）は
+  `_state != Playing`（Pause中）のとき、vout がリースしていたスロットを `ring.ReturnLease` で返却し、
+  `currentSlot` を保持フレーム（`_heldLease`）側に切り替える実装になっている（[MediaEngine.cs:753-758](../../src/MultiTrackPlayer.Engine/MediaEngine.cs#L753-L758)）。
+  再開（`_state == Playing` に戻る）後、`ring.TryLeaseDue(clock, ...)` が正しく新しい due フレームを
+  見つけられているか要確認。
+- `GpuVideoFrameRing`（[GpuVideoFrameRing.cs](../../src/MultiTrackPlayer.Engine/Video/GpuVideoFrameRing.cs)）
+  の中身が固定されたまま（`Free` スロットへの新規書き込みも一切発生していない）なので、
+  `VideoDecodeThread`（デコード→ `_sink.BeginWrite` → `WriteFrame` → `CommitWrite`）側も
+  一緒に止まっている可能性が高い。`BeginWrite` がスロット確保待ちでブロックしている
+  （＝ vout 側が古いスロットを解放し損ねている／リースの受け渡しがどこかで噛み合っていない）
+  のか、それとも `VideoDecodeThread` 自体が別の理由で止まっているのか切り分けが必要。
+- `Pause()` / `Play()`（[MediaEngine.cs:285-313](../../src/MultiTrackPlayer.Engine/MediaEngine.cs#L285-L313)）は
+  WASAPI の Play/Pause とクロックの状態切り替えのみを行っており、vout スレッドや
+  `VideoDecodeThread` に対する明示的な再開シグナル（Wake 等）は無い。両スレッドとも `_state` を
+  ポーリング/都度参照する設計のはずだが、一時停止をまたぐと片方（映像側）だけ再開できていない
+  ように見える。
+
+### 再現条件（暫定）
+
+今回確認できたのは 2160×3840・AV1・GPU 経路のファイルでの一時停止→再生。GPU 経路特有の問題
+（`VideoOutputLoop` の due 判定・スロット受け渡り）か、CPU 経路でも起きるかは未確認。
