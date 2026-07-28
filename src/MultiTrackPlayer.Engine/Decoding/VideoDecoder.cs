@@ -46,20 +46,31 @@ public unsafe class VideoDecoder : IDisposable
 
         avcodec_parameters_to_context(_ctx, stream->codecpar);
 
-        // 共有 HW デバイスコンテキストが渡されていれば参照共有版を優先。未指定（null）や失敗時は従来の自前生成へフォールバックする。
+        // このデコーダが D3D11VA ハードウェアデコード（hw_device_ctx 注入方式）に対応するかをデコード前に確定させる。
+        // get_format は最初のフレームをデコードした時点で初めて呼ばれるため、Open 時の経路選択（GPU/CPU）に間に合わない。
+        // avcodec_get_hw_config はデコード前に列挙でき、対応が無ければ最初から SW（CPU 経路）へ確実にフォールバックできる。
+        // （AV1 等、この環境の FFmpeg が D3D11VA 候補を出さないコーデックで映像が黒画面になる問題への対処）
+        bool supportsD3d11va = SupportsD3d11vaDecode(codec);
+
+        // D3D11VA 対応時のみ HW デバイスを注入する。共有 HW デバイスコンテキストが渡されていれば参照共有版を優先し、
+        // 未指定（null）や失敗時は従来の自前生成へフォールバックする。
         bool usedSharedDevice = false;
-        if (sharedHwDeviceCtx != null)
+        if (supportsD3d11va)
         {
-            // 共有コンテキストへの参照を1つ取るだけ（av_hwdevice_ctx_init は呼ばない）。ファイル切替ごとに
-            // init/uninit を繰り返すとネイティブヒープを破損させ、連続 D&D でクラッシュしていたための共有化。
-            _hwCtx = av_buffer_ref(sharedHwDeviceCtx);
-            usedSharedDevice = _hwCtx != null;
+            if (sharedHwDeviceCtx != null)
+            {
+                // 共有コンテキストへの参照を1つ取るだけ（av_hwdevice_ctx_init は呼ばない）。ファイル切替ごとに
+                // init/uninit を繰り返すとネイティブヒープを破損させ、連続 D&D でクラッシュしていたための共有化。
+                _hwCtx = av_buffer_ref(sharedHwDeviceCtx);
+                usedSharedDevice = _hwCtx != null;
+            }
+            if (_hwCtx == null)
+                _hwCtx = HardwareAccel.TryCreateD3D11VAContext();
         }
-        if (_hwCtx == null)
-            _hwCtx = HardwareAccel.TryCreateD3D11VAContext();
 
         DiagnosticLog.Write("gpuDevice",
-            $"VideoDecoder HW デバイス経路: {(usedSharedDevice ? "自前デバイス注入版" : "FFmpeg 自前生成版(従来)")} " +
+            $"VideoDecoder HW デバイス経路: d3d11vaSupported={supportsD3d11va} " +
+            $"{(usedSharedDevice ? "自前デバイス注入版" : (_hwCtx != null ? "FFmpeg 自前生成版(従来)" : "SW デコード（CPU 経路）"))} " +
             $"(hwCtx={(_hwCtx != null ? "有効" : "無効=SW")})");
 
         if (_hwCtx != null)
@@ -75,6 +86,26 @@ public unsafe class VideoDecoder : IDisposable
 
         int ret = avcodec_open2(_ctx, codec, null);
         if (ret < 0) throw new InvalidOperationException($"Could not open video codec: {ret}");
+    }
+
+    // AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX（FFmpeg）。hw_device_ctx 注入方式で HW デコードできることを示すビット。
+    private const int HwConfigMethodHwDeviceCtx = 0x01;
+
+    /// <summary>
+    /// 指定コーデックが D3D11VA ハードウェアデコード（hw_device_ctx 注入方式）に対応するかを、デコード前に
+    /// <c>avcodec_get_hw_config</c> の列挙で判定する。対応が無ければ HW デバイスを注入せず SW デコード（CPU 経路）になる。
+    /// </summary>
+    private static bool SupportsD3d11vaDecode(AVCodec* codec)
+    {
+        for (int i = 0; ; i++)
+        {
+            AVCodecHWConfig* cfg = avcodec_get_hw_config(codec, i);
+            if (cfg == null) break;
+            if (cfg->device_type == AVHWDeviceType.D3d11va &&
+                (cfg->methods & HwConfigMethodHwDeviceCtx) != 0)
+                return true;
+        }
+        return false;
     }
 
     /// <summary>デコーダへパケットを送る（pkt に null を渡すと EOF フラッシュ）。avcodec_send_packet の戻り値をそのまま返す。</summary>
