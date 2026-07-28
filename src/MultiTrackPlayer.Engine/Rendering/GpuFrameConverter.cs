@@ -25,7 +25,9 @@ public readonly record struct ColorInfo(bool IsBt709, bool IsFullRange)
 /// enumerator / processor は入出力サイズ確定時（初回・サイズ変化時）に生成する。入力 InputView は
 /// ArraySlice（=サブリソース番号）ごとにキャッシュし、入力テクスチャのポインタが変わったらキャッシュを破棄する。
 ///
-/// スレッド契約: 単一のデコードスレッドから使う前提（内部にロックは持たない）。生成・<see cref="Dispose"/> も同一スレッドで行う。
+/// スレッド契約: <see cref="ConvertInto"/> は単一のデコードスレッドから呼ぶ前提（内部にロックは持たない）。
+/// 生成・<see cref="Dispose"/> は所有者（<c>MediaEngine</c>）のスレッドで行い、デコードスレッドの開始前の生成・
+/// Join 後の破棄という happens-before で安全性を担保する（ConvertInto を呼ぶスレッドとは別スレッド）。
 /// </summary>
 public sealed class GpuFrameConverter : IDisposable
 {
