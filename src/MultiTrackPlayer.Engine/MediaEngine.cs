@@ -295,7 +295,12 @@ public unsafe class MediaEngine : IMediaEngine
         ReleaseHeldFrame();
         EnsurePipelineStarted();
         if (wasStopped)
+        {
+            // 新規再生の開始点で提示統計をリセットし、この再生1本ごとのドロップ率を UI に表示する（性能検証・実運用の可視性）。
+            _droppedFrames = 0;
+            _displayedFrames = 0;
             RequestAnchor(0.0);
+        }
         _wasapiOut?.Play();
     }
 
