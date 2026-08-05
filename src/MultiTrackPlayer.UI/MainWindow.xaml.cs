@@ -87,7 +87,7 @@ public partial class MainWindow : Window
         CompositionTarget.Rendering += OnRendering;
 
         // コマンドライン引数で渡された動画ファイルを起動時に開く。
-        // 1件だけ渡された場合はフォルダ内の他の動画も自動でプレイリストに読み込む
+        // 1件だけ渡された場合はその1件だけのプレイリストにする（フォルダの自動読み込みはしない）
         Loaded += (_, _) =>
         {
             // 案Y: 映像子ウィンドウの HWND をエンジンへ接続する。GPU デコード経路の再生開始時に
@@ -108,7 +108,7 @@ public partial class MainWindow : Window
             if (files.Length == 0) return;
             if (files.Length == 1)
             {
-                _vm.OpenFileWithFolderPlaylist(files[0]);
+                _vm.OpenSingleFile(files[0]);
             }
             else
             {
@@ -537,6 +537,24 @@ public partial class MainWindow : Window
             _vm.OpenFile(files[0]);
         }
         UpdateSeekBarChapters();
+    }
+
+    /// <summary>
+    /// 別プロセス（多重起動された2つ目以降のインスタンス）から Explorer 等で開かれたファイルを受け取る。
+    /// 新規ウィンドウを開かせず、既存のプレイリスト末尾に追加したうえで先頭のファイルへ即座に切り替えて再生する。
+    /// </summary>
+    public void HandleFilesFromAnotherInstance(string[] files)
+    {
+        var existing = files.Where(System.IO.File.Exists).ToArray();
+        if (existing.Length == 0) return;
+
+        _vm.Playlist.AddFiles(existing);
+        _vm.OpenFile(existing[0]);
+        UpdateSeekBarChapters();
+
+        if (WindowState == WindowState.Minimized)
+            WindowState = WindowState.Normal;
+        Activate();
     }
 
     // ── Sub-windows (lazy) ──
