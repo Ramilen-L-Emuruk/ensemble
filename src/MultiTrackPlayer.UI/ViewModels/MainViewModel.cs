@@ -133,8 +133,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _osdTimer.Start();
     }
 
-    /// <summary>単一ファイルを開く操作（ファイルを開くダイアログ・単一ファイルのドラッグ&amp;ドロップ・
-    /// 起動時引数）の入口。同じフォルダ内の対応拡張子ファイルを自動的にプレイリストへ読み込むことで、
+    /// <summary>単一ファイルを開く操作（ファイルを開くダイアログ・単一ファイルのドラッグ&amp;ドロップ）の入口。
+    /// 同じフォルダ内の対応拡張子ファイルを自動的にプレイリストへ読み込むことで、
     /// 明示的にプレイリストを組んでいなくても次の動画へ自動的に進めるようにする。</summary>
     public void OpenFileWithFolderPlaylist(string path)
     {
@@ -148,6 +148,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         Playlist.Files.Clear();
         Playlist.AddFiles(siblings.Count > 0 ? siblings : new[] { path });
+        OpenFile(path);
+    }
+
+    /// <summary>アプリ未起動の状態から動画ファイルを1件開いて起動する場合の入口。
+    /// 同じフォルダの他ファイルは自動追加せず、渡された1件だけのプレイリストにする。</summary>
+    public void OpenSingleFile(string path)
+    {
+        Playlist.Files.Clear();
+        Playlist.AddFiles(new[] { path });
         OpenFile(path);
     }
 
