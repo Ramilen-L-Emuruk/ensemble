@@ -97,9 +97,11 @@ public partial class MainWindow : Window
             // 案Y: 映像子ウィンドウが airspace で最前面になり OSD が隠れるため、透過オーバーレイを
             // その上に重ねて追従表示する（段階2-2a）。VideoHost のサイズ・ウィンドウ位置・状態変化で再配置する。
             _overlay = new AirspaceOverlayWindow { Owner = this, DataContext = _vm };
-            // フルスクリーン中はオーバーレイが前面に来るため、万一オーバーレイ側にキーが渡っても
-            // 本ウィンドウのショートカット処理へ転送してキー操作を失わないようにする
-            _overlay.KeyDown += Window_KeyDown;
+            // フルスクリーン中は下部オーバーレイ（シークバー）がマウス入力を受けるため、その上へ
+            // ファイルをドロップされても開けるよう、本ウィンドウと同じ処理へ委譲する
+            _overlay.AllowDrop = true;
+            _overlay.DragOver += Window_DragOver;
+            _overlay.Drop += Window_Drop;
             LocationChanged += (_, _) => UpdateOverlayBounds();
             StateChanged += (_, _) => UpdateOverlayBounds();
             UpdateOverlayBounds();
@@ -220,8 +222,8 @@ public partial class MainWindow : Window
     }
 
     // 映像アスペクト比を維持したレターボックス矩形（VideoArea 内での表示サイズ）を求める。
-    // VideoHost（GPU 経路の子ウィンドウ）と VideoImage（CPU 経路の Stretch=Uniform）はどちらも
-    // この矩形に映像を出すため、オーバーレイの追従先計算（UpdateOverlayBounds）と共通で使う。
+    // GPU 経路の VideoHost（子ウィンドウ）をこの矩形に合わせることで映像の歪みを防ぐ
+    // （CPU 経路の VideoImage は Stretch=Uniform が同じ矩形を自前で算出する）。
     private static void ComputeLetterbox(double areaW, double areaH, int videoW, int videoH,
         out double rectW, out double rectH)
     {
@@ -241,37 +243,33 @@ public partial class MainWindow : Window
         }
     }
 
-    // 透過オーバーレイ（AirspaceOverlayWindow）を映像の実表示矩形（レターボックス）のスクリーン座標・サイズへ
-    // 追従させる（段階2-2a）。GPU 経路の VideoHost / CPU 経路の VideoImage はどちらも VideoArea 内の中央
-    // レターボックス矩形に映像を出すため、VideoHost ではなく VideoArea を基準に算出する。
-    // （CPU 経路では VideoHost が Collapsed で ActualWidth=0 になるため、VideoHost 基準だとオーバーレイが常に隠れてしまう）
+    // 透過オーバーレイ（AirspaceOverlayWindow）を映像領域（VideoArea）のスクリーン座標・サイズへ追従させる（段階2-2a）。
+    // 映像そのものの矩形（レターボックス）ではなく VideoArea 全域に合わせるのは、フルスクリーン時の下部シークバーを
+    // 画面幅いっぱいに出すため（映像幅に合わせると、アスペクト比によっては通常時のシークバーより狭くなってしまう）。
+    // 黒帯部分に重なるのは透明な領域だけなので、見た目には影響しない。
+    // 基準を VideoHost にしないのは、CPU 経路では VideoHost が Collapsed で ActualWidth=0 になり、
+    // オーバーレイが常に隠れてしまうため。
     private void UpdateOverlayBounds()
     {
         if (_overlay == null) return;
         var source = PresentationSource.FromVisual(VideoArea);
         if (source == null) return;
 
-        var media = _vm.CurrentMedia;
         double areaW = VideoArea.ActualWidth;
         double areaH = VideoArea.ActualHeight;
-        if (media == null || media.Width <= 0 || media.Height <= 0 || areaW <= 0 || areaH <= 0)
+        if (_vm.CurrentMedia == null || areaW <= 0 || areaH <= 0)
         {
             if (_overlay.IsVisible) _overlay.Hide();
             return;
         }
 
-        // 映像の実表示矩形を VideoArea 内で算出し、中央配置（VideoHost/VideoImage とも中央寄せ）のオフセットを求める。
-        ComputeLetterbox(areaW, areaH, media.Width, media.Height, out double rectW, out double rectH);
-        double offsetX = (areaW - rectW) / 2.0;
-        double offsetY = (areaH - rectH) / 2.0;
-
         // PointToScreen はデバイスピクセル、Window.Left/Top はデバイス非依存単位のため DPI 変換する
-        Point deviceTopLeft = VideoArea.PointToScreen(new Point(offsetX, offsetY));
+        Point deviceTopLeft = VideoArea.PointToScreen(new Point(0, 0));
         Point dipTopLeft = source.CompositionTarget.TransformFromDevice.Transform(deviceTopLeft);
         _overlay.Left = dipTopLeft.X;
         _overlay.Top = dipTopLeft.Y;
-        _overlay.Width = rectW;
-        _overlay.Height = rectH;
+        _overlay.Width = areaW;
+        _overlay.Height = areaH;
         if (!_overlay.IsVisible) _overlay.Show();
     }
 
