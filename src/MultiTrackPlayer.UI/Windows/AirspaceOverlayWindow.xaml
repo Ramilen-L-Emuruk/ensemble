@@ -9,8 +9,8 @@
     <Window.Resources>
         <ui:EmptyStringToVisibilityConverter x:Key="EmptyStringToVis"/>
     </Window.Resources>
-    <!-- RootGrid の Background は SetClickThrough で付け外しする。クリックスルー時は null（下へ透過）、
-         フルスクリーン時は Transparent（透明でも全面でマウス移動を拾えるようにする）。 -->
+    <!-- RootGrid に背景は敷かない。敷くとフルスクリーン中にウィンドウ全面が入力を受けるようになり、
+         このウィンドウはアクティブ化しないため、アプリを前面に戻すクリックまで吸ってしまう。 -->
     <Grid x:Name="RootGrid">
         <!-- 操作 OSD: 案Y では映像子ウィンドウ（VideoHwndHost）が airspace で最前面になり本来の
              Grid 内オーバーレイが隠れるため、この透過オーバーレイ側で表示する（段階2-2a）。
