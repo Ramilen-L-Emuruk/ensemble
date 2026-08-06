@@ -4,7 +4,7 @@ MultiTrackPlayer（マルチトラック対応 Windows 動画プレイヤー）�
 
 ## プロジェクト概要
 
-- C# + WPF (.NET 6) 製の Windows 動画プレイヤー。
+- C# + WPF (.NET 10) 製の Windows 動画プレイヤー。
 - 映像エンジン: Sdcb.FFmpeg（D3D11VA ハードウェアデコード対応）。
 - 音声: NAudio (WASAPI)。マルチトラック音声の同時再生・個別音量制御に対応。
 - MVVM: CommunityToolkit.Mvvm。
@@ -52,11 +52,11 @@ MultiTrackPlayer（マルチトラック対応 Windows 動画プレイヤー）�
   - **実行 exe の path**: 必ず絶対パスで連携する（相対パスだと、どのワークツリー／チェックアウトの exe か伝わらず、古い exe を誤って実行される事故につながる）。コピーしやすいよう独立したコードブロックで示す。
     - Debug ビルド例:
       ```
-      D:\Documents\002.dev\ensemble\.claude\worktrees\<name>\src\MultiTrackPlayer.UI\bin\Debug\net6.0-windows\MultiTrackPlayer.UI.exe
+      D:\Documents\002.dev\ensemble\.claude\worktrees\<name>\src\MultiTrackPlayer.UI\bin\Debug\net10.0-windows\MultiTrackPlayer.UI.exe
       ```
     - Release ビルド例:
       ```
-      D:\Documents\002.dev\ensemble\.claude\worktrees\<name>\src\MultiTrackPlayer.UI\bin\Release\net6.0-windows\MultiTrackPlayer.UI.exe
+      D:\Documents\002.dev\ensemble\.claude\worktrees\<name>\src\MultiTrackPlayer.UI\bin\Release\net10.0-windows\MultiTrackPlayer.UI.exe
       ```
   - **確認してほしい手順**: 何を・どう操作すると・どうなれば正常かを具体的な操作ステップで示す（曖昧に「動作確認してください」で済ませない）
   - ユーザーからの確認結果（動いた／動かなかった）を待ってから次のステップ（コミット前確認）に進む
@@ -121,7 +121,7 @@ MultiTrackPlayer（マルチトラック対応 Windows 動画プレイヤー）�
 dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o publish
 ```
 
-- 出力先はリポジトリルート直下の `publish/` に固定する（`-o publish`）。`bin/Release/net6.0-windows/...` のようなバージョン・ランタイム別のネストしたパスには出力しない。
+- 出力先はリポジトリルート直下の `publish/` に固定する（`-o publish`）。`bin/Release/net10.0-windows/...` のようなバージョン・ランタイム別のネストしたパスには出力しない。
 - `publish/` は `.gitignore` 済み（コミット対象外）。GitHub Release は作られない（ローカル確認専用）。
 - リリースを伴わずローカルの発行物だけ欲しい場合も、同じコマンドをそのまま使ってよい。
 
