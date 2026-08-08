@@ -25,6 +25,9 @@ public readonly record struct ColorInfo(bool IsBt709, bool IsFullRange)
 /// enumerator / processor は入出力サイズ確定時（初回・サイズ変化時）に生成する。入力 InputView は
 /// ArraySlice（=サブリソース番号）ごとにキャッシュし、入力テクスチャのポインタが変わったらキャッシュを破棄する。
 ///
+/// HW デコード出力テクスチャはコーデックのアライメントに切り上げたサイズで確保されるため、実映像より
+/// 大きいことがある。processor 生成時にソース矩形を実映像サイズへ固定して、パディング領域を切り落とす。
+///
 /// スレッド契約: <see cref="ConvertInto"/> は単一のデコードスレッドから呼ぶ前提（内部にロックは持たない）。
 /// 生成・<see cref="Dispose"/> は所有者（<c>MediaEngine</c>）のスレッドで行い、デコードスレッドの開始前の生成・
 /// Join 後の破棄という happens-before で安全性を担保する（ConvertInto を呼ぶスレッドとは別スレッド）。
@@ -64,8 +67,8 @@ public sealed class GpuFrameConverter : IDisposable
     /// </summary>
     /// <param name="inputTexturePtr">HW デコード出力の <see cref="ID3D11Texture2D"/> の生ポインタ（AVFrame.data[0]）。</param>
     /// <param name="subResourceIndex">テクスチャ配列内の ArraySlice 番号（AVFrame.data[1]）。</param>
-    /// <param name="width">動画の幅。</param>
-    /// <param name="height">動画の高さ。</param>
+    /// <param name="width">動画の幅（入力テクスチャから切り出すソース矩形の幅も兼ねる）。</param>
+    /// <param name="height">動画の高さ（入力テクスチャから切り出すソース矩形の高さも兼ねる）。</param>
     /// <param name="color">入力の色空間。</param>
     /// <param name="ring">出力先リング。</param>
     /// <param name="slotIndex">出力先スロット。</param>
@@ -127,7 +130,18 @@ public sealed class GpuFrameConverter : IDisposable
         _height = height;
         _lastColor = null; // processor 再生成後は色空間を再設定させる。
 
-        DiagnosticLog.Write("gpuConvert", $"VideoProcessor 生成 size={width}x{height}");
+        // HW デコード出力テクスチャは、コーデックが要求するアライメントへ切り上げたサイズで確保される
+        // （FFmpeg の D3D11VA は AV1/HEVC で 128 アライメント。1080p なら実体は 1920x1152）。
+        // VideoProcessorBlt の既定のソース矩形は「入力サーフェス全体」なので、指定しないとパディング行まで
+        // 変換対象になり、下端に帯が出た上に映像が縦へ圧縮される。実映像の矩形を明示して切り出す。
+        // 出力先はちょうど width x height なので DestRect は既定と同じ値だが、ドライバ既定に依存しないよう明示する。
+        // これらは processor のストリーム状態として永続するため、Blt ごとではなく生成時に一度だけ設定すればよい。
+        var frameRect = new Vortice.RawRect(0, 0, width, height);
+        var videoContext = _gpu.VideoContext!;
+        videoContext.VideoProcessorSetStreamSourceRect(_processor, streamIndex: 0, enable: true, frameRect);
+        videoContext.VideoProcessorSetStreamDestRect(_processor, streamIndex: 0, enable: true, frameRect);
+
+        DiagnosticLog.Write("gpuConvert", $"VideoProcessor 生成 size={width}x{height}（source/dest rect を実映像サイズへ固定）");
     }
 
     private ID3D11VideoProcessorInputView GetOrCreateInputView(IntPtr inputTexturePtr, uint arraySlice)
@@ -140,6 +154,13 @@ public sealed class GpuFrameConverter : IDisposable
             _inputTexture = new ID3D11Texture2D(inputTexturePtr);
             Marshal.AddRef(inputTexturePtr);
             _inputTexturePtr = inputTexturePtr;
+
+            // 実テクスチャはアライメント切り上げで映像サイズより大きいことがある（AV1 1080p なら 1920x1152）。
+            // ソース矩形でどれだけ切り落としているかを実測で追えるよう、テクスチャ差し替え時に一度だけ残す。
+            var texDesc = _inputTexture.Description;
+            DiagnosticLog.Write("gpuConvert",
+                $"入力テクスチャ {texDesc.Width}x{texDesc.Height} / 映像 {_width}x{_height}" +
+                $"（差分は HW デコーダのアライメント padding。ソース矩形で除外する）");
         }
 
         if (_inputViews.TryGetValue(arraySlice, out var cached))
