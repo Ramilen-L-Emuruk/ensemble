@@ -19,7 +19,11 @@ Desktop.ini
 .idea/
 
 # Claude directories
-.claude/
+# rules/ だけは共有したいので追跡対象に残す。
+# `.claude/` とディレクトリごと除外すると配下の否定（!）が効かなくなるため
+# `.claude/*` と書いている。
+.claude/*
+!.claude/rules/
 
 # Release output
 publish/
