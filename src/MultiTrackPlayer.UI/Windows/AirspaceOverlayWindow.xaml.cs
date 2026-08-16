@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Input;
@@ -61,7 +61,7 @@ public partial class AirspaceOverlayWindow : Window
         FullscreenSeekBar.Seeking += (_, ratio) =>
         {
             if (DataContext is MainViewModel vm)
-                vm.Engine.Seek(TimeSpan.FromSeconds(ratio * vm.Duration.TotalSeconds));
+                vm.SeekTo(TimeSpan.FromSeconds(ratio * vm.Duration.TotalSeconds));
         };
 
         PreviewMouseUp += (_, _) => RestoreOwnerFocus();

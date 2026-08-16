@@ -1,4 +1,4 @@
-using MultiTrackPlayer.Core.Enums;
+﻿using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.Core.Interfaces;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Audio;
@@ -104,10 +104,15 @@ public unsafe class MediaEngine : IMediaEngine
     public event EventHandler? PlaybackEnded;
     public event EventHandler<PlaybackStatistics>? StatisticsUpdated;
 
+    /// <summary>動画ファイルを開き、トラック・チャプター情報の構築と音声出力の準備までを行う。</summary>
+    /// <exception cref="Exception">
+    /// ファイルオープン・ストリーム解析・デコーダ初期化・音声出力初期化のいずれかが失敗した場合。
+    /// FFmpeg / NAudio 由来の例外がそのまま伝播することがあるため型は限定されない。
+    /// 失敗した場合、このインスタンスはファイルを開く前の状態へ巻き戻される。
+    /// </exception>
     public void Open(string filePath)
     {
-        Stop();
-        DisposeDecoders();
+        Close();
 
         fixed (AVFormatContext** fmtCtxPtr = &_fmtCtx)
         {
@@ -119,7 +124,43 @@ public unsafe class MediaEngine : IMediaEngine
                 throw new InvalidOperationException($"Cannot open file: {filePath} (ret={ret}: {err})");
             }
         }
-        avformat_find_stream_info(_fmtCtx, null);
+
+        try
+        {
+            LoadStreamsAndSetupAudio(filePath);
+        }
+        catch
+        {
+            // 途中まで構築したデコーダ・フォーマットコンテキストを残すと、次の Open や Dispose が
+            // 中途半端な状態を触ることになる。呼び出し元へ投げ直す前に完全に巻き戻す。
+            // 巻き戻し中の二次例外で本来の原因が消えないよう、そちらは捕まえて記録するに留める
+            try { DisposeDecoders(); }
+            catch (Exception cleanupEx)
+            {
+                DiagnosticLog.WriteFatal("error", $"ファイルオープン失敗後の巻き戻しで二次例外: {cleanupEx}");
+            }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 開いているファイルを閉じ、デコーダ・音声出力・フォーマットコンテキストを解放して
+    /// 「何も開いていない」状態へ戻す。オープンの途中で失敗した場合の後始末にも使う。
+    /// </summary>
+    public void Close()
+    {
+        Stop();
+        DisposeDecoders();
+    }
+
+    private void LoadStreamsAndSetupAudio(string filePath)
+    {
+        // 情報が不完全でも再生自体は試みる価値があるため続行するが、後段の症状（トラックが出ない・
+        // 尺が 0 になる等）の原因になるので記録は残す
+        int infoRet = avformat_find_stream_info(_fmtCtx, null);
+        if (infoRet < 0)
+            DiagnosticLog.Write("error",
+                $"ストリーム情報の取得に失敗（得られた情報のまま続行） path={filePath} ret={infoRet} ({FFmpegError.Describe(infoRet)})");
 
         var audioTracks = new List<AudioTrackInfo>();
         var chapters = new List<ChapterInfo>();
@@ -184,7 +225,9 @@ public unsafe class MediaEngine : IMediaEngine
             chapters.Add(new ChapterInfo(i, title, TimeSpan.FromSeconds(startSec), IsUserDefined: false));
         }
 
-        var userChapters = UserChapterStore.Load(filePath, chapters.Count);
+        var userChapters = UserChapterStore.Load(filePath, chapters.Count, out string? chapterLoadError);
+        if (chapterLoadError != null)
+            DiagnosticLog.WriteFatal("chapter", $"保存済みチャプターを読めなかった（.bak へ退避した）: {chapterLoadError}");
         chapters.AddRange(userChapters);
         chapters = chapters.OrderBy(c => c.StartTime).ToList();
         _chapters = chapters.Select((c, idx) => c with { Index = idx }).ToList();
@@ -262,8 +305,22 @@ public unsafe class MediaEngine : IMediaEngine
         }
 
         int wasapiLatencyMs = 100;
-        _wasapiOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, wasapiLatencyMs);
-        _wasapiOut.Init(_mixer);
+        try
+        {
+            _wasapiOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, wasapiLatencyMs);
+            _wasapiOut.Init(_mixer);
+        }
+        catch (Exception ex)
+        {
+            // 既定の出力デバイスなし・Windows Audio サービス停止・RDP で音声リダイレクト無効、
+            // といった環境で失敗する。再生位置クロックが音声出力を基準にしている都合上、
+            // 音声なしでの再生は現状成立しないため、ここで意味のあるメッセージにして中断する
+            DiagnosticLog.Write("error", $"音声出力デバイスの初期化に失敗: {ex}");
+            _wasapiOut?.Dispose();
+            _wasapiOut = null;
+            throw new InvalidOperationException(
+                "音声出力デバイスを初期化できませんでした。既定の再生デバイスが利用可能か確認してください。", ex);
+        }
 
         _clock.Reset();
         _positionSource = new WasapiPositionSource(
@@ -293,23 +350,39 @@ public unsafe class MediaEngine : IMediaEngine
         _lastPullTimestamp = Stopwatch.GetTimestamp();
         DiagnosticLog.Write("engine", $"Play wasStopped={wasStopped}");
         ReleaseHeldFrame();
-        EnsurePipelineStarted();
-        if (wasStopped)
+        try
         {
-            // 新規再生の開始点で提示統計をリセットし、この再生1本ごとのドロップ率を UI に表示する（性能検証・実運用の可視性）。
-            _droppedFrames = 0;
-            _displayedFrames = 0;
-            RequestAnchor(0.0);
+            EnsurePipelineStarted();
+            if (wasStopped)
+            {
+                // 新規再生の開始点で提示統計をリセットし、この再生1本ごとのドロップ率を UI に表示する（性能検証・実運用の可視性）。
+                _droppedFrames = 0;
+                _displayedFrames = 0;
+                RequestAnchor(0.0);
+            }
+            // 音声出力の開始に失敗すると audio-master クロックが進まず再生が成立しないため、
+            // ここも巻き戻しの対象に含める（呼び出し元は「失敗＝再生していない」と扱うため）
+            _wasapiOut?.Play();
         }
-        _wasapiOut?.Play();
+        catch
+        {
+            // ここで巻き戻さないと _state=Playing・_demuxThread が非 null のまま残り、
+            // 以後 Play() は先頭の早期 return で、EnsurePipelineStarted は再入ガードで
+            // それぞれ素通りしてしまい、アプリを再起動するまで再生できなくなる
+            _state = CorePlaybackState.Stopped;
+            TeardownPipeline();
+            throw;
+        }
     }
 
     public void Pause()
     {
         if (_state != CorePlaybackState.Playing) return;
+        // ネイティブ呼び出しを先に済ませてから状態を確定する。逆順にすると、失敗して例外が出たときに
+        // 呼び出し元は「失敗＝状態は変わっていない」と扱うのに、Engine 内部だけ Paused へ進んでしまう
+        _wasapiOut?.Pause();
         _state = CorePlaybackState.Paused;
         DiagnosticLog.Write("engine", $"Pause pos={Position.TotalSeconds:F3}");
-        _wasapiOut?.Pause();
     }
 
     public void Stop()
@@ -317,7 +390,10 @@ public unsafe class MediaEngine : IMediaEngine
         ReleaseHeldFrame();
         TeardownPipeline();
         _state = CorePlaybackState.Stopped;
-        _wasapiOut?.Stop();
+        // ここまで来るとパイプラインは畳み終わっていて後戻りできない。
+        // 音声デバイス側の停止に失敗しても停止状態として扱い、記録だけ残す
+        try { _wasapiOut?.Stop(); }
+        catch (Exception ex) { DiagnosticLog.WriteFatal("engine", $"音声出力の停止に失敗: {ex}"); }
         foreach (var s in _audioStates) s.Buffer.ClearBuffer();
         _clock.Reset();
         _positionSource?.Reset();
@@ -549,16 +625,23 @@ public unsafe class MediaEngine : IMediaEngine
     {
         _chapters.Add(chapter);
         _chapters = _chapters.OrderBy(c => c.StartTime).Select((c, i) => c with { Index = i }).ToList();
-        if (_currentMedia != null)
-            UserChapterStore.Save(_currentMedia.FilePath, _chapters);
+        SaveUserChapters();
     }
 
     public void RemoveUserChapter(ChapterInfo chapter)
     {
         _chapters.Remove(chapter);
         _chapters = _chapters.Select((c, i) => c with { Index = i }).ToList();
-        if (_currentMedia != null)
-            UserChapterStore.Save(_currentMedia.FilePath, _chapters);
+        SaveUserChapters();
+    }
+
+    // 保存に失敗しても再生は続けるが、無言だと「編集したのに次回消えている」原因が追えない。
+    // デバッグモードが無効でも残るよう WriteFatal で記録する
+    private void SaveUserChapters()
+    {
+        if (_currentMedia == null) return;
+        if (!UserChapterStore.Save(_currentMedia.FilePath, _chapters, out string? error))
+            DiagnosticLog.WriteFatal("chapter", $"チャプターの保存に失敗: {error}");
     }
 
     public ChapterInfo? FindUserChapterNear(TimeSpan position, TimeSpan tolerance)
@@ -572,8 +655,7 @@ public unsafe class MediaEngine : IMediaEngine
         var idx = _chapters.IndexOf(chapter);
         if (idx < 0) return;
         _chapters[idx] = chapter with { Title = newTitle };
-        if (_currentMedia != null)
-            UserChapterStore.Save(_currentMedia.FilePath, _chapters);
+        SaveUserChapters();
     }
 
     // ── パイプライン構築・分解 ──
@@ -972,12 +1054,14 @@ public unsafe class MediaEngine : IMediaEngine
         _positionSource = null;
         if (_fmtCtx != null) { fixed (AVFormatContext** p = &_fmtCtx) avformat_close_input(p); }
         _fmtCtx = null;
+        // 破棄後に CurrentMedia が残っていると、閉じたはずのメディアのパスを使う処理
+        // （既定ミュートの保存など）が成立してしまう
+        _currentMedia = null;
     }
 
     public void Dispose()
     {
-        Stop();
-        DisposeDecoders();
+        Close();
         // 共有 HW デバイスコンテキストを解放する。内部で共有 D3D11 デバイスを Release するため、デバイス破棄より先に行う。
         if (_sharedHwDeviceCtx != null)
         {

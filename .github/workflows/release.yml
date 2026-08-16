@@ -21,17 +21,32 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
+      # タグ名・手動入力はいずれも外部から与えられる文字列なので、スクリプト本文へ直接展開せず
+      # 環境変数を経由して渡す（本文に埋め込むと、タグ名に含まれる引用符でスクリプトを脱出され、
+      # contents:write を持つランナー上で任意コードを実行できてしまう）。
+      # 併せて、MSBuild が受け付けるバージョン形式かをここで検証する（不正なら publish 直前ではなく即座に失敗させる）。
       - name: Determine version
         id: version
         shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if ("${{ github.event_name }}" -eq "push") {
-            $version = "${{ github.ref_name }}" -replace '^v', ''
-            $tagName = "${{ github.ref_name }}"
+          if ($env:EVENT_NAME -eq "push") {
+            $version = $env:REF_NAME -replace '^v', ''
+            $tagName = $env:REF_NAME
           } else {
-            $version = "${{ github.event.inputs.version }}"
+            $version = $env:INPUT_VERSION -replace '^v', ''
             $tagName = "v$version"
+          }
+          # \A と \z を使う（.NET の $ は末尾の改行 1 文字を許容してしまうため）
+          if ($version -notmatch '\A\d+\.\d+\.\d+(-[0-9A-Za-z][0-9A-Za-z.-]*)?\z') {
+            Write-Error "バージョン '$version' の形式が不正です（期待する形式: X.Y.Z もしくは X.Y.Z-prerelease）"
+            exit 1
           }
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag_name=$tagName" >> $env:GITHUB_OUTPUT
@@ -45,11 +60,21 @@ jobs:
         run: dotnet restore src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj
 
       - name: Publish
-        run: dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o publish /p:Version=${{ steps.version.outputs.version }}
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o publish "/p:Version=$env:VERSION"
 
+      # 配布 zip の改ざんを利用者が検知できるよう SHA-256 を併せて公開する
       - name: Create archive
         shell: pwsh
-        run: Compress-Archive -Path publish/* -DestinationPath "MultiTrackPlayer-${{ steps.version.outputs.version }}-win-x64.zip"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $zipName = "MultiTrackPlayer-$env:VERSION-win-x64.zip"
+          Compress-Archive -Path publish/* -DestinationPath $zipName
+          $hash = (Get-FileHash -Path $zipName -Algorithm SHA256).Hash
+          "$hash  $zipName" | Out-File -FilePath "$zipName.sha256" -Encoding ascii
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -57,4 +82,6 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag_name }}
           name: ${{ steps.version.outputs.tag_name }}
           generate_release_notes: true
-          files: MultiTrackPlayer-*.zip
+          files: |
+            MultiTrackPlayer-*.zip
+            MultiTrackPlayer-*.zip.sha256

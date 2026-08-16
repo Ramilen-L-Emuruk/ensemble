@@ -31,16 +31,29 @@ public sealed unsafe class AudioDecodeThread
     private bool _anchorNotifyPending;
     private double _anchorTarget;
 
+    // 異常が続くと毎フレーム記録されてログが埋まるため、トラックごとに最初の 1 回だけ残す
+    private readonly bool[] _resampleFailureLogged;
+    private readonly bool[] _sendPacketFailureLogged;
+
+    /// <exception cref="ArgumentException">decoders と states の件数が一致しない場合。</exception>
     public AudioDecodeThread(
         IReadOnlyList<AudioDecoder> decoders, IReadOnlyList<AudioTrackState> states,
         AudioPacketQueue queue, Func<double> getPtsSyncOffset,
         Action<double>? onFirstSamplesAfterFlush = null)
     {
+        // 両者は常に同じトラック番号で添字アクセスされる。不一致のまま走らせると
+        // デコード中に IndexOutOfRangeException となりスレッドごと停止する
+        if (decoders.Count != states.Count)
+            throw new ArgumentException(
+                $"デコーダ数（{decoders.Count}）とトラック状態数（{states.Count}）が一致しない", nameof(states));
+
         _decoders = decoders;
         _states = states;
         _queue = queue;
         _getPtsSyncOffset = getPtsSyncOffset;
         _onFirstSamplesAfterFlush = onFirstSamplesAfterFlush;
+        _resampleFailureLogged = new bool[decoders.Count];
+        _sendPacketFailureLogged = new bool[decoders.Count];
     }
 
     /// <summary>
@@ -83,10 +96,47 @@ public sealed unsafe class AudioDecodeThread
                 }
             }
         }
+        catch (Exception ex)
+        {
+            // VideoDecodeThread.Run と同じ理由（そちらのコメント参照）。.NET では非 UI スレッドの
+            // 未処理例外がプロセス即終了に直結するため、音声 1 トラックの障害でアプリ全体を巻き込まない。
+            // デバッグモードが無効でも原因を追えるよう WriteFatal で残す。
+            Diagnostics.DiagnosticLog.WriteFatal("audio", $"音声デコードスレッド異常終了（以降の音声は出力されない）: {ex}");
+            AbandonAudioPipeline();
+        }
         finally
         {
             av_frame_free(&frame);
         }
+    }
+
+    /// <summary>
+    /// このスレッドが異常終了したあと、再生全体が固まらないように音声側を畳む。
+    /// ここを怠ると次の 2 つの経路で映像ごと停止する:
+    /// ・IsEof が false のままバッファが空になったトラックがあると、ミキサーの共通利用可能量が 0 に
+    ///   固定され、健全なトラックまで無音になったうえクロックが進まなくなる
+    /// ・誰も Get() しなくなったキューがやがて満杯になり、映像と音声を同一スレッドで読む
+    ///   DemuxThread が Put でブロックして映像の供給まで止まる
+    /// </summary>
+    private void AbandonAudioPipeline()
+    {
+        try
+        {
+            foreach (var state in _states) state.IsEof = true;
+            _queue.Close();
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.DiagnosticLog.WriteFatal("audio", $"音声パイプラインの後始末に失敗: {ex}");
+        }
+    }
+
+    // 同じ異常が毎フレーム続いてもログが埋まらないよう、トラックごとに最初の 1 回だけ記録する
+    private static void LogOnce(bool[] logged, int trackIndex, string message)
+    {
+        if (trackIndex < 0 || trackIndex >= logged.Length || logged[trackIndex]) return;
+        logged[trackIndex] = true;
+        Diagnostics.DiagnosticLog.Write("audio", message);
     }
 
     private void HandleFlush(int serial)
@@ -127,15 +177,24 @@ public sealed unsafe class AudioDecodeThread
             {
                 var pcm = _decoders[i].ResampleFrame(frame);
                 if (pcm != null) AddWithGate(i, pcm, 0, pcm.Length);
+                else LogOnce(_resampleFailureLogged, i, $"EOF ドレイン中のリサンプルに失敗 track={i}");
                 av_frame_unref(frame);
             }
+            // デコードエラーで抜けた場合も EOF として扱う。ここを立てないと、
+            // ミキサーの ComputeCommonAvailableBytes がこのトラックを除外できず
+            // 健全な他トラックまで巻き込んで無音になる
             _states[i].IsEof = true;
         }
     }
 
     private void HandlePacket(int trackIndex, AVPacket* pkt, AVFrame* frame)
     {
-        if (trackIndex < 0 || trackIndex >= _decoders.Count) return;
+        if (trackIndex < 0 || trackIndex >= _decoders.Count)
+        {
+            Diagnostics.DiagnosticLog.Write("audio",
+                $"範囲外のトラック番号のパケットを破棄 trackIndex={trackIndex} decoderCount={_decoders.Count}");
+            return;
+        }
         var decoder = _decoders[trackIndex];
 
         int ret = decoder.SendPacket(pkt);
@@ -144,6 +203,10 @@ public sealed unsafe class AudioDecodeThread
             DrainInto(trackIndex, decoder, frame);
             ret = decoder.SendPacket(pkt);
         }
+        // TryReceiveFrame 側は失敗をログするのに SendPacket だけ無言だと、
+        // 特定トラックが無音になったときに手がかりが残らない
+        if (ret < 0)
+            LogOnce(_sendPacketFailureLogged, trackIndex, $"SendPacket が失敗 track={trackIndex} ret={ret}");
         DrainInto(trackIndex, decoder, frame);
     }
 
@@ -163,6 +226,7 @@ public sealed unsafe class AudioDecodeThread
 
         var pcm = decoder.ResampleFrame(frame);
         if (pcm != null) AddWithGate(trackIndex, pcm, 0, pcm.Length);
+        else LogOnce(_resampleFailureLogged, trackIndex, $"リサンプルに失敗（このトラックは無音になる） track={trackIndex}");
     }
 
     /// <summary>true を返した場合、通常のリサンプル＋追加はスキップ済み（preroll 側で処理を終えている）。</summary>
@@ -188,6 +252,11 @@ public sealed unsafe class AudioDecodeThread
                     int skip = Math.Min(action.SkipByteCount, pcm.Length);
                     if (skip < pcm.Length)
                         AddWithGate(trackIndex, pcm, skip, pcm.Length - skip);
+                    else
+                        // PrerollCalculator の見積もりと swr_convert の実出力長は一致する保証がないため、
+                        // skip がフレーム長以上になると実質 DropAll になる。無言で消さず記録する
+                        Diagnostics.DiagnosticLog.Write("audio",
+                            $"preroll の skip 量がフレーム長以上のため全破棄 track={trackIndex} skip={action.SkipByteCount} len={pcm.Length}");
                 }
                 _prerollActive = false;
                 return true;
