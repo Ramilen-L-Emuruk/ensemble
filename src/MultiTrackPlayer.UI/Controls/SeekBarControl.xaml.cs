@@ -154,6 +154,11 @@ public partial class SeekBarControl : UserControl
         double w = TrackCanvas.ActualWidth;
         if (w <= 0) return;
         double ratio = Math.Clamp(x / w, 0, 1);
+        // PositionRatio の代入は「つまみを指の位置へ即座に追従させる」ための見た目の更新。
+        // 実際のシーク要求は Seeking イベントだけが担う（ViewModel 側の値変更からは
+        // シークを起こさない。両方から起こすと 1 操作で 2 回シークが走る）。
+        // なおバインドは TwoWay のままにしておくこと。OneWay にすると、この直接代入で
+        // バインド自体が解除され、以後の再生位置がシークバーへ反映されなくなる
         PositionRatio = ratio;
         Seeking?.Invoke(this, ratio);
         UpdateVisuals();

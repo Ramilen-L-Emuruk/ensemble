@@ -32,6 +32,10 @@ public sealed unsafe class AudioDecodeThread
     private double _anchorTarget;
 
     // 異常が続くと毎フレーム記録されてログが埋まるため、トラックごとに最初の 1 回だけ残す
+    /// <summary>最後に処理した Flush 番兵の世代。キューの Serial と一致していればシークに追いついている。</summary>
+    public int HandledSerial => _handledSerial;
+    private volatile int _handledSerial;
+
     private readonly bool[] _resampleFailureLogged;
     private readonly bool[] _sendPacketFailureLogged;
 
@@ -141,6 +145,8 @@ public sealed unsafe class AudioDecodeThread
 
     private void HandleFlush(int serial)
     {
+        // キューの Serial と突き合わせて「このスレッドがシークに追いついたか」を外から判断できるようにする
+        _handledSerial = serial;
         for (int i = 0; i < _decoders.Count; i++)
         {
             _decoders[i].FlushBuffers();
@@ -170,6 +176,17 @@ public sealed unsafe class AudioDecodeThread
 
     private void HandleEof(AVFrame* frame)
     {
+        // プリロール中のまま終端に達すると完了通知が出ず、ミキサーの出力保留が解けない
+        if (_prerollActive)
+        {
+            _prerollActive = false;
+            _anchorNotifyPending = false;
+            if (_queue.Serial == _prerollSerial)
+            {
+                Diagnostics.DiagnosticLog.Write("audio", $"EOF 到達のためプリロールを完了扱いにする target={_prerollTarget:F3}");
+                _onFirstSamplesAfterFlush?.Invoke(_prerollTarget);
+            }
+        }
         for (int i = 0; i < _decoders.Count; i++)
         {
             _decoders[i].SendPacket(null);

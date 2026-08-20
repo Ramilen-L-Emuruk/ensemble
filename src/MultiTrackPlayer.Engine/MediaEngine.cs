@@ -75,7 +75,12 @@ public unsafe class MediaEngine : IMediaEngine
     private volatile bool _audioPrerollReady = true;
 
     private MediaInfo? _currentMedia;
-    private CorePlaybackState _state = CorePlaybackState.Stopped;
+    // SetState 以外からも素の読み取りが多数あるため volatile にする（書き込みは _stateLock で直列化）
+    private volatile CorePlaybackState _state = CorePlaybackState.Stopped;
+    private readonly object _stateLock = new();
+    // 停止時に読み取り位置を巻き戻せなかった（スレッドが止まりきらなかった）ことを覚えておく。
+    // このまま次の再生に入ると、実際の内容は停止位置からなのに表示だけ 0 秒から進んでしまう
+    private bool _rewindSkipped;
     private double _playbackSpeed = 1.0;
     private List<ChapterInfo> _chapters = new();
     // 映像の1フレーム時間（秒）: due 判定・プリロール猶予・フレームドロップ閾値に使用
@@ -85,6 +90,8 @@ public unsafe class MediaEngine : IMediaEngine
     private int _displayedFrames;
 
     public MediaInfo? CurrentMedia => _currentMedia;
+    /// <summary>現在の再生状態。UI 側はこの値を唯一の情報源として表示すること。</summary>
+    /// <remarks>読み取りは volatile で足りる。書き込みだけ <c>_stateLock</c> で直列化している。</remarks>
     public CorePlaybackState State => _state;
     public double PlaybackSpeed => _playbackSpeed;
 
@@ -99,6 +106,28 @@ public unsafe class MediaEngine : IMediaEngine
 
     private double GetMasterClockSeconds()
         => _positionSource == null ? 0.0 : _clock.PositionAt(_positionSource.GetPositionFrames());
+
+    /// <summary>
+    /// 再生状態が変化したときに発火する。UI スレッド以外（再生完了検出は状態タイマー＝
+    /// スレッドプール）からも発火するため、購読側でディスパッチャへ移すこと。
+    /// </summary>
+    public event EventHandler<CorePlaybackState>? StateChanged;
+
+    /// <summary>
+    /// 再生状態を変更する。状態の変更はすべてこのメソッドを通すこと。
+    /// UI 側が独自に状態を持って二重管理すると、「表示は再生中なのに実際は止まっている」類の
+    /// 不整合が生まれるため、変化を必ず外へ通知する。
+    /// </summary>
+    private void SetState(CorePlaybackState next)
+    {
+        lock (_stateLock)
+        {
+            if (_state == next) return;
+            _state = next;
+        }
+        DiagnosticLog.Write("engine", $"状態遷移 -> {next}");
+        StateChanged?.Invoke(this, next);
+    }
 
     public event EventHandler<TimeSpan>? PositionChanged;
     public event EventHandler? PlaybackEnded;
@@ -344,12 +373,20 @@ public unsafe class MediaEngine : IMediaEngine
         if (_fmtCtx == null) return;
         if (_state == CorePlaybackState.Playing) return;
         bool wasStopped = _state == CorePlaybackState.Stopped;
-        _state = CorePlaybackState.Playing;
+        SetState(CorePlaybackState.Playing);
         _playbackEndedFired = false;
         _lastFrameServedTicks = Environment.TickCount64;
         _lastPullTimestamp = Stopwatch.GetTimestamp();
         DiagnosticLog.Write("engine", $"Play wasStopped={wasStopped}");
         ReleaseHeldFrame();
+        // EOF に到達した状態から再生を押された場合、demux は最後まで読み終えて待機しているだけなので、
+        // 先頭へ巻き戻さないと何も起きない（「最後まで見た動画をもう一度再生できない」）
+        // 保留中のシーク要求があるなら、EofReached がまだ true でも「終端から再開」ではない
+        // （ユーザーがシークした直後に再生を押した場合。ここを見落とすと先頭へ強制的に戻してしまう）
+        bool restartFromEof = _demuxThread?.EofReached == true && IsSettledAfterSeek();
+        // パイプラインがまだ無い＝本当に停止状態からの新規開始。EOF で Stopped になった場合は
+        // パイプラインが生きたまま残る（CheckPlaybackEnded は畳まない）ので区別できる
+        bool pipelineWasFresh = _demuxThread == null;
         try
         {
             EnsurePipelineStarted();
@@ -358,7 +395,21 @@ public unsafe class MediaEngine : IMediaEngine
                 // 新規再生の開始点で提示統計をリセットし、この再生1本ごとのドロップ率を UI に表示する（性能検証・実運用の可視性）。
                 _droppedFrames = 0;
                 _displayedFrames = 0;
-                RequestAnchor(0.0);
+                // Seek は着地後の最初の音声サンプル投入時に錨を要求するため、こちらでは要求しない。
+                // 巻き戻せていない場合も Seek を使う（RequestAnchor(0.0) だと、実際の内容は
+                // 停止位置からなのに表示だけ 0 秒から進むという食い違いになる）
+                if (restartFromEof || _rewindSkipped)
+                {
+                    // 終端で音声出力を止めている間に実ハードウェア位置と書込カーソルが乖離し、
+                    // 位置ソースが実クロックからフォールバック（外挿）へ切り替わっていることがある。
+                    // Seek が先に表示用のガード（BeginSeek）を立てるので、その後で内部カウンタを戻す
+                    Seek(TimeSpan.Zero);
+                    _positionSource?.Reset();
+                    _rewindSkipped = false;
+                }
+                else if (pipelineWasFresh) RequestAnchor(0.0);
+                // 上記以外は「EOF 後に手動でシークしてから再生した」場合。そのシークが既に
+                // 正しい錨を張っているので、ここで 0 秒として上書きしてはいけない
             }
             // 音声出力の開始に失敗すると audio-master クロックが進まず再生が成立しないため、
             // ここも巻き戻しの対象に含める（呼び出し元は「失敗＝再生していない」と扱うため）
@@ -368,9 +419,11 @@ public unsafe class MediaEngine : IMediaEngine
         {
             // ここで巻き戻さないと _state=Playing・_demuxThread が非 null のまま残り、
             // 以後 Play() は先頭の早期 return で、EnsurePipelineStarted は再入ガードで
-            // それぞれ素通りしてしまい、アプリを再起動するまで再生できなくなる
-            _state = CorePlaybackState.Stopped;
-            TeardownPipeline();
+            // それぞれ素通りしてしまい、アプリを再起動するまで再生できなくなる。
+            // 後始末は Stop() と同じ扱いにする（片方だけ丁寧にすると、読み取り位置が
+            // 不明なまま次の再生に入って表示位置がずれる経路が残る）
+            SetState(CorePlaybackState.Stopped);
+            HandleTeardownResult(TeardownPipeline());
             throw;
         }
     }
@@ -381,15 +434,15 @@ public unsafe class MediaEngine : IMediaEngine
         // ネイティブ呼び出しを先に済ませてから状態を確定する。逆順にすると、失敗して例外が出たときに
         // 呼び出し元は「失敗＝状態は変わっていない」と扱うのに、Engine 内部だけ Paused へ進んでしまう
         _wasapiOut?.Pause();
-        _state = CorePlaybackState.Paused;
+        SetState(CorePlaybackState.Paused);
         DiagnosticLog.Write("engine", $"Pause pos={Position.TotalSeconds:F3}");
     }
 
     public void Stop()
     {
         ReleaseHeldFrame();
-        TeardownPipeline();
-        _state = CorePlaybackState.Stopped;
+        bool allThreadsStopped = TeardownPipeline();
+        SetState(CorePlaybackState.Stopped);
         // ここまで来るとパイプラインは畳み終わっていて後戻りできない。
         // 音声デバイス側の停止に失敗しても停止状態として扱い、記録だけ残す
         try { _wasapiOut?.Stop(); }
@@ -402,11 +455,53 @@ public unsafe class MediaEngine : IMediaEngine
         _videoPrerollReady = true;
         _audioPrerollReady = true;
         if (_mixer != null) _mixer.HoldOutput = false;
+        HandleTeardownResult(allThreadsStopped);
+    }
+
+    /// <summary>
+    /// パイプラインを畳んだ後の共通の後始末。Stop() と Play() の失敗経路の両方から呼ぶこと。
+    /// 片方だけ丁寧に扱うと、読み取り位置が不明なまま次の再生に入って表示位置がずれる経路が残る。
+    /// </summary>
+    private void HandleTeardownResult(bool allThreadsStopped)
+    {
+        // demux スレッドがまだ生きている可能性がある間に AVFormatContext を触ると、
+        // av_read_frame と競合してネイティブヒープを壊す。その場合は巻き戻しを諦めるが、
+        // 読み取り位置が不明なまま次の再生に入ると表示位置がずれるため覚えておく
+        if (allThreadsStopped)
+        {
+            RewindToStart();
+            _rewindSkipped = false;
+        }
+        else
+        {
+            _rewindSkipped = true;
+            DiagnosticLog.WriteFatal("engine", "停止待ちが完了しなかったため読み取り位置の巻き戻しを省略した");
+        }
+    }
+
+    /// <summary>
+    /// コンテナの読み取り位置を先頭へ戻す。停止後に再生すると次の DemuxThread は
+    /// この位置から読み始めるため、ここで巻き戻さないと「表示は 0:00 なのに
+    /// 停止した位置の続きが流れる」「EOF 後に停止しても再生し直せない」ことになる。
+    /// パイプラインを畳んだ後（demux スレッドが居ない状態）でのみ呼ぶこと。
+    /// </summary>
+    private void RewindToStart()
+    {
+        if (_fmtCtx == null) return;
+        int ret = avformat_seek_file(_fmtCtx, -1, long.MinValue, 0, 0, (int)AVSEEK_FLAG.Backward);
+        if (ret < 0)
+            DiagnosticLog.Write("engine", $"停止時の巻き戻しに失敗 ret={ret} ({FFmpegError.Describe(ret)})");
     }
 
     public void Seek(TimeSpan position)
     {
-        if (_fmtCtx == null) return;
+        // demux スレッドが動いていない状態でシークを受け付けると、HoldOutput だけ立てて
+        // 解除側（プリロール完了通知）が永久に来ず、以後の再生が音も映像も出なくなる
+        if (_fmtCtx == null || _demuxThread == null)
+        {
+            DiagnosticLog.Write("engine", $"再生していないためシーク要求を無視 target={position.TotalSeconds:F3} state={_state}");
+            return;
+        }
 
         // 目標を [0, duration) にクランプ（スキップ連打で負値や duration 超えの目標が来る）
         double durationSec = _currentMedia?.Duration.TotalSeconds ?? 0.0;
@@ -933,17 +1028,21 @@ public unsafe class MediaEngine : IMediaEngine
         DiagnosticLog.Write("demux", $"seek 処理 target={normalizedTargetSeconds:F3} ringSerial={_videoRing?.CurrentSerial ?? -1}");
     }
 
-    private void TeardownPipeline()
+    /// <returns>すべてのスレッドが時間内に停止した場合 true。false のときネイティブ資源は他スレッドが触っている可能性がある。</returns>
+    private bool TeardownPipeline()
     {
         // StatusTick はスレッドプールで走り _positionSource(WASAPI COM) / _videoRing(D3D) 等のネイティブ資源を
-        // 触るため、以降の破棄より先に走行中コールバックの完了を待ってタイマーを確実に止める。
+        // 触るため、以降の破棄より先に走行中コールバックの完了を待ってタイマーを止める。
         // （Change(Infinite) や引数なし Dispose は走行中コールバックを止めないため、連続ファイル切替で
         //   破棄済みネイティブ資源へアクセスしてプロセスが不正終了する原因になっていた。）
+        // ただし待ちには上限があり、時間内に止まらなければ「走行中のまま破棄へ進む」ことになる。
+        // その場合は上記の不正終了が起こりうるため、必ず記録を残す。
         if (_statusTimer != null)
         {
             using var timerStopped = new ManualResetEvent(false);
             _statusTimer.Dispose(timerStopped);
-            timerStopped.WaitOne(TimeSpan.FromSeconds(2));
+            if (!timerStopped.WaitOne(TimeSpan.FromSeconds(2)))
+                DiagnosticLog.WriteFatal("engine", "状態タイマーが時間内に停止しなかった（走行中のまま破棄へ進む）");
             _statusTimer = null;
         }
 
@@ -959,9 +1058,12 @@ public unsafe class MediaEngine : IMediaEngine
         _videoRing?.Close();
         _audioDecodeThread?.Wake();
 
-        _demuxThreadHandle?.Join(TimeSpan.FromSeconds(3));
-        _videoDecodeThreadHandle?.Join(TimeSpan.FromSeconds(3));
-        _audioDecodeThreadHandle?.Join(TimeSpan.FromSeconds(3));
+        // 停止待ちがタイムアウトした場合、そのスレッドはまだ AVFormatContext やネイティブ資源を
+        // 触っている可能性がある。呼び出し元が「触ってよいか」を判断できるよう結果を返す
+        bool allStopped = true;
+        allStopped &= JoinOrLog(_demuxThreadHandle, "demux");
+        allStopped &= JoinOrLog(_videoDecodeThreadHandle, "映像デコード");
+        allStopped &= JoinOrLog(_audioDecodeThreadHandle, "音声デコード");
 
         _videoQueue?.DrainAndDispose();
         _audioQueue?.DrainAndDispose();
@@ -980,6 +1082,16 @@ public unsafe class MediaEngine : IMediaEngine
         _demuxThreadHandle = null;
         _videoDecodeThreadHandle = null;
         _audioDecodeThreadHandle = null;
+        return allStopped;
+    }
+
+    /// <summary>スレッドの停止を待ち、時間内に止まらなければ記録する。</summary>
+    /// <returns>停止した場合 true。</returns>
+    private static bool JoinOrLog(Thread? handle, string name)
+    {
+        if (handle == null || handle.Join(TimeSpan.FromSeconds(3))) return true;
+        DiagnosticLog.WriteFatal("engine", $"{name} スレッドが時間内に停止しなかった");
+        return false;
     }
 
     // ── ステータス通知（100ms 周期。映像フレーム配送は UI 側の CompositionTarget.Rendering がプルする）──
@@ -1000,7 +1112,15 @@ public unsafe class MediaEngine : IMediaEngine
         var pos = TimeSpan.FromSeconds(posSeconds);
 
         if (_state == CorePlaybackState.Playing || _state == CorePlaybackState.Paused)
-            PositionChanged?.Invoke(this, pos);
+        {
+            // 終端に達した後もハードウェア位置は進み続けることがある（無音の再生・
+            // デバイス側のバッファ処理）ので尺で抑える。ただしコンテナ申告の尺は実際の
+            // 最終フレームより短いことがあるため（VFR・録画ファイル）、真に終端と判定できた
+            // 後だけ抑える。再生中に抑えると「尺で止まったのに音だけ鳴り続ける」ように見える
+            var duration = _currentMedia?.Duration ?? TimeSpan.Zero;
+            bool clampToEnd = _playbackEndedFired && duration > TimeSpan.Zero && pos > duration;
+            PositionChanged?.Invoke(this, clampToEnd ? duration : pos);
+        }
 
         StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _lastVideoLagSec));
 
@@ -1029,16 +1149,53 @@ public unsafe class MediaEngine : IMediaEngine
         _lastFrameServedTicks = now; // 停止継続中は 2 秒おきに記録
     }
 
+    /// <summary>
+    /// 直近のシークが demux・映像・音声のすべてへ浸透し終えたか。
+    /// 再生終了の判定は「demux が終端に達した」「映像リングがドレインし切った」「各音声トラックが EOF」という、
+    /// 別スレッドが独立に更新するフラグの組み合わせで決まる。世代が揃っていない途中の状態で判定すると、
+    /// シーク直後に前の終端の残骸を見て誤って「再生終了」と判断してしまう
+    /// （EOF から再生を押した直後に、始まった再生がすぐ止まる）。
+    /// フラグを個別に突き合わせるのではなく、必ずこのメソッドを通して判断すること。
+    /// </summary>
+    private bool IsSettledAfterSeek()
+    {
+        // demux がシーク要求を抱えている／処理中
+        if (_demuxThread?.HasPendingSeek == true) return false;
+        // Flush 番兵は積まれたが、映像デコードスレッドがまだ消費していない。
+        // リングの世代とは比較しないこと（リングの Flush は 1 回のシークで 2 度進むため
+        // キューの Serial と 1:1 で対応せず、常に不一致になって再生終了を検出できなくなる）
+        if (_videoQueue != null && _videoDecodeThread != null
+            && _videoQueue.Serial != _videoDecodeThread.HandledSerial) return false;
+        // 同じく音声側が追いついていない
+        if (_audioQueue != null && _audioDecodeThread != null
+            && _audioQueue.Serial != _audioDecodeThread.HandledSerial) return false;
+        return true;
+    }
+
     private void CheckPlaybackEnded()
     {
         if (_playbackEndedFired) return;
         if (_state != CorePlaybackState.Playing && _state != CorePlaybackState.Paused) return;
         if (_demuxThread == null || !_demuxThread.EofReached) return;
+        if (!IsSettledAfterSeek()) return;
         if (_videoDecoder != null && (_videoRing == null || !_videoRing.IsEofDrained)) return;
         foreach (var s in _audioStates)
             if (!s.IsEof || s.Buffer.BufferedBytes > 0) return;
 
         _playbackEndedFired = true;
+        DiagnosticLog.Write("engine", "再生終了を検出");
+        // 音声出力を止めないと WASAPI が無音を出し続け、クロックも位置表示も終端を越えて
+        // 進み続ける（デコードは終わっているのに再生時間だけ伸びていく）。
+        // パイプライン自体はここでは畳まない（状態タイマーのコールバックから Join するのは危険なため）
+        try { _wasapiOut?.Pause(); }
+        catch (Exception ex) { DiagnosticLog.WriteFatal("engine", $"再生終了時の音声出力停止に失敗: {ex}"); }
+        // 状態を進めないと、次に Play() を呼んでも冒頭の「既に Playing」ガードで弾かれ、
+        // UI だけ「再生中」を表示したまま何も起きなくなる
+        SetState(CorePlaybackState.Stopped);
+        // 状態が Stopped になると StatusTick は位置を通知しなくなるため、ここで最終位置を 1 度だけ送る。
+        // 送らないと、尺を超えた値のまま表示が固まる（1:05 / 1:00 のような表示になる）
+        var endPosition = _currentMedia?.Duration ?? TimeSpan.Zero;
+        if (endPosition > TimeSpan.Zero) PositionChanged?.Invoke(this, endPosition);
         PlaybackEnded?.Invoke(this, EventArgs.Empty);
     }
 
@@ -1057,6 +1214,8 @@ public unsafe class MediaEngine : IMediaEngine
         // 破棄後に CurrentMedia が残っていると、閉じたはずのメディアのパスを使う処理
         // （既定ミュートの保存など）が成立してしまう
         _currentMedia = null;
+        // 「読み取り位置が不明」は今開いているファイルに閉じた話。次のファイルへ持ち越さない
+        _rewindSkipped = false;
     }
 
     public void Dispose()

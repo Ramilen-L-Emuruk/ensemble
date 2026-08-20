@@ -24,6 +24,10 @@ public sealed unsafe class VideoDecodeThread
     // 生き残った番兵が本来とは別のシークの目標値を取り出してしまうバグがあった
     // （ほぼ同時刻の2連続シークだけで再生が固まる不具合の原因。詳細は MediaEngine.PublishSeekTarget 参照）
     private readonly Dictionary<int, double> _pendingSeekTargets = new();
+    /// <summary>最後に処理した Flush 番兵の世代。キューの Serial と一致していればシークに追いついている。</summary>
+    public int HandledSerial => _handledSerial;
+    private volatile int _handledSerial;
+
     private bool _prerollActive;
     private double _prerollTarget;
     // このプリロールが属するキュー世代（Flush 番兵自身の Serial）。プリロール完了判定の瞬間に
@@ -95,6 +99,8 @@ public sealed unsafe class VideoDecodeThread
 
     private void HandleFlush(int serial)
     {
+        // キューの Serial と突き合わせて「このスレッドがシークに追いついたか」を外から判断できるようにする
+        _handledSerial = serial;
         _decoder.FlushBuffers();
         // demux スレッドがシーク時に既に ring.Flush 済み（デッドロック解消のため）。
         // ここでもう一度呼び、demux の Flush 後にコミットされ得た残骸 Ready も掃除する
@@ -120,7 +126,25 @@ public sealed unsafe class VideoDecodeThread
     {
         _decoder.SendPacket(null);
         DrainAvailable(frame);
+        ReleasePendingPreroll();
         _sink.MarkEof();
+    }
+
+    /// <summary>
+    /// プリロール中のままファイル終端に達したときに、完了扱いにして通知する。
+    /// 目標地点へ届く映像が 1 枚も来ない場合（コンテナの duration が実際の最終フレームより
+    /// 大きい・末尾が音声のみ・シーク自体が失敗した等）、ここで解除しないと
+    /// ミキサーの出力保留が永久に解けず、音も映像も出ないまま固まる。
+    /// </summary>
+    private void ReleasePendingPreroll()
+    {
+        if (!_prerollActive) return;
+        _prerollActive = false;
+        if (_queue.Serial == _prerollSerial)
+        {
+            Diagnostics.DiagnosticLog.Write("video", $"EOF 到達のためプリロールを完了扱いにする target={_prerollTarget:F3}");
+            _onFirstFrameAfterFlush?.Invoke();
+        }
     }
 
     private void HandlePacket(AVPacket* pkt, AVFrame* frame)

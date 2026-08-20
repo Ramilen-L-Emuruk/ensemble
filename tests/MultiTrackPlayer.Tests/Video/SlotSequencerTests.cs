@@ -11,6 +11,50 @@ public sealed class SlotSequencerTests
 {
     private static int Acquire(SlotSequencer seq) => seq.BeginWrite(_ => { });
 
+    [Fact(DisplayName = "EOF 前は提示待ちが無くてもドレイン済みとは見なさない")]
+    public void IsEofDrained_IsFalse_BeforeMarkEof()
+    {
+        var seq = new SlotSequencer(4);
+
+        Assert.False(seq.IsEofDrained);
+    }
+
+    [Fact(DisplayName = "EOF 後に提示待ちのフレームが残っていればドレイン済みにならない")]
+    public void IsEofDrained_IsFalse_WhileReadyFrameRemains()
+    {
+        var seq = new SlotSequencer(4);
+        int slot = Acquire(seq);
+        seq.CommitWrite(slot, 1.0);
+        seq.MarkEof();
+
+        Assert.False(seq.IsEofDrained);
+    }
+
+    // GPU 経路の vout スレッドは、次のフレームが due になるまで最後のフレームをリースしたまま
+    // 再提示し続ける。リース中を「未ドレイン」と見なすと、最後まで再生しても再生完了が
+    // 永久に検出されない（実機で「尺を超えて位置が伸び続ける」として現れた）
+    [Fact(DisplayName = "EOF 後にリース中のフレームだけが残っていればドレイン済みと見なす")]
+    public void IsEofDrained_IsTrue_WhenOnlyLeasedFrameRemains()
+    {
+        var seq = new SlotSequencer(4);
+        int slot = Acquire(seq);
+        seq.CommitWrite(slot, 1.0);
+        Assert.True(seq.TryLeaseOldest(TimeSpan.Zero, minSerial: 0, out _, out _));
+        seq.MarkEof();
+
+        Assert.True(seq.IsEofDrained);
+    }
+
+    [Fact(DisplayName = "EOF 後に書き込み中のフレームが残っていればドレイン済みにならない")]
+    public void IsEofDrained_IsFalse_WhileWritingFrameRemains()
+    {
+        var seq = new SlotSequencer(4);
+        Acquire(seq); // Commit せず Writing のまま
+        seq.MarkEof();
+
+        Assert.False(seq.IsEofDrained);
+    }
+
     [Fact]
     public void CommitWrite_DiscardsFrame_WhenFlushHappensBetweenBeginAndCommit()
     {
