@@ -22,19 +22,23 @@ public sealed unsafe class AudioDecodeThread
 
     private volatile bool _stopRequested;
     private readonly object _seekTargetLock = new();
-    // VideoDecodeThread と同じ理由（コメント参照）で FIFO ではなく Flush 番兵の Serial キー付き辞書にする
-    private readonly Dictionary<int, double> _pendingSeekTargets = new();
+    // VideoDecodeThread と同じ理由（コメント参照）で FIFO ではなくシーク世代キー付き辞書にする
+    private readonly Dictionary<SeekEpoch, double> _pendingSeekTargets = new();
     private bool _prerollActive;
     private double _prerollTarget;
-    // このプリロールが属するキュー世代（Flush 番兵自身の Serial）。VideoDecodeThread と同じ理由で、
+    // このプリロールが属するシーク世代（Flush 番兵の世代）。VideoDecodeThread と同じ理由で、
     // 次のシークに割り込まれた後の「無効な世代のプリロール完了」による誤アンカーを防ぐために使う
-    private int _prerollSerial;
+    private SeekEpoch _prerollEpoch = SeekEpoch.Initial;
     private bool _anchorNotifyPending;
     private double _anchorTarget;
 
-    /// <summary>最後に処理した Flush 番兵の世代。キューの Serial と一致していればシークに追いついている。</summary>
-    public int HandledSerial => _handledSerial;
-    private volatile int _handledSerial;
+    /// <summary>
+    /// 最後に処理した Flush 番兵の世代。キューの世代と一致していればシークに追いついている。
+    /// <c>SeekEpoch</c> は構造体で volatile にできないため、内部では int で保持して
+    /// <see cref="Volatile"/> で読み書きする（<c>VideoDecodeThread.HandledEpoch</c> と対称）。
+    /// </summary>
+    public SeekEpoch HandledEpoch => new(Volatile.Read(ref _handledEpochValue));
+    private int _handledEpochValue;
 
     // 異常が続くと毎フレーム記録されてログが埋まるため、トラックごとに最初の 1 回だけ残す
     private readonly bool[] _resampleFailureLogged;
@@ -81,11 +85,11 @@ public sealed unsafe class AudioDecodeThread
 
     /// <summary>
     /// DemuxThread のシーク処理から、Flush 番兵を投入する前に呼ぶこと。
-    /// serial は、これから投入される Flush 番兵自身の Serial（呼び出し側で Flush() 前のキュー Serial + 1 として算出）。
+    /// <paramref name="epoch"/> は DemuxThread が採番した世代で、この後に投入される Flush 番兵が同じ値を持つ。
     /// </summary>
-    public void SetSeekTarget(int serial, double normalizedTargetSeconds)
+    public void SetSeekTarget(SeekEpoch epoch, double normalizedTargetSeconds)
     {
-        lock (_seekTargetLock) _pendingSeekTargets[serial] = normalizedTargetSeconds;
+        lock (_seekTargetLock) _pendingSeekTargets[epoch] = normalizedTargetSeconds;
     }
 
     public void RequestStop() => _stopRequested = true;
@@ -105,7 +109,7 @@ public sealed unsafe class AudioDecodeThread
                 switch (item.Kind)
                 {
                     case QueueItemKind.Flush:
-                        HandleFlush(item.Serial);
+                        HandleFlush(item.Epoch);
                         break;
                     case QueueItemKind.Eof:
                         HandleEof(frame);
@@ -162,10 +166,10 @@ public sealed unsafe class AudioDecodeThread
         Diagnostics.DiagnosticLog.Write("audio", message);
     }
 
-    private void HandleFlush(int serial)
+    private void HandleFlush(SeekEpoch epoch)
     {
-        // キューの Serial と突き合わせて「このスレッドがシークに追いついたか」を外から判断できるようにする
-        _handledSerial = serial;
+        // キューの世代と突き合わせて「このスレッドがシークに追いついたか」を外から判断できるようにする
+        Volatile.Write(ref _handledEpochValue, epoch.Value);
         // 連続失敗で切り離したトラックには復帰の機会を与える（シーク先では正常にリサンプルできる
         // 場合がある）。リサンプラ自体が壊れているトラック（AudioDecoder.IsResamplerBroken）は
         // シークでは回復しないため、シーク後の最初のフレームで再び切り離される
@@ -177,16 +181,16 @@ public sealed unsafe class AudioDecodeThread
             _states[i].IsEof = false;
             _abandonedTracks[i] = false;
         }
-        _prerollSerial = serial;
+        _prerollEpoch = epoch;
         lock (_seekTargetLock)
         {
-            _prerollActive = _pendingSeekTargets.Remove(serial, out _prerollTarget);
+            _prerollActive = _pendingSeekTargets.Remove(epoch, out _prerollTarget);
             if (!_prerollActive) _prerollTarget = double.NaN;
-            // この番兵より前の serial 宛ての目標は、対応する番兵が Flush() の Clear() で
+            // この番兵より前の世代宛ての目標は、対応する番兵が Flush() の Clear() で
             // 消えて二度と来ない残骸。溜め続けると意味のない対応関係が残るので掃除する
             if (_pendingSeekTargets.Count > 0)
             {
-                foreach (int staleKey in _pendingSeekTargets.Keys.Where(k => k <= serial).ToList())
+                foreach (SeekEpoch staleKey in _pendingSeekTargets.Keys.Where(k => k <= epoch).ToList())
                     _pendingSeekTargets.Remove(staleKey);
             }
         }
@@ -195,7 +199,7 @@ public sealed unsafe class AudioDecodeThread
         // クロックとA/Vが恒久的にズレる（実機検証で -56s のズレとして観測されたバグ）。
         _anchorNotifyPending = _prerollActive;
         _anchorTarget = _prerollTarget;
-        Diagnostics.DiagnosticLog.Write("audio", $"flush 処理 serial={serial} preroll={(_prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
+        Diagnostics.DiagnosticLog.Write("audio", $"flush 処理 epoch={epoch} preroll={(_prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
     }
 
     private void HandleEof(AVFrame* frame)
@@ -231,10 +235,10 @@ public sealed unsafe class AudioDecodeThread
         double target = _prerollTarget;
         // AddWithGate と同じ理由の世代チェック: 次のシークに割り込まれていたら、この完了通知は
         // もう無効な世代のもの（本物の Flush が後から来て正しく上書きする）
-        bool serialMatches = _queue.Serial == _prerollSerial;
+        bool epochMatches = _queue.Epoch == _prerollEpoch;
         _prerollActive = false;
         _anchorNotifyPending = false;
-        if (!serialMatches) return;
+        if (!epochMatches) return;
 
         Diagnostics.DiagnosticLog.Write("audio", $"{reason}のためプリロールを完了扱いにする target={target:F3}");
         _onFirstSamplesAfterFlush?.Invoke(target);
@@ -408,12 +412,12 @@ public sealed unsafe class AudioDecodeThread
         {
             _anchorNotifyPending = false;
             // VideoDecodeThread と同じ理由の世代チェック: この間に次のシークが割り込んで
-            // キューの Serial が進んでいたら、この完了通知はもう無効な世代のもの。
+            // キューの世代が進んでいたら、この完了通知はもう無効な世代のもの。
             // 錨要求もプリロール完了通知も発火しない（本物の Flush が後で来て正しく上書きする）
-            if (_queue.Serial == _prerollSerial)
+            if (_queue.Epoch == _prerollEpoch)
                 _onFirstSamplesAfterFlush?.Invoke(_anchorTarget);
             else
-                Diagnostics.DiagnosticLog.Write("audio", $"stale preroll 破棄 prerollSerial={_prerollSerial} currentSerial={_queue.Serial} target={_anchorTarget:F3}");
+                Diagnostics.DiagnosticLog.Write("audio", $"stale preroll 破棄 prerollEpoch={_prerollEpoch} currentEpoch={_queue.Epoch} target={_anchorTarget:F3}");
         }
         // 切り離したトラックは IsEof を立てているため、ここでバッファへ足すとミキサーの除外条件
         //（EOF かつ残量ゼロ）から外れ、再び共通利用可能量の計算に巻き込まれる。中途半端に

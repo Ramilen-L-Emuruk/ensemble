@@ -161,7 +161,7 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
 - `src/MultiTrackPlayer.Core/`: モデル・インターフェース（依存なし）
 - `src/MultiTrackPlayer.Engine/`: FFmpeg デコード・NAudio ミキサー（unsafe コード有）
   - `Pipeline/`: ffplay 型スレッド分離パイプライン。`DemuxThread` が `AVFormatContext` を唯一専有し、
-    `VideoDecodeThread`/`AudioDecodeThread` が `VideoPacketQueue`/`AudioPacketQueue`（serial・Flush/EOF
+    `VideoDecodeThread`/`AudioDecodeThread` が `VideoPacketQueue`/`AudioPacketQueue`（シーク世代・Flush/EOF
     番兵付き有界キュー）経由でデコードする。シークは `DemuxThread.RequestSeek` でコアレスされ非同期処理される。
     映像の書き込み戦略は sink（`IVideoFrameSink`）に委譲し、HW デコード時は `GpuFrameSink`（GPU 色変換）、
     SW デコード時は `CpuFrameSink`（`sws_scale`）を使う
@@ -171,8 +171,12 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
     `GpuFrameConverter`（`ID3D11VideoProcessor` による YCbCr→BGRA 変換）、`SwapChainVideoPresenter`
     （映像子ウィンドウのスワップチェーンへ vsync Present）
   - `Video/`: 映像フレームリング。`GpuVideoFrameRing`（GPU 共有テクスチャ）/`VideoFrameRing`（CPU BGRA）と、
-    スロット状態機械 `SlotSequencer`（Free/Writing/Ready/Leased・serial 世代・`TryLeaseDue`/`TryLeaseOldest`+
+    スロット状態機械 `SlotSequencer`（Free/Writing/Ready/Leased・シーク世代・`TryLeaseDue`/`TryLeaseOldest`+
     `ReturnLease` のリース方式）・due 選択 `FrameSelector` に分割されている
+  - `SeekEpoch.cs`: シーク世代。`DemuxThread.RequestSeek` が採番し、パケットキューの Flush 番兵・
+    パケット・映像リングのスロットに刻まれる。判定は常に等値。レビュー時の観点は
+    [.claude/rules/ensemble-review.md](.claude/rules/ensemble-review.md) の
+    「6. シーク世代（`SeekEpoch`）の扱い」を参照
   - `Sync/PlaybackClock.cs`: audio-master クロック（mixer 出力サンプル軸のセグメントマップ）。
     `WasapiPositionSource`（`IWavePosition` ベース、異常検知で `FallbackPositionSource` へ自動切替）と組み合わせて
     `MediaEngine.Position` を算出する

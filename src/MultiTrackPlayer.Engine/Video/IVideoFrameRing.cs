@@ -12,8 +12,8 @@ namespace MultiTrackPlayer.Engine.Video;
 /// </summary>
 public interface IVideoFrameRing : IDisposable
 {
-    /// <summary>現在の世代番号（シークで進む）。</summary>
-    int CurrentSerial { get; }
+    /// <summary>現在のシーク世代（demux が採番した値。<see cref="SeekEpoch"/> 参照）。</summary>
+    SeekEpoch CurrentEpoch { get; }
 
     /// <summary>EOF 済みかつ表示待ち・リース中のフレームが残っていない（再生完了検出に使う）。</summary>
     bool IsEofDrained { get; }
@@ -21,14 +21,24 @@ public interface IVideoFrameRing : IDisposable
     /// <summary>クロック位置に対して due な最新フレームを1枚リースする。何も due でなければ false。読み終えたら必ず <see cref="ReturnLease"/> すること。</summary>
     bool TryLeaseDue(double clockPositionSeconds, double frameDurationSeconds, out VideoFrameLease? lease, out int droppedCount);
 
-    /// <summary>最も古い Ready フレームを1枚リースする（クロック非依存。Step・一時停止中シーク用）。timeout 内に無ければ false。</summary>
-    bool TryLeaseOldest(TimeSpan timeout, int minSerial, out VideoFrameLease? lease);
+    /// <summary>
+    /// 最も古い Ready フレームを1枚リースする（クロック非依存。Step・一時停止中シーク用）。
+    /// 世代が <paramref name="epoch"/> と一致するスロットだけを対象にする。timeout 内に無ければ false。
+    /// </summary>
+    bool TryLeaseOldest(TimeSpan timeout, SeekEpoch epoch, out VideoFrameLease? lease);
 
     /// <summary>リース中のスロットを Free に戻す。</summary>
     void ReturnLease(int slotIndex);
 
-    /// <summary>シーク時: 世代番号を進めて Ready を Free に戻し EOF 状態も解除する（どのスレッドから呼んでも安全）。</summary>
-    void Flush();
+    /// <summary>
+    /// シーク時: 世代を <paramref name="epoch"/> へ更新して Ready を Free に戻し EOF 状態も解除する
+    /// （どのスレッドから呼んでも安全）。
+    /// </summary>
+    /// <returns>
+    /// 適用した場合 true。現在と同じか古い世代で呼ばれて無視した場合 false
+    /// （呼び出し規約違反。呼び出し側で記録すること）。
+    /// </returns>
+    bool Flush(SeekEpoch epoch);
 
     /// <summary>診断用: 全スロットの状態スナップショット。</summary>
     string DescribeSlots();

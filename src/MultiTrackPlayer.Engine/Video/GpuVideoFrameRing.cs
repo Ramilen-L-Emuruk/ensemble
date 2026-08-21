@@ -11,7 +11,7 @@ namespace MultiTrackPlayer.Engine.Video;
 /// 書き込み側（<c>GpuFrameConverter</c>）が <see cref="ID3D11VideoProcessorOutputView"/> 経由で VideoProcessorBlt の出力先に使う。
 /// 読み取り側（UI）へは <see cref="GpuRingFrame.SharedHandle"/> を渡し、別デバイスから共有ハンドルで開いて描画する。
 ///
-/// 状態機械（Free/Writing/Ready/Leased・serial 世代・Flush/EOF・Close）は <see cref="SlotSequencer"/> に委譲し、
+/// 状態機械（Free/Writing/Ready/Leased・シーク世代・Flush/EOF・Close）は <see cref="SlotSequencer"/> に委譲し、
 /// 本クラスはスロットごとのテクスチャ／共有ハンドル／OutputView の確保・解放だけを担う（<see cref="VideoFrameRing"/> と同じ委譲パターン）。
 ///
 /// OutputView 生成には <see cref="ID3D11VideoProcessorEnumerator"/> が要るが、それは書き込み側の <c>GpuFrameConverter</c> が
@@ -24,7 +24,7 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
 
     /// <summary>BeginWrite の戻り値: Close 済み。</summary>
     public const int SlotClosed = SlotSequencer.SlotClosed;
-    /// <summary>BeginWrite の戻り値: 空き待ち中に Flush が発生（このフレームは破棄すべき）。</summary>
+    /// <summary>BeginWrite の戻り値: 書き込もうとしたフレームがすでに過去の世代（このフレームは破棄すべき）。</summary>
     public const int SlotFlushed = SlotSequencer.SlotFlushed;
 
     private sealed class Payload
@@ -51,7 +51,7 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
         _seq = new SlotSequencer(SlotCount, FreeSlot);
     }
 
-    public int CurrentSerial => _seq.CurrentSerial;
+    public SeekEpoch CurrentEpoch => _seq.CurrentEpoch;
 
     /// <summary>
     /// 書き込み側（Converter）が OutputView を生成するための enumerator を渡す。enumerator が差し替わった場合は、
@@ -69,12 +69,14 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
     }
 
     /// <summary>
-    /// Free スロットが空くまでブロックする。Close 済みなら <see cref="SlotClosed"/>、待機中に Flush が起きたら <see cref="SlotFlushed"/>。
+    /// Free スロットが空くまでブロックする。Close 済みなら <see cref="SlotClosed"/>、
+    /// <paramref name="epoch"/> が現在の世代と一致しなければ <see cref="SlotFlushed"/>。
     /// 確保できたスロットは、サイズが変わっていれば共有テクスチャ＋共有ハンドルを作り直す（OutputView は enumerator に依存するため遅延生成）。
     /// </summary>
-    public int BeginWrite(int width, int height)
+    /// <param name="epoch">書き込むフレームを産んだパケットの世代（<see cref="SlotSequencer.BeginWrite"/> 参照）。</param>
+    public int BeginWrite(int width, int height, SeekEpoch epoch)
     {
-        return _seq.BeginWrite(idx =>
+        return _seq.BeginWrite(epoch, idx =>
         {
             var p = _payloads[idx];
             if (p.Texture == null || p.Width != width || p.Height != height)
@@ -138,10 +140,13 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
         return false;
     }
 
-    /// <summary>最も古い Ready フレームを1枚リースする（クロック非依存。Step・一時停止中シーク用）。timeout 内に無ければ false。</summary>
-    public bool TryLeaseOldest(TimeSpan timeout, int minSerial, out VideoFrameLease? lease)
+    /// <summary>
+    /// 最も古い Ready フレームを1枚リースする（クロック非依存。Step・一時停止中シーク用）。
+    /// <paramref name="epoch"/> と世代が一致するスロットだけを対象にする。timeout 内に無ければ false。
+    /// </summary>
+    public bool TryLeaseOldest(TimeSpan timeout, SeekEpoch epoch, out VideoFrameLease? lease)
     {
-        if (_seq.TryLeaseOldest(timeout, minSerial, out int idx, out double pts))
+        if (_seq.TryLeaseOldest(timeout, epoch, out int idx, out double pts))
         {
             var p = _payloads[idx];
             lease = new VideoFrameLease(idx, FrameKind.Gpu, PixelBuffer: IntPtr.Zero, p.Width, p.Height,
@@ -155,8 +160,11 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
     /// <summary>リース中のスロットを Free に戻す。破棄時に遅延解放が予約されていれば、ここでテクスチャ／OutputView も解放する。</summary>
     public void ReturnLease(int slotIndex) => _seq.ReturnLease(slotIndex);
 
-    /// <summary>シーク時: 世代番号を進めて Ready を Free に戻し EOF 状態も解除する（どのスレッドから呼んでも安全）。</summary>
-    public void Flush() => _seq.Flush();
+    /// <summary>
+    /// シーク時: 世代を <paramref name="epoch"/> へ更新して Ready を Free に戻し EOF 状態も解除する
+    /// （どのスレッドから呼んでも安全）。戻り値の意味は <see cref="SlotSequencer.Flush"/> を参照。
+    /// </summary>
+    public bool Flush(SeekEpoch epoch) => _seq.Flush(epoch);
 
     /// <summary>診断用: 全スロットの状態スナップショット。</summary>
     public string DescribeSlots() => _seq.DescribeSlots();
