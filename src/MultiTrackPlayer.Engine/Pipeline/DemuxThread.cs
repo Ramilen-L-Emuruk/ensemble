@@ -87,6 +87,10 @@ public sealed unsafe class DemuxThread
             int ret = av_read_frame(_fmtCtx, pkt.Packet);
             if (ret < 0)
             {
+                // 停止要求に伴う I/O 中断（AVIOInterruptCB）でも負値が返る。これをファイル終端として
+                // 扱うと EOF 番兵が積まれ、停止操作が「再生完了」として扱われてしまう（プレイリストの
+                // 自動送りが走る）。中断と終端は戻り値では区別できないため、停止要求の有無で分ける
+                if (_stopRequested) break;
                 _eofReached = true;
                 _videoQueue.PutEof(_videoQueue.Serial);
                 _audioQueue.PutEof(_audioQueue.Serial);
@@ -97,13 +101,14 @@ public sealed unsafe class DemuxThread
             av_packet_unref(pkt.Packet);
             if (!routed)
             {
-                // 映像キューが閉じられたときだけ demux を終える（＝パイプライン全体の終了処理中）。
-                // 音声キューだけが閉じているのは、音声デコードスレッドが異常終了して音声側を
+                // 停止要求が出ている＝パイプライン全体を畳んでいるので終える。
+                // それ以外でキューが閉じているのは、片側のデコードスレッドが異常終了してその側だけを
                 // 畳んだ状態。ここで break すると AVFormatContext を専有するこのスレッドが消え、
-                // 映像の供給まで止まってしまうため、音声パケットは捨てて読み進める
-                if (_videoQueue.IsClosed) break;
-                if (_audioQueue.IsClosed) continue;
-                continue; // Put がシーク割込みで中断された: このパケットは捨ててループ先頭で保留シークを処理する
+                // 生き残った側への供給まで止まってしまう（映像・音声のどちらが落ちても同じなので
+                // 対称に扱う）。そのパケットは捨てて読み進め、終端まで到達させる。
+                // Put がシーク割込みで中断された場合も同じく捨て、ループ先頭で保留シークを処理する
+                if (_stopRequested) break;
+                continue;
             }
         }
     }

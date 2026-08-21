@@ -363,6 +363,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
         else
         {
+            // 検疫中は Play() が必ず失敗する。InvokeEngine の汎用 OSD（「再生に失敗しました」）だけでは
+            // 原因も復旧手段も伝わらず、「ボタンを押しても何も起きない」ように見えるため個別に案内する
+            if (Engine.IsPipelineQuarantined)
+            {
+                ShowOsd("前回の停止処理が完了していません。ファイルを開き直してください");
+                return;
+            }
             // Play() はパイプライン構築に失敗すると（自身を巻き戻したうえで）例外を送出する
             if (!InvokeEngine("再生", Engine.Play)) return;
             ShowOsd("再生");
@@ -374,7 +381,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         if (!InvokeEngine("停止", Engine.Stop)) return;
         Position = TimeSpan.Zero;
-        ShowOsd("停止");
+        // 検疫が起きた場合、音声出力・バッファ・クロックの後始末は省略されている（消音のみ）。
+        // 「停止」とだけ出すと正常に停止したように見え、縮退したことに気づく手段が
+        // 「もう一度再生を押す」以外になくなる
+        ShowOsd(Engine.IsPipelineQuarantined
+            ? "停止（後始末を完了できませんでした。ファイルを開き直してください）"
+            : "停止");
     }
 
     [RelayCommand]

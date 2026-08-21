@@ -14,7 +14,7 @@ public sealed class SlotSequencerTests
     [Fact(DisplayName = "EOF 前は提示待ちが無くてもドレイン済みとは見なさない")]
     public void IsEofDrained_IsFalse_BeforeMarkEof()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
 
         Assert.False(seq.IsEofDrained);
     }
@@ -22,7 +22,7 @@ public sealed class SlotSequencerTests
     [Fact(DisplayName = "EOF 後に提示待ちのフレームが残っていればドレイン済みにならない")]
     public void IsEofDrained_IsFalse_WhileReadyFrameRemains()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
         int slot = Acquire(seq);
         seq.CommitWrite(slot, 1.0);
         seq.MarkEof();
@@ -36,7 +36,7 @@ public sealed class SlotSequencerTests
     [Fact(DisplayName = "EOF 後にリース中のフレームだけが残っていればドレイン済みと見なす")]
     public void IsEofDrained_IsTrue_WhenOnlyLeasedFrameRemains()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
         int slot = Acquire(seq);
         seq.CommitWrite(slot, 1.0);
         Assert.True(seq.TryLeaseOldest(TimeSpan.Zero, minSerial: 0, out _, out _));
@@ -48,7 +48,7 @@ public sealed class SlotSequencerTests
     [Fact(DisplayName = "EOF 後に書き込み中のフレームが残っていればドレイン済みにならない")]
     public void IsEofDrained_IsFalse_WhileWritingFrameRemains()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
         Acquire(seq); // Commit せず Writing のまま
         seq.MarkEof();
 
@@ -58,7 +58,7 @@ public sealed class SlotSequencerTests
     [Fact]
     public void CommitWrite_DiscardsFrame_WhenFlushHappensBetweenBeginAndCommit()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
         int slot = Acquire(seq);
         Assert.True(slot >= 0);
         seq.Flush();
@@ -71,7 +71,7 @@ public sealed class SlotSequencerTests
     [Fact]
     public void BeginWrite_ReturnsSlotFlushed_WhenFlushHappensWhileWaitingForFreeSlot()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
         for (int i = 0; i < 4; i++) { int s = Acquire(seq); seq.CommitWrite(s, i); }
         var leases = new List<int>();
         for (int i = 0; i < 4; i++)
@@ -87,13 +87,13 @@ public sealed class SlotSequencerTests
         Assert.True(writer.Wait(TimeSpan.FromSeconds(3)));
         Assert.Equal(SlotSequencer.SlotFlushed, writer.Result);
 
-        foreach (var s in leases) seq.ReturnLease(s, _ => { });
+        foreach (var s in leases) seq.ReturnLease(s);
     }
 
     [Fact]
     public void Flush_FreesReadySlots_AndUnblocksWaitingWriter()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
         for (int i = 0; i < 4; i++) { int s = Acquire(seq); seq.CommitWrite(s, i); }
 
         var writer = Task.Run(() => seq.BeginWrite(_ => { }));
@@ -115,7 +115,7 @@ public sealed class SlotSequencerTests
     [Fact]
     public void TryLeaseOldest_SkipsFrames_BelowMinSerial()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
         int s = Acquire(seq);
         seq.CommitWrite(s, 1.0);
         int nextSerial = seq.CurrentSerial + 1;
@@ -133,11 +133,11 @@ public sealed class SlotSequencerTests
     [Fact]
     public void ReturnLease_MakesSlotReusable()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
         for (int i = 0; i < 4; i++) { int s = Acquire(seq); seq.CommitWrite(s, i); }
         Assert.True(seq.TryLeaseOldest(TimeSpan.Zero, 0, out int leased, out _));
 
-        seq.ReturnLease(leased, _ => { });
+        seq.ReturnLease(leased);
         int slot = Acquire(seq);
 
         Assert.True(slot >= 0);
@@ -147,38 +147,102 @@ public sealed class SlotSequencerTests
     [Fact]
     public void Flush_DoesNotTouchLeasedSlot()
     {
-        var seq = new SlotSequencer(4);
+        var seq = new SlotSequencer(4, _ => { });
         int s = Acquire(seq);
         seq.CommitWrite(s, 1.0);
         Assert.True(seq.TryLeaseOldest(TimeSpan.Zero, 0, out int held, out _));
 
         seq.Flush();
 
-        seq.ReturnLease(held, _ => { });
+        seq.ReturnLease(held);
         int slot = Acquire(seq);
         Assert.True(slot >= 0);
         seq.AbortWrite(slot);
     }
 
-    [Fact]
+    [Fact(DisplayName = "破棄時、リース中のスロットは即解放せずリース返却時に解放する")]
     public void DisposeSlots_DefersFreeForLeasedSlot_AndFreesOnReturn()
     {
-        var seq = new SlotSequencer(4);
+        var freed = new List<int>();
+        var seq = new SlotSequencer(4, freed.Add);
         int s = Acquire(seq);
         seq.CommitWrite(s, 1.0);
         Assert.True(seq.TryLeaseOldest(TimeSpan.Zero, 0, out int held, out _));
 
         seq.Close();
-        var freed = new List<int>();
-        seq.DisposeSlots(freed.Add);
+        seq.DisposeSlots();
 
         // Leased スロットは即解放されず、残り3スロットだけが解放される
         Assert.DoesNotContain(held, freed);
         Assert.Equal(3, freed.Count);
 
         // リース返却時に遅延解放される
-        var freedOnReturn = new List<int>();
-        seq.ReturnLease(held, freedOnReturn.Add);
-        Assert.Contains(held, freedOnReturn);
+        seq.ReturnLease(held);
+        Assert.Contains(held, freed);
+    }
+
+    // スレッド停止待ちがタイムアウトすると、デコードスレッドが Writing スロットへ書き込んでいる最中に
+    // リングが破棄される。そこでペイロードを解放すると sws_scale / VideoProcessorBlt の
+    // 書き込み先が足元から消えてネイティブヒープが壊れる（過去に実クラッシュを出した経路）
+    [Fact(DisplayName = "破棄時、書き込み中のスロットは即解放しない")]
+    public void DisposeSlots_DefersFreeForWritingSlot()
+    {
+        var freed = new List<int>();
+        var seq = new SlotSequencer(4, freed.Add);
+        int writing = Acquire(seq); // Commit せず Writing のまま
+
+        seq.Close();
+        seq.DisposeSlots();
+
+        Assert.DoesNotContain(writing, freed);
+        Assert.Equal(3, freed.Count);
+    }
+
+    [Fact(DisplayName = "書き込み中に予約された遅延解放は CommitWrite で解放される")]
+    public void CommitWrite_FreesDeferredPayload_AfterDisposeSlots()
+    {
+        var freed = new List<int>();
+        var seq = new SlotSequencer(4, freed.Add);
+        int writing = Acquire(seq);
+
+        seq.Close();
+        seq.DisposeSlots();
+        Assert.DoesNotContain(writing, freed);
+
+        // 生き残っていたデコードスレッドが変換を終えて戻ってきた場面
+        seq.CommitWrite(writing, 1.0);
+
+        Assert.Contains(writing, freed);
+        // 破棄後に Ready へ昇格させてはいけない（提示側に拾わせない）
+        Assert.False(seq.TryLeaseOldest(TimeSpan.Zero, minSerial: 0, out _, out _));
+    }
+
+    [Fact(DisplayName = "書き込み中に予約された遅延解放は AbortWrite でも解放される")]
+    public void AbortWrite_FreesDeferredPayload_AfterDisposeSlots()
+    {
+        var freed = new List<int>();
+        var seq = new SlotSequencer(4, freed.Add);
+        int writing = Acquire(seq);
+
+        seq.Close();
+        seq.DisposeSlots();
+        seq.AbortWrite(writing);
+
+        Assert.Contains(writing, freed);
+    }
+
+    [Fact(DisplayName = "遅延解放は 1 度だけ行われる")]
+    public void DeferredFree_HappensOnlyOnce()
+    {
+        var freed = new List<int>();
+        var seq = new SlotSequencer(4, freed.Add);
+        int writing = Acquire(seq);
+
+        seq.Close();
+        seq.DisposeSlots();
+        seq.AbortWrite(writing);
+        seq.AbortWrite(writing);
+
+        Assert.Equal(1, freed.Count(i => i == writing));
     }
 }
