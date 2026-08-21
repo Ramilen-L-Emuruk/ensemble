@@ -67,6 +67,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
         Engine.StateChanged += (_, _) =>
             Application.Current.Dispatcher.BeginInvoke(() => PlaybackState = Engine.State);
         Engine.PlaybackEnded += (_, _) => OnPlaybackEnded();
+        // 音声出力が異常停止すると、音が消えるだけでなく audio-master クロックも止まるため
+        // 映像まで停止する。原因が分からないままフリーズしたように見えるので必ず画面に出す
+        Engine.PlaybackFailed += (_, message) =>
+            Application.Current.Dispatcher.BeginInvoke(() =>
+            {
+                // ウィンドウを閉じた後に積み残された継続で、破棄済みの OSD タイマーを
+                // 再始動させない（OnPlaybackEnded と同じ流儀）
+                if (_isDisposed) return;
+                ShowOsd(message);
+            });
         Thumbnails.ThumbnailsReady += (_, sheet) =>
             Application.Current.Dispatcher.Invoke(() => ThumbnailSheet = sheet);
         Engine.StatisticsUpdated += (_, stats) =>
@@ -368,6 +378,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
             if (Engine.IsPipelineQuarantined)
             {
                 ShowOsd("前回の停止処理が完了していません。ファイルを開き直してください");
+                return;
+            }
+            // 音声出力が死んだまま再生を押しても、位置クロックが音声出力基準のため何も進まない。
+            // 無言で失敗させず、OSD の一度きりの通知を見逃した場合でもここで案内する
+            if (Engine.IsAudioOutputFailed)
+            {
+                ShowOsd("音声出力が停止しています。ファイルを開き直してください");
                 return;
             }
             // Play() はパイプライン構築に失敗すると（自身を巻き戻したうえで）例外を送出する

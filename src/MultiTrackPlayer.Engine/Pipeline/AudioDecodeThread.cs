@@ -17,6 +17,7 @@ public sealed unsafe class AudioDecodeThread
     private readonly AudioPacketQueue _queue;
     private readonly Func<double> _getPtsSyncOffset;
     private readonly Action<double>? _onFirstSamplesAfterFlush;
+    private readonly Action<int>? _onTrackAbandoned;
     private readonly ManualResetEventSlim _wake = new(false);
 
     private volatile bool _stopRequested;
@@ -31,19 +32,33 @@ public sealed unsafe class AudioDecodeThread
     private bool _anchorNotifyPending;
     private double _anchorTarget;
 
-    // 異常が続くと毎フレーム記録されてログが埋まるため、トラックごとに最初の 1 回だけ残す
     /// <summary>最後に処理した Flush 番兵の世代。キューの Serial と一致していればシークに追いついている。</summary>
     public int HandledSerial => _handledSerial;
     private volatile int _handledSerial;
 
+    // 異常が続くと毎フレーム記録されてログが埋まるため、トラックごとに最初の 1 回だけ残す
     private readonly bool[] _resampleFailureLogged;
     private readonly bool[] _sendPacketFailureLogged;
+
+    private readonly ResampleFailureTracker _resampleFailures;
+
+    /// <summary>
+    /// リサンプルできず切り離したトラック。以降このトラックのデコード結果はバッファへ足さない
+    /// （<c>AudioTrackState.IsEof</c> を立てた状態とバッファ内容の整合を保つため）。
+    /// シーク時の Flush で一旦解除するが、リサンプラ自体が壊れているトラックは
+    /// シーク後の最初のフレームで再び切り離される。
+    /// </summary>
+    private readonly bool[] _abandonedTracks;
+
+    // 切り離しはシークごとに再発生しうるため、記録と通知はトラックごとに最初の 1 回だけに絞る
+    private readonly bool[] _abandonLogged;
 
     /// <exception cref="ArgumentException">decoders と states の件数が一致しない場合。</exception>
     public AudioDecodeThread(
         IReadOnlyList<AudioDecoder> decoders, IReadOnlyList<AudioTrackState> states,
         AudioPacketQueue queue, Func<double> getPtsSyncOffset,
-        Action<double>? onFirstSamplesAfterFlush = null)
+        Action<double>? onFirstSamplesAfterFlush = null,
+        Action<int>? onTrackAbandoned = null)
     {
         // 両者は常に同じトラック番号で添字アクセスされる。不一致のまま走らせると
         // デコード中に IndexOutOfRangeException となりスレッドごと停止する
@@ -56,8 +71,12 @@ public sealed unsafe class AudioDecodeThread
         _queue = queue;
         _getPtsSyncOffset = getPtsSyncOffset;
         _onFirstSamplesAfterFlush = onFirstSamplesAfterFlush;
+        _onTrackAbandoned = onTrackAbandoned;
         _resampleFailureLogged = new bool[decoders.Count];
         _sendPacketFailureLogged = new bool[decoders.Count];
+        _resampleFailures = new ResampleFailureTracker(decoders.Count);
+        _abandonedTracks = new bool[decoders.Count];
+        _abandonLogged = new bool[decoders.Count];
     }
 
     /// <summary>
@@ -147,11 +166,16 @@ public sealed unsafe class AudioDecodeThread
     {
         // キューの Serial と突き合わせて「このスレッドがシークに追いついたか」を外から判断できるようにする
         _handledSerial = serial;
+        // 連続失敗で切り離したトラックには復帰の機会を与える（シーク先では正常にリサンプルできる
+        // 場合がある）。リサンプラ自体が壊れているトラック（AudioDecoder.IsResamplerBroken）は
+        // シークでは回復しないため、シーク後の最初のフレームで再び切り離される
+        _resampleFailures.Reset();
         for (int i = 0; i < _decoders.Count; i++)
         {
             _decoders[i].FlushBuffers();
             _states[i].Buffer.ClearBuffer();
             _states[i].IsEof = false;
+            _abandonedTracks[i] = false;
         }
         _prerollSerial = serial;
         lock (_seekTargetLock)
@@ -177,16 +201,7 @@ public sealed unsafe class AudioDecodeThread
     private void HandleEof(AVFrame* frame)
     {
         // プリロール中のまま終端に達すると完了通知が出ず、ミキサーの出力保留が解けない
-        if (_prerollActive)
-        {
-            _prerollActive = false;
-            _anchorNotifyPending = false;
-            if (_queue.Serial == _prerollSerial)
-            {
-                Diagnostics.DiagnosticLog.Write("audio", $"EOF 到達のためプリロールを完了扱いにする target={_prerollTarget:F3}");
-                _onFirstSamplesAfterFlush?.Invoke(_prerollTarget);
-            }
-        }
+        CompletePrerollWithoutSamples("EOF 到達");
         for (int i = 0; i < _decoders.Count; i++)
         {
             _decoders[i].SendPacket(null);
@@ -202,6 +217,70 @@ public sealed unsafe class AudioDecodeThread
             // 健全な他トラックまで巻き込んで無音になる
             _states[i].IsEof = true;
         }
+    }
+
+    /// <summary>
+    /// 音声サンプルを一つも出せないまま、シーク後のプリロールを完了扱いにする。
+    /// これを怠るとミキサーの出力保留（HoldOutput）が解除されず、映像ごと止まる。
+    /// </summary>
+    /// <param name="reason">ログに残す理由（「EOF 到達」等）。</param>
+    private void CompletePrerollWithoutSamples(string reason)
+    {
+        if (!_prerollActive && !_anchorNotifyPending) return;
+
+        double target = _prerollTarget;
+        // AddWithGate と同じ理由の世代チェック: 次のシークに割り込まれていたら、この完了通知は
+        // もう無効な世代のもの（本物の Flush が後から来て正しく上書きする）
+        bool serialMatches = _queue.Serial == _prerollSerial;
+        _prerollActive = false;
+        _anchorNotifyPending = false;
+        if (!serialMatches) return;
+
+        Diagnostics.DiagnosticLog.Write("audio", $"{reason}のためプリロールを完了扱いにする target={target:F3}");
+        _onFirstSamplesAfterFlush?.Invoke(target);
+    }
+
+    /// <summary>
+    /// リサンプル失敗を記録し、回復の見込みがないトラックを切り離す。リサンプラ自体が壊れている
+    /// 場合は同じフレーム形式で再試行しても直らないため即座に、それ以外（<c>swr_convert</c> が
+    /// 負値を返す一時的な失敗）は連続失敗が閾値に達してから切り離す。
+    /// </summary>
+    private void HandleResampleFailure(int trackIndex, AudioDecoder decoder)
+    {
+        if (decoder.IsResamplerBroken)
+        {
+            if (!_abandonedTracks[trackIndex])
+                AbandonTrack(trackIndex, "リサンプラの初期化に失敗した");
+            return;
+        }
+        if (_resampleFailures.RecordFailure(trackIndex))
+            AbandonTrack(trackIndex, $"リサンプルが {_resampleFailures.Threshold} 回連続で失敗した");
+    }
+
+    /// <summary>
+    /// リサンプルできないトラックを EOF 扱いにして切り離す。ミキサーは「EOF かつバッファ残量ゼロ」の
+    /// トラックだけを共通利用可能量の計算から除外するため、これを立てないと当該トラックの残量ゼロが
+    /// 全体を 0 に固定し、健全な他トラックまで無音になったうえクロックも進まなくなる。
+    /// </summary>
+    private void AbandonTrack(int trackIndex, string reason)
+    {
+        _abandonedTracks[trackIndex] = true;
+        _states[trackIndex].IsEof = true;
+        // シークのたびに同じトラックが再び切り離されるため、記録と通知は最初の 1 回だけにする
+        //（連続シークで fatal.log へ積み続けると、本当に重要な記録の見通しが悪くなる）
+        if (!_abandonLogged[trackIndex])
+        {
+            _abandonLogged[trackIndex] = true;
+            Diagnostics.DiagnosticLog.WriteFatal("audio",
+                $"音声トラックを切り離した track={trackIndex}（他トラックの再生は継続する）: {reason}");
+            // 記録だけでは「なぜか片方のトラックが無音になった」理由がユーザーに伝わらない
+            _onTrackAbandoned?.Invoke(trackIndex);
+        }
+
+        // 全トラックを切り離すと、この先バッファへの追加（AddWithGate）に到達しないため、
+        // シーク後のプリロール完了通知が出ずミキサーの出力保留が永久に解けない
+        if (_abandonedTracks.All(abandoned => abandoned))
+            CompletePrerollWithoutSamples("全音声トラックの切り離し");
     }
 
     private void HandlePacket(int trackIndex, AVPacket* pkt, AVFrame* frame)
@@ -242,8 +321,14 @@ public sealed unsafe class AudioDecodeThread
             return;
 
         var pcm = decoder.ResampleFrame(frame);
-        if (pcm != null) AddWithGate(trackIndex, pcm, 0, pcm.Length);
-        else LogOnce(_resampleFailureLogged, trackIndex, $"リサンプルに失敗（このトラックは無音になる） track={trackIndex}");
+        if (pcm == null)
+        {
+            LogOnce(_resampleFailureLogged, trackIndex, $"リサンプルに失敗（このトラックは無音になる） track={trackIndex}");
+            HandleResampleFailure(trackIndex, decoder);
+            return;
+        }
+        _resampleFailures.RecordSuccess(trackIndex);
+        AddWithGate(trackIndex, pcm, 0, pcm.Length);
     }
 
     /// <summary>true を返した場合、通常のリサンプル＋追加はスキップ済み（preroll 側で処理を終えている）。</summary>
@@ -264,8 +349,16 @@ public sealed unsafe class AudioDecodeThread
 
             case PrerollActionKind.SkipBytes:
                 var pcm = decoder.ResampleFrame(frame);
-                if (pcm != null)
+                if (pcm == null)
                 {
+                    // preroll 中の失敗を見逃すと、壊れたトラックが切り離されないまま通常経路へ進み、
+                    // ミキサーの共通利用可能量を 0 に固定し続ける
+                    LogOnce(_resampleFailureLogged, trackIndex, $"preroll 中のリサンプルに失敗 track={trackIndex}");
+                    HandleResampleFailure(trackIndex, decoder);
+                }
+                else
+                {
+                    _resampleFailures.RecordSuccess(trackIndex);
                     int skip = Math.Min(action.SkipByteCount, pcm.Length);
                     if (skip < pcm.Length)
                         AddWithGate(trackIndex, pcm, skip, pcm.Length - skip);
@@ -322,6 +415,10 @@ public sealed unsafe class AudioDecodeThread
             else
                 Diagnostics.DiagnosticLog.Write("audio", $"stale preroll 破棄 prerollSerial={_prerollSerial} currentSerial={_queue.Serial} target={_anchorTarget:F3}");
         }
+        // 切り離したトラックは IsEof を立てているため、ここでバッファへ足すとミキサーの除外条件
+        //（EOF かつ残量ゼロ）から外れ、再び共通利用可能量の計算に巻き込まれる。中途半端に
+        // 復帰させず、次のシーク（Flush）まで破棄し続ける
+        if (_abandonedTracks[trackIndex]) return;
         track.Buffer.AddSamples(pcm, offset, count);
     }
 }

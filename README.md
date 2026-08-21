@@ -55,7 +55,7 @@ src/
     └── Settings/              アプリ設定・キーバインド設定
 
 tests/
-└── MultiTrackPlayer.Tests/    xUnit（純ロジックのみ。unsafe/FFmpeg 依存のパイプライン本体は対象外）
+└── MultiTrackPlayer.Tests/    xUnit（FFmpeg・D3D11 に依存しないロジックが対象。デコード・描画パイプライン本体は対象外）
 ```
 
 ## ビルド

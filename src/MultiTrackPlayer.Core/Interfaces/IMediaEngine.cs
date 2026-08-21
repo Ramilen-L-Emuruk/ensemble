@@ -18,6 +18,13 @@ public interface IMediaEngine : IDisposable
     bool IsPipelineQuarantined { get; }
 
     /// <summary>
+    /// 音声出力が異常停止した状態。この間は再生を再開しても再生位置と映像が進まない
+    /// （ファイルを開き直すと解除される）。表示側はこれを見て、無言で失敗させる代わりに
+    /// 復旧手段を案内すること。
+    /// </summary>
+    bool IsAudioOutputFailed { get; }
+
+    /// <summary>
     /// 再生状態が変化したときに発火する。UI スレッド以外からも発火するため、
     /// 購読側でディスパッチャへ移すこと。
     /// </summary>
@@ -53,6 +60,13 @@ public interface IMediaEngine : IDisposable
     event EventHandler<TimeSpan> PositionChanged;
     event EventHandler PlaybackEnded;
     event EventHandler<PlaybackStatistics>? StatisticsUpdated;
+
+    /// <summary>
+    /// 再生を継続できない異常（音声出力の停止など）が起きたことを知らせる。
+    /// UI スレッド以外からも発火するため、購読側でディスパッチャへ移すこと。
+    /// 引数はそのままユーザーへ提示できる文面。
+    /// </summary>
+    event EventHandler<string>? PlaybackFailed;
 }
 
 public record PlaybackStatistics(int DroppedFrames, int DisplayedFrames, double VideoLagSec);
