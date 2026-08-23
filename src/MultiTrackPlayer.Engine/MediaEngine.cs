@@ -83,6 +83,18 @@ public unsafe class MediaEngine : IMediaEngine
     //（同一 HWND を 2 つのスワップチェーンが二重駆動する）。各スレッドは開始時の世代を覚え、
     // 一致しなくなったら自分が過去の世代だと判断して抜ける
     private volatile int _voutGeneration;
+
+    // 映像提示を畳んだときにユーザーへ出す文面。デバイス喪失とそれ以外を必ず区別する。
+    //
+    // vout を畳むと _swapPresenter が null になり IsVideoOutputActive が false へ落ちるため、
+    // UI 側は自動的に CompositionTarget.Rendering の pull 経路（D3DImagePresenter）へ切り替わる。
+    // swapchain だけが壊れてデバイスは生きている場合、この切り替えで映像は復活しうる。
+    // 一方デバイス自体が失われている場合は pull 経路でも表示できない。
+    // 「停止しました」と一律に案内すると前者で実態と食い違うので、文面を分ける
+    private const string DeviceLostMessage =
+        "映像デバイスが失われたため映像を表示できません（ファイルを開き直してください）";
+    private const string VideoOutputFellBackMessage =
+        "高速表示に問題が発生したため通常表示に切り替えました";
     private long _lastVoutPull;
 
     // Paused 中に表示するフレーム（Step/Seek で更新）。Playing 中は使わず TryLeaseDue を直接使う
@@ -205,6 +217,7 @@ public unsafe class MediaEngine : IMediaEngine
     /// 購読側でディスパッチャへ移すこと。引数はそのままユーザーへ提示できる文面。
     /// </summary>
     public event EventHandler<string>? PlaybackFailed;
+    public event EventHandler? VideoRingRebuilt;
 
     /// <summary>動画ファイルを開き、トラック・チャプター情報の構築と音声出力の準備までを行う。</summary>
     /// <exception cref="Exception">
@@ -598,8 +611,15 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     /// <summary>
-    /// 指定位置へシークする。<b>UI スレッドから同期的に呼ぶこと</b>（一時停止中は着地フレームの
-    /// 取得のため最大 500ms ブロックする。詳細は <see cref="TryHoldNextFrame"/> の remarks 参照）。
+    /// 指定位置へシークする。<b>UI スレッドから同期的に呼ぶこと</b>。
+    ///
+    /// <para>
+    /// <b>再生中以外</b>（一時停止中、および EOF 到達で停止したがパイプラインは生きている状態）では、
+    /// 着地フレームを 1 枚表示するために最大 500ms 呼び出しスレッドをブロックする。シークバーの
+    /// ドラッグは移動ごとにここを通るため、着地が遅い状況ではスクラブの反応が鈍くなる
+    /// （スクラブ位置のフレームを見せるための意図的な待機。詳細は
+    /// <see cref="TryHoldNextFrame"/> の remarks 参照）。
+    /// </para>
     /// </summary>
     public void Seek(TimeSpan position)
     {
@@ -618,7 +638,19 @@ public unsafe class MediaEngine : IMediaEngine
         DiagnosticLog.Write("engine", $"Seek 要求 raw={position.TotalSeconds:F3} target={target:F3} state={_state}");
 
         _clock.BeginSeek(target);
-        ReleaseHeldFrame();
+        // 保持フレームを手放してよいのは、それを表示に使っていない再生中だけ。
+        // 再生中は vout / TryGetFrame が due なフレームを直接リースするので _heldLease は不要。
+        //
+        // それ以外（一時停止中・EOF 到達で Stopped へ落ちたがパイプラインは生きている状態）では
+        // vout がこのリースを表示に使っている。ここで先に手放すと「表示すべきスロットが無い」状態に
+        // なり、着地までが暗転として見える（FlipDiscard なので前フレームの再提示もできず、黒で
+        // 塗らなければ 2 枚のバックバッファが交互に出てちらつく）。入れ替えは TryHoldNextFrame が
+        // 「新しいリースを掴んでから旧リースを返す」順で行う。
+        //
+        // 判定は必ず消費側（VideoOutputLoop の Playing 以外の分岐が _heldLease を読む）と同じ条件に
+        // そろえること。ここを「一時停止中だけ」と書くと、EOF で Stopped に落ちた状態のシークが
+        // 「手放すが掴まない」経路に入り、Play を押すまで永久に暗転する
+        if (_state == CorePlaybackState.Playing) ReleaseHeldFrame();
         // ミキサーに残る旧位置の音声を即座に破棄する（シーク中に古い音が鳴り続けるのを防ぐ）。
         // クロックの錨は AudioDecodeThread が新サンプルを投入する瞬間に要求される（早期消費バグの根治）
         foreach (var s in _audioStates) s.Buffer.ClearBuffer();
@@ -642,9 +674,12 @@ public unsafe class MediaEngine : IMediaEngine
         _lastFrameServedTicks = Environment.TickCount64;
         _lastPullTimestamp = Stopwatch.GetTimestamp();
 
-        // 一時停止中のシークは、着地後の最初のフレームを即座に1枚だけ表示する。
-        // 待つのは「このシークの世代」のフレームだけ（等値判定）
-        if (_state == CorePlaybackState.Paused)
+        // 再生中以外のシークは、着地後の最初のフレームを即座に1枚だけ表示する。
+        // 待つのは「このシークの世代」のフレームだけ（等値判定）。
+        // 上の手放し条件と同じ「Playing 以外」でそろえる（片方だけ Paused 限定にすると
+        // EOF 停止中に「手放すが掴まない」状態になり永久に暗転する）。
+        // 完全に停止している場合はこのメソッド冒頭で早期 return しているのでここへは来ない
+        if (_state != CorePlaybackState.Playing)
             TryHoldNextFrame(TimeSpan.FromMilliseconds(500), epoch);
     }
 
@@ -737,7 +772,7 @@ public unsafe class MediaEngine : IMediaEngine
     public void StepForward()
     {
         if (_state != CorePlaybackState.Paused) return;
-        ReleaseHeldFrame();
+        // 旧フレームは手放さずに次を探す（Seek と同じ理由。入れ替えは TryHoldNextFrame が行う）
         TryHoldNextFrame(TimeSpan.FromMilliseconds(500), _videoRing?.CurrentEpoch ?? SeekEpoch.Initial);
     }
 
@@ -820,6 +855,12 @@ public unsafe class MediaEngine : IMediaEngine
     /// メッセージポンプが回らないため追い越しは構造的に発生しない。つまりこのメソッドは
     /// 並行呼び出しに耐性があるのではなく、<b>並行呼び出しされないことに依存している</b>。
     /// 将来シークを非同期化・再入可能化する場合はここの前提が崩れる。
+    ///
+    /// <para>
+    /// 保持フレームの入れ替えは<b>新しいリースを掴んでから旧リースを返す</b>順で行う。逆順にすると
+    /// <c>_heldLease</c> が一瞬 null になり、それを見た vout が表示対象を失って暗転する。
+    /// 掴めなかった場合は旧フレームを保持したままにする（黒を出すより古い絵を残す方がまし）。
+    /// </para>
     /// </remarks>
     private void TryHoldNextFrame(TimeSpan timeout, SeekEpoch epoch)
     {
@@ -837,11 +878,16 @@ public unsafe class MediaEngine : IMediaEngine
                 DiagnosticLog.Write("video",
                     $"表示用フレームの取得が空振り epoch={epoch} timeoutMs={timeout.TotalMilliseconds:F0} " +
                     $"slots={ring.DescribeSlots()}");
+            // 旧フレームは保持したまま抜ける。位置表示だけが新しい位置になって絵が古いままという
+            // 食い違いは残るが、暗転させて何も見えなくするより追いやすい
             return;
         }
 
+        // 先に新しいリースを見えるようにしてから旧リースを返す（順序が逆だと 1 フレーム暗転する）
+        var previous = _heldLease;
         _heldLease = lease;
         _heldFrameConsumed = false;
+        if (previous != null) ring.ReturnLease(previous.SlotIndex);
         PositionChanged?.Invoke(this, _heldLease.Pts);
     }
 
@@ -973,6 +1019,10 @@ public unsafe class MediaEngine : IMediaEngine
         // HW デコード（D3D11VA）かつ VideoProcessor が使える環境なら GPU ゼロコピー経路、
         // そうでなければ従来の CPU（sws_scale）経路のリング・書き込み戦略（sink）を構築する。
         IVideoFrameSink? videoSink = BuildVideoRingAndSink();
+        // リングを作り直すと GPU 共有テクスチャのハンドルが 4 枚とも変わる。ハンドルをキーに
+        // キャッシュしている描画側（D3DImagePresenter）へ、破棄・再取得の合図を送る。
+        // CurrentMedia の変化を代わりに使うと、同じファイルの停止→再生では発火せず取りこぼす
+        VideoRingRebuilt?.Invoke(this, EventArgs.Empty);
 
         _demuxThread = new DemuxThread(
             _fmtCtx, videoStreamIndex, _audioStreamToTrack,
@@ -1113,12 +1163,20 @@ public unsafe class MediaEngine : IMediaEngine
         int currentSlot = -1;     // 現在 backbuffer に出しているスロット
         bool ownedByVout = false; // vout 自身がリース中で、返却責任が vout 側にあるスロットか
         var prevState = _state;  // 直前ループの状態（Paused→Playing 遷移の検出用）
+        // 映像提示を畳んだ理由。null なら正常終了（停止要求・世代交代）。
+        // 「デバイスが失われた」と断定してよいのは実際にそうだった場合だけで、
+        // それ以外の失敗を同じ文面にすると、ユーザーと開発者の両方を誤った原因へ誘導する
+        string? stopReason = null;
 
         try
         {
             while (_voutRunning && generation == _voutGeneration)
             {
-                presenter.WaitForVBlank();
+                if (!presenter.TryWaitForVBlank())
+                {
+                    stopReason = VideoOutputFellBackMessage;
+                    break;
+                }
                 // 世代もここで見る。_voutRunning だけを見ると、停止待ちがタイムアウトした旧スレッドが
                 // 新セッションの立て直した true を素通りし、この下の共有統計フィールド
                 //（_lastVoutPull / _droppedFrames / _displayedFrames / _lastFrameServedTicks /
@@ -1189,11 +1247,28 @@ public unsafe class MediaEngine : IMediaEngine
                 if (!_voutRunning || generation != _voutGeneration) break;
 
                 if (currentSlot >= 0)
+                {
                     presenter.Render(ring, currentSlot);
+                }
+                else
+                {
+                    // まだ 1 枚も表示すべきフレームが無い（ファイルを開いた直後・一時停止で保持フレーム無し）。
+                    // Present は下で必ず呼ぶため、ここで塗らないと FlipDiscard の未初期化バックバッファが出る
+                    presenter.ClearBackBuffer();
+                }
 
                 // frame latency waitable object は「待機と Present が 1:1」でないと枯渇してブロックする。
                 // そのため due が無い vsync でも必ず Present する（前フレームを再提示する）。
-                presenter.Present();
+                PresentOutcome outcome = presenter.TryPresent();
+                if (outcome != PresentOutcome.Presented)
+                {
+                    // TDR・ドライバ更新等でデバイスが失われた場合、このスレッドで復旧はできないので畳む
+                    //（swapchain の破棄は下の finally が行う）
+                    stopReason = outcome == PresentOutcome.DeviceLost
+                        ? DeviceLostMessage
+                        : VideoOutputFellBackMessage;
+                    break;
+                }
             }
 
             if (generation != _voutGeneration)
@@ -1204,7 +1279,12 @@ public unsafe class MediaEngine : IMediaEngine
         catch (Exception ex)
         {
             // D3D 提示中の想定外例外で、専用スレッドの未処理例外→プロセス fail-fast に巻き込まれないようにする。
-            DiagnosticLog.Write("d3dPresenter", $"vout スレッド異常終了（映像提示を停止）: {ex}");
+            // Write は既定 no-op のため、映像が静かに止まる経路を無記録にしないよう WriteFatal で残す
+            DiagnosticLog.WriteFatal("d3dPresenter", $"vout スレッド異常終了（映像提示を停止）: {ex}");
+            // この catch は Render（GetBuffer / CopyResource）・ClearBackBuffer・リング操作・クロック取得の
+            // すべてを覆っている。デバイス喪失と断定できるのは実際に失われている場合だけで、
+            // リング側のレース等を「GPU デバイスの問題」に見せると調査を丸ごと誤らせる
+            stopReason = presenter.IsDeviceLost ? DeviceLostMessage : VideoOutputFellBackMessage;
         }
         finally
         {
@@ -1213,6 +1293,28 @@ public unsafe class MediaEngine : IMediaEngine
             // ゾンビ vout が触る」レースが原理的に発生しない。
             presenter.Dispose();
         }
+
+        if (stopReason == null) return; // 停止要求・世代交代による正常終了
+
+        // 記録は世代を問わず残す。世代が交代していても異常が起きた事実は変わらないので取りこぼさない。
+        // 個別の原因は既に TryPresent / TryWaitForVBlank / catch のいずれかが WriteFatal で残しているため、
+        // ここは経緯を補う Write にとどめる（WriteFatal を重ねると vout スレッドを余計に数百ms 止める）
+        DiagnosticLog.Write("d3dPresenter",
+            $"映像提示を停止 generation={generation} 現在世代={_voutGeneration} 理由={stopReason}");
+
+        // ユーザーへの通知と後始末は現行世代のときだけ行う。世代が交代しているのは
+        // ユーザー自身が停止・ファイル切替を操作した直後なので、そこへエラーを出しても混乱させるだけ。
+        // なお「この喪失は次の vout が検出する」わけではない（_voutGeneration が進むのは
+        // StopVideoOutput だけで、次の vout は後続の Play で初めて生成される）。検出は
+        // 次に映像出力を始めたときまで遅れる
+        if (generation != _voutGeneration) return;
+
+        _voutRunning = false;
+        // 破棄済みの presenter を指したままにすると IsVideoOutputActive が真を返し続け、
+        // 「vout が動いていない＝_swapPresenter は null」という StopVideoOutput 側の不変条件が崩れる。
+        // 世代一致を確認済みなので、他スレッドの後始末と競合しない
+        _swapPresenter = null;
+        PlaybackFailed?.Invoke(this, stopReason);
     }
 
     /// <summary>vout スレッドを停止する（リング破棄より先に呼ぶこと）。スワップチェーンの破棄は vout スレッド自身に委譲する。</summary>
