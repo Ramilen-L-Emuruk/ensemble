@@ -64,6 +64,10 @@ public unsafe class MediaEngine : IMediaEngine
     // 触るため、新しいパイプラインの音声出力保留を実プリロール完了前に解除してしまう
     //（早送り・A-V ズレの再発）。各スレッドは構築時の世代を握り、一致しない通知は捨てる
     private volatile int _pipelineGeneration;
+    // リングの Flush の呼び出し規約違反を記録したか。WriteFatal は数百ms ブロックするため
+    // 毎シーク記録すると症状が「固まる」から「毎回のシークが遅れる」へ化けて診断しづらくなる。
+    // パイプラインを作り直すたびにリセットする（DemuxThread 側の _flushViolationLogged と対称）
+    private bool _ringFlushViolationLogged;
     private Timer? _statusTimer;
     private volatile bool _playbackEndedFired;
 
@@ -593,11 +597,16 @@ public unsafe class MediaEngine : IMediaEngine
             DiagnosticLog.Write("engine", $"停止時の巻き戻しに失敗 ret={ret} ({FFmpegError.Describe(ret)})");
     }
 
+    /// <summary>
+    /// 指定位置へシークする。<b>UI スレッドから同期的に呼ぶこと</b>（一時停止中は着地フレームの
+    /// 取得のため最大 500ms ブロックする。詳細は <see cref="TryHoldNextFrame"/> の remarks 参照）。
+    /// </summary>
     public void Seek(TimeSpan position)
     {
         // demux スレッドが動いていない状態でシークを受け付けると、HoldOutput だけ立てて
         // 解除側（プリロール完了通知）が永久に来ず、以後の再生が音も映像も出なくなる
-        if (_fmtCtx == null || _demuxThread == null)
+        var demuxThread = _demuxThread;
+        if (_fmtCtx == null || demuxThread == null)
         {
             DiagnosticLog.Write("engine", $"再生していないためシーク要求を無視 target={position.TotalSeconds:F3} state={_state}");
             return;
@@ -623,18 +632,20 @@ public unsafe class MediaEngine : IMediaEngine
             _videoPrerollReady = _videoDecoder == null;
             _audioPrerollReady = _audioDecoders.Count == 0;
             _mixer.HoldOutput = true;
-            DiagnosticLog.Write("gate", $"HoldOutput 設定 target={target:F3} videoQueueSerial={_videoQueue?.Serial ?? -1} audioQueueSerial={_audioQueue?.Serial ?? -1}");
+            DiagnosticLog.Write("gate", $"HoldOutput 設定 target={target:F3} videoQueueEpoch={_videoQueue?.Epoch.Value ?? -1} audioQueueEpoch={_audioQueue?.Epoch.Value ?? -1}");
         }
 
-        int minSerial = (_videoRing?.CurrentSerial ?? 0) + 1; // これから demux が Flush で進める世代
-        _demuxThread?.RequestSeek(target);
+        // このシークで採番された世代。以前は「リングの現在世代 + 1」と予測していたが、
+        // リングの Flush 回数に依存する予測だったため、シーク前の残骸フレームを掴んでしまっていた
+        SeekEpoch epoch = demuxThread.RequestSeek(target);
         _playbackEndedFired = false;
         _lastFrameServedTicks = Environment.TickCount64;
         _lastPullTimestamp = Stopwatch.GetTimestamp();
 
-        // 一時停止中のシークは、着地後（＝新世代）の最初のフレームを即座に1枚だけ表示する
+        // 一時停止中のシークは、着地後の最初のフレームを即座に1枚だけ表示する。
+        // 待つのは「このシークの世代」のフレームだけ（等値判定）
         if (_state == CorePlaybackState.Paused)
-            TryHoldNextFrame(TimeSpan.FromMilliseconds(500), minSerial);
+            TryHoldNextFrame(TimeSpan.FromMilliseconds(500), epoch);
     }
 
     /// <summary>次に実音声が mixer へ書かれた瞬間、その書込カーソル位置を srcPts=target としてクロックを起点合わせする。</summary>
@@ -727,7 +738,7 @@ public unsafe class MediaEngine : IMediaEngine
     {
         if (_state != CorePlaybackState.Paused) return;
         ReleaseHeldFrame();
-        TryHoldNextFrame(TimeSpan.FromMilliseconds(500), _videoRing?.CurrentSerial ?? 0);
+        TryHoldNextFrame(TimeSpan.FromMilliseconds(500), _videoRing?.CurrentEpoch ?? SeekEpoch.Initial);
     }
 
     public void StepBackward()
@@ -798,10 +809,36 @@ public unsafe class MediaEngine : IMediaEngine
         _heldFrameConsumed = true;
     }
 
-    private void TryHoldNextFrame(TimeSpan timeout, int minSerial)
+    /// <param name="epoch">
+    /// 欲しいフレームのシーク世代。等値で判定するため、シーク前の残骸フレームを掴まない。
+    /// </param>
+    /// <remarks>
+    /// <b>呼び出しは UI スレッドから同期的に行うこと。</b>この待機は最大 <paramref name="timeout"/> ぶん
+    /// 呼び出しスレッドをブロックする。等値で待つため、待機中に別のシークが割り込んで世代が
+    /// 追い越されると空振りする。現在は <see cref="Seek"/>・<see cref="StepForward"/>・
+    /// <see cref="StepBackward"/> のすべてが UI スレッド上の同期呼び出しで、この待機中に
+    /// メッセージポンプが回らないため追い越しは構造的に発生しない。つまりこのメソッドは
+    /// 並行呼び出しに耐性があるのではなく、<b>並行呼び出しされないことに依存している</b>。
+    /// 将来シークを非同期化・再入可能化する場合はここの前提が崩れる。
+    /// </remarks>
+    private void TryHoldNextFrame(TimeSpan timeout, SeekEpoch epoch)
     {
-        if (_videoRing == null) return;
-        if (!_videoRing.TryLeaseOldest(timeout, minSerial, out var lease) || lease == null) return;
+        // Seek / PublishSeekTarget と同じくローカルへ捕捉してから使う（フィールドを複数回
+        // 参照するとティアダウンとの競合に対する露出面が増える）
+        var ring = _videoRing;
+        if (ring == null) return;
+        if (!ring.TryLeaseOldest(timeout, epoch, out var lease) || lease == null)
+        {
+            // 一時停止中のシーク・コマ送りで「映像が更新されないが原因が分からない」状態を
+            // 追えるようにする（プリロールが timeout に間に合わなかった場合もここを通る）。
+            // DescribeSlots はリングのロックを取って文字列を組み立てるため、
+            // ログ無効時に引数として評価されないよう Enabled で囲む
+            if (DiagnosticLog.Enabled)
+                DiagnosticLog.Write("video",
+                    $"表示用フレームの取得が空振り epoch={epoch} timeoutMs={timeout.TotalMilliseconds:F0} " +
+                    $"slots={ring.DescribeSlots()}");
+            return;
+        }
 
         _heldLease = lease;
         _heldFrameConsumed = false;
@@ -943,6 +980,8 @@ public unsafe class MediaEngine : IMediaEngine
 
         // このパイプラインの世代。取り残された旧スレッドの遅延通知を弾くために使う
         int pipelineGeneration = ++_pipelineGeneration;
+        // リング・キューは新規生成されて世代が Initial に戻るため、違反記録の抑制も解除する
+        _ringFlushViolationLogged = false;
 
         if (_videoDecoder != null && videoSink != null)
             _videoDecodeThread = new VideoDecodeThread(
@@ -1206,23 +1245,32 @@ public unsafe class MediaEngine : IMediaEngine
         return stopped;
     }
 
-    // demux スレッドがシーク実行直後（各キューへ FlushMarker を入れる前）に呼ぶ
-    private void PublishSeekTarget(double normalizedTargetSeconds)
+    // demux スレッドがシーク実行直後（各キューへ Flush 番兵を入れる前）に呼ぶ。
+    // epoch は DemuxThread.RequestSeek が採番した値で、この後に積まれる Flush 番兵と
+    // リングのスロットに同じ値が刻まれる。予測は一切していない
+    private void PublishSeekTarget(SeekEpoch epoch, double normalizedTargetSeconds)
     {
-        // これから videoQueue.Flush()/audioQueue.Flush() が発行する Flush 番兵自身の Serial を先読みする
-        // （Flush() は呼ばれるたびに Serial をちょうど+1して即座にその番兵を積むため確定的に計算できる）。
         // 短時間に複数回シークされて前の Flush 番兵が後続の Flush() の Clear() で消えても、
-        // 生き残った番兵は必ず自分の Serial に対応する正しい目標値を引けるようにするための紐付け
-        int videoTargetSerial = (_videoQueue?.Serial ?? 0) + 1;
-        int audioTargetSerial = (_audioQueue?.Serial ?? 0) + 1;
-        _videoDecodeThread?.SetSeekTarget(videoTargetSerial, normalizedTargetSeconds);
-        _audioDecodeThread?.SetSeekTarget(audioTargetSerial, normalizedTargetSeconds);
+        // 生き残った番兵は必ず自分の世代に対応する正しい目標値を引けるようにするための紐付け
+        _videoDecodeThread?.SetSeekTarget(epoch, normalizedTargetSeconds);
+        _audioDecodeThread?.SetSeekTarget(epoch, normalizedTargetSeconds);
         // リングを demux スレッド側から即時 Flush する。これが無いと、リング満杯で
-        // BeginWrite ブロック中の VideoDecodeThread が FlushMarker を処理できず、
+        // BeginWrite ブロック中の VideoDecodeThread が Flush 番兵を処理できず、
         // 後方シーク時（リング内フレームが全て「未来」になり誰も取り出さない）に
-        // 音声だけ流れて映像が止まるデッドロックになる
-        _videoRing?.Flush();
-        DiagnosticLog.Write("demux", $"seek 処理 target={normalizedTargetSeconds:F3} ringSerial={_videoRing?.CurrentSerial ?? -1}");
+        // 音声だけ流れて映像が止まるデッドロックになる。
+        // これがリングを Flush する唯一の経路（デコードスレッド側では呼ばない）
+        var ring = _videoRing;
+        bool ringFlushed = ring == null || ring.Flush(epoch);
+        DiagnosticLog.Write("demux", $"seek 処理 target={normalizedTargetSeconds:F3} epoch={epoch}");
+        // 無視されるのは呼び出し規約が破られたときだけ（採番は単調増加なので正当な世代は必ず適用される）。
+        // 起きていた場合、シーク前の Ready フレームが残ったまま新世代の再生が始まる
+        if (!ringFlushed && !_ringFlushViolationLogged)
+        {
+            _ringFlushViolationLogged = true;
+            DiagnosticLog.WriteFatal("demux",
+                $"リングのシーク世代が重複・巻き戻し（呼び出し規約違反。以降は記録しない） " +
+                $"epoch={epoch} 現在={ring?.CurrentEpoch}");
+        }
     }
 
     /// <returns>すべてのスレッドが時間内に停止した場合 true。false のときネイティブ資源は他スレッドが触っている可能性がある。</returns>
@@ -1396,13 +1444,19 @@ public unsafe class MediaEngine : IMediaEngine
     private void DetectVideoStall()
     {
         if (!DiagnosticLog.Enabled) return;
-        if (_state != CorePlaybackState.Playing || _videoDecoder == null || _videoRing == null) return;
+        // TryHoldNextFrame と同じくローカルへ捕捉してから使う。このメソッドは状態タイマー
+        //（ThreadPool）から呼ばれる一方 _videoRing を null にするのは UI スレッドなので、
+        // null チェックと実際の参照でフィールドを 2 度読むと、その間に null 化されうる
+        //（通常は StopStatusTimer が実行中のコールバックの完了を待つが、その待ちが
+        // タイムアウトした縮退経路では待たずに破棄が進む）
+        var ring = _videoRing;
+        if (_state != CorePlaybackState.Playing || _videoDecoder == null || ring == null) return;
 
         long now = Environment.TickCount64;
         if (now - _lastFrameServedTicks < VideoStallThresholdMs) return;
 
         DiagnosticLog.Write("stall",
-            $"映像 {VideoStallThresholdMs}ms 以上停止 clock={GetMasterClockSeconds():F3} ring={_videoRing.DescribeSlots()}");
+            $"映像 {VideoStallThresholdMs}ms 以上停止 clock={GetMasterClockSeconds():F3} ring={ring.DescribeSlots()}");
         _lastFrameServedTicks = now; // 停止継続中は 2 秒おきに記録
     }
 
@@ -1418,14 +1472,12 @@ public unsafe class MediaEngine : IMediaEngine
     {
         // demux がシーク要求を抱えている／処理中
         if (_demuxThread?.HasPendingSeek == true) return false;
-        // Flush 番兵は積まれたが、映像デコードスレッドがまだ消費していない。
-        // リングの世代とは比較しないこと（リングの Flush は 1 回のシークで 2 度進むため
-        // キューの Serial と 1:1 で対応せず、常に不一致になって再生終了を検出できなくなる）
+        // Flush 番兵は積まれたが、映像デコードスレッドがまだ消費していない
         if (_videoQueue != null && _videoDecodeThread != null
-            && _videoQueue.Serial != _videoDecodeThread.HandledSerial) return false;
+            && _videoQueue.Epoch != _videoDecodeThread.HandledEpoch) return false;
         // 同じく音声側が追いついていない
         if (_audioQueue != null && _audioDecodeThread != null
-            && _audioQueue.Serial != _audioDecodeThread.HandledSerial) return false;
+            && _audioQueue.Epoch != _audioDecodeThread.HandledEpoch) return false;
         return true;
     }
 

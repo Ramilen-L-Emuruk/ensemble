@@ -27,17 +27,18 @@ public unsafe sealed class AudioPacketQueue
             disposer: r => PacketOwnership.Release((AVPacket*)r.Packet));
     }
 
-    public int Serial => _queue.Serial;
+    public SeekEpoch Epoch => _queue.Epoch;
     public bool IsClosed => _queue.IsClosed;
     public bool Close() => _queue.Close();
-    public int Flush() => _queue.Flush();
-    public void PutEof(int serial) => _queue.PutEof(serial);
+    /// <summary>戻り値の意味は <see cref="BoundedSerialQueue{T}.Flush"/> を参照（false は呼び出し規約違反）。</summary>
+    public bool Flush(SeekEpoch epoch) => _queue.Flush(epoch);
+    public void PutEof(SeekEpoch epoch) => _queue.PutEof(epoch);
     public void AbortPutWaiters() => _queue.AbortPutWaiters();
 
-    public bool PutMove(AVPacket* src, int trackIndex, int serial)
+    public bool PutMove(AVPacket* src, int trackIndex, SeekEpoch epoch)
     {
         AVPacket* owned = PacketOwnership.AcquireCopy(src);
-        bool ok = _queue.Put(new AudioPacketRef((IntPtr)owned, trackIndex), serial);
+        bool ok = _queue.Put(new AudioPacketRef((IntPtr)owned, trackIndex), epoch);
         if (!ok) PacketOwnership.Release(owned);
         return ok;
     }

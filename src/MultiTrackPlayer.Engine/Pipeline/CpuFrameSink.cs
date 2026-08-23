@@ -19,7 +19,7 @@ internal sealed unsafe class CpuFrameSink : IVideoFrameSink
         _ring = ring;
     }
 
-    public int BeginWrite(int width, int height) => _ring.BeginWrite(width, height);
+    public int BeginWrite(int width, int height, SeekEpoch epoch) => _ring.BeginWrite(width, height, epoch);
 
     public bool WriteFrame(AVFrame* frame, int slotIndex)
     {
@@ -31,8 +31,6 @@ internal sealed unsafe class CpuFrameSink : IVideoFrameSink
     public void CommitWrite(int slotIndex, double ptsSeconds) => _ring.CommitWrite(slotIndex, ptsSeconds);
 
     public void AbortWrite(int slotIndex) => _ring.AbortWrite(slotIndex);
-
-    public void Flush() => _ring.Flush();
 
     public void MarkEof() => _ring.MarkEof();
 }

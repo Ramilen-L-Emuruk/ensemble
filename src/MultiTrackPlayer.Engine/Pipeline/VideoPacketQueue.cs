@@ -15,18 +15,19 @@ public unsafe sealed class VideoPacketQueue
             disposer: p => PacketOwnership.Release((AVPacket*)p));
     }
 
-    public int Serial => _queue.Serial;
+    public SeekEpoch Epoch => _queue.Epoch;
     public bool IsClosed => _queue.IsClosed;
     public bool Close() => _queue.Close();
-    public int Flush() => _queue.Flush();
-    public void PutEof(int serial) => _queue.PutEof(serial);
+    /// <summary>戻り値の意味は <see cref="BoundedSerialQueue{T}.Flush"/> を参照（false は呼び出し規約違反）。</summary>
+    public bool Flush(SeekEpoch epoch) => _queue.Flush(epoch);
+    public void PutEof(SeekEpoch epoch) => _queue.PutEof(epoch);
     public void AbortPutWaiters() => _queue.AbortPutWaiters();
 
     /// <summary>src の中身の所有権を取って投入する。Close 済みで投入できなかった場合は自分で解放する。</summary>
-    public bool PutMove(AVPacket* src, int serial)
+    public bool PutMove(AVPacket* src, SeekEpoch epoch)
     {
         AVPacket* owned = PacketOwnership.AcquireCopy(src);
-        bool ok = _queue.Put((IntPtr)owned, serial);
+        bool ok = _queue.Put((IntPtr)owned, epoch);
         if (!ok) PacketOwnership.Release(owned);
         return ok;
     }

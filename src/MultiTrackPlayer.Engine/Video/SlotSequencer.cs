@@ -1,7 +1,7 @@
 namespace MultiTrackPlayer.Engine.Video;
 
 /// <summary>
-/// 固定長スロットの状態機械（Free/Writing/Ready/Leased）と serial 世代・Monitor 待機・Flush・EOF・
+/// 固定長スロットの状態機械（Free/Writing/Ready/Leased）とシーク世代（<see cref="SeekEpoch"/>）・Monitor 待機・Flush・EOF・
 /// Close・due 選択（<see cref="FrameSelector"/> 委譲）を担う汎用コア。ペイロード（ネイティブバッファや
 /// GPU テクスチャ）は保持せず、呼び出し側がスロット index に対応づけて管理する。ペイロードの確保・解放は
 /// クリティカルセクション内で呼ばれるコールバックで行い、状態遷移との原子性を保つ。
@@ -14,7 +14,11 @@ public sealed class SlotSequencer
 {
     /// <summary>BeginWrite の戻り値: Close 済み。</summary>
     public const int SlotClosed = -1;
-    /// <summary>BeginWrite の戻り値: 空き待ち中に Flush が発生（このフレームは破棄すべき）。</summary>
+    /// <summary>
+    /// BeginWrite の戻り値: 書き込もうとしたフレームがすでに過去の世代のもの（このフレームは破棄すべき）。
+    /// 空き待ち中に Flush が発生した場合と、シーク前のパケットから作られたフレームを
+    /// 書き込もうとした場合の両方でこれを返す。
+    /// </summary>
     public const int SlotFlushed = -2;
 
     private enum SlotState { Free, Writing, Ready, Leased }
@@ -23,7 +27,8 @@ public sealed class SlotSequencer
     {
         public SlotState State = SlotState.Free;
         public double PtsSeconds;
-        public int Serial;
+        /// <summary>このスロットに書かれたフレームが属するシーク世代。</summary>
+        public SeekEpoch Epoch;
         // 破棄時にまだ他スレッドが参照していて即解放できなかったスロットに立つ。
         // 参照が離れる経路（Leased→ReturnLease / Writing→CommitWrite・AbortWrite）で解放する
         public bool PendingFreeOnRelease;
@@ -34,8 +39,9 @@ public sealed class SlotSequencer
     private readonly object _lock = new();
     private bool _closed;
     private bool _eofMarked;
-    // Flush ごとに増える世代番号。古い世代のフレームの CommitWrite は棄却される
-    private int _serial;
+    // 現在のシーク世代。demux が採番した値を Flush で受け取る（自分では進めない）。
+    // 古い世代のフレームの BeginWrite / CommitWrite は棄却される
+    private SeekEpoch _epoch = SeekEpoch.Initial;
 
     /// <param name="slotCount">スロット数。</param>
     /// <param name="onFreePayload">
@@ -51,28 +57,35 @@ public sealed class SlotSequencer
 
     public int SlotCount => _slots.Length;
 
-    public int CurrentSerial { get { lock (_lock) return _serial; } }
+    /// <summary>現在のシーク世代（最後に <see cref="Flush"/> で設定された値）。</summary>
+    public SeekEpoch CurrentEpoch { get { lock (_lock) return _epoch; } }
 
     /// <summary>
     /// Free スロットが空くまでブロックし、確保できたら <paramref name="onAcquired"/> をロック内で呼んで
     /// から Writing に遷移させて index を返す。ペイロードの確保はこのコールバック内で行うことで状態遷移と
-    /// 同一クリティカルセクションに収める。Close 済みなら <see cref="SlotClosed"/>、待機中に Flush が起きたら
+    /// 同一クリティカルセクションに収める。Close 済みなら <see cref="SlotClosed"/>、
+    /// <paramref name="epoch"/> が現在の世代と一致しない（待機中に Flush が起きた場合を含む）なら
     /// <see cref="SlotFlushed"/>（呼び出し側はこのフレームを破棄する）。
     /// </summary>
-    public int BeginWrite(Action<int> onAcquired)
+    /// <param name="epoch">
+    /// 書き込もうとしているフレームを産んだパケットの世代。<b>リングの現在世代ではなくデータ側の世代</b>を
+    /// 渡すこと。これによって「demux がリングを Flush した後、デコードスレッドがまだ Flush 番兵に
+    /// 到達しておらずシーク前のパケットを処理している」間のフレームが、新世代の刻印を得て
+    /// 表示対象になるのを防ぐ（一時停止中のシークでシーク前のフレームが残る不具合の根治）。
+    /// </param>
+    public int BeginWrite(SeekEpoch epoch, Action<int> onAcquired)
     {
         lock (_lock)
         {
-            int entrySerial = _serial;
             int idx;
-            while ((idx = FindFreeSlotLocked()) < 0 && !_closed && _serial == entrySerial)
+            while ((idx = FindFreeSlotLocked()) < 0 && !_closed && epoch == _epoch)
                 Monitor.Wait(_lock);
             if (_closed) return SlotClosed;
-            if (_serial != entrySerial) return SlotFlushed;
+            if (epoch != _epoch) return SlotFlushed;
 
             onAcquired(idx);
             var slot = _slots[idx];
-            slot.Serial = _serial;
+            slot.Epoch = epoch;
             slot.State = SlotState.Writing;
             return idx;
         }
@@ -87,7 +100,7 @@ public sealed class SlotSequencer
             if (!TryReleaseDeferredLocked(slot, slotIndex, out releaseError))
             {
                 // 変換中に Flush が起きた（＝シーク前のフレーム）場合は Ready にせず破棄する
-                if (slot.Serial != _serial)
+                if (slot.Epoch != _epoch)
                 {
                     slot.State = SlotState.Free;
                 }
@@ -209,15 +222,19 @@ public sealed class SlotSequencer
 
     /// <summary>
     /// 最も古い Ready スロットを1枚リースする（クロック非依存。Step・一時停止中シーク用）。
-    /// minSerial 未満の世代（＝シーク前の残骸）は対象外。timeout 内に無ければ false。
+    /// <paramref name="epoch"/> と世代が<b>一致する</b>スロットだけを対象にする。timeout 内に無ければ false。
     /// </summary>
-    public bool TryLeaseOldest(TimeSpan timeout, int minSerial, out int slotIndex, out double ptsSeconds)
+    /// <param name="epoch">
+    /// 欲しいフレームの世代。下限（以上）ではなく等値で判定するため、シーク前の残骸フレームも
+    /// 「まだ来ていない次の世代」のフレームも取り違えない。
+    /// </param>
+    public bool TryLeaseOldest(TimeSpan timeout, SeekEpoch epoch, out int slotIndex, out double ptsSeconds)
     {
         lock (_lock)
         {
             var deadline = DateTime.UtcNow + timeout;
             int chosen;
-            while ((chosen = FindOldestReadyLocked(minSerial)) < 0 && !_closed)
+            while ((chosen = FindOldestReadyLocked(epoch)) < 0 && !_closed)
             {
                 var remaining = deadline - DateTime.UtcNow;
                 if (remaining <= TimeSpan.Zero) { slotIndex = -1; ptsSeconds = 0; return false; }
@@ -254,20 +271,40 @@ public sealed class SlotSequencer
     }
 
     /// <summary>
-    /// シーク時: 世代番号を進めて Ready を Free に戻し、EOF 状態も解除する。BeginWrite で空き待ち中の
-    /// デコーダは SlotFlushed で起床する。Writing スロットはデコーダが変換中のため触らない（CommitWrite が
-    /// 世代不一致で自ら破棄する）。Leased スロットは呼び出し側がまだ参照中の可能性があるため触らない。
+    /// シーク時: 世代を <paramref name="epoch"/> へ更新して Ready を Free に戻し、EOF 状態も解除する。
+    /// BeginWrite で空き待ち中のデコーダは SlotFlushed で起床する。Writing スロットはデコーダが変換中のため
+    /// 触らない（CommitWrite が世代不一致で自ら破棄する）。Leased スロットは呼び出し側がまだ参照中の
+    /// 可能性があるため触らない。
+    ///
+    /// <para>
+    /// <b>1 つの世代につき有効な Flush は 1 回だけ</b>。現在と同じか古い世代での呼び出しは
+    /// 何も変更せず <c>false</c> を返す（<c>BoundedSerialQueue.Flush</c> と対称）。
+    /// 受け入れてしまうと、すでに書き込まれた新世代の Ready フレームを残骸と誤認して捨てることになる
+    /// （世代を巻き戻す・同じ世代を二度掃除する、のどちらも同じ結果になる）。
+    /// </para>
+    /// <para>
+    /// 採番が単調増加（<c>DemuxThread.RequestSeek</c> が唯一の採番元）である限り、正当な新しい
+    /// シークの世代が現在の世代以下になることはないため、このガードが正当な Flush を弾くことはない。
+    /// 発火するのは呼び出し規約が破られたときだけ。何も変更しないので、
+    /// <see cref="BeginWrite"/> で待機中のスレッドを起こす必要もない（起こす対象の状態変化がない）。
+    /// </para>
     /// </summary>
-    public void Flush()
+    /// <returns>
+    /// 適用した場合 true。現在と同じか古い世代で呼ばれて無視した場合 false
+    /// （呼び出し側は呼び出し規約違反として記録すること）。
+    /// </returns>
+    public bool Flush(SeekEpoch epoch)
     {
         lock (_lock)
         {
-            _serial++;
+            if (epoch <= _epoch) return false;
+            _epoch = epoch;
             foreach (var slot in _slots)
                 if (slot.State == SlotState.Ready)
                     slot.State = SlotState.Free;
             _eofMarked = false;
             Monitor.PulseAll(_lock);
+            return true;
         }
     }
 
@@ -362,9 +399,9 @@ public sealed class SlotSequencer
             for (int i = 0; i < _slots.Length; i++)
             {
                 var s = _slots[i];
-                parts[i] = $"[{i}:{s.State} pts={s.PtsSeconds:F3} serial={s.Serial}]";
+                parts[i] = $"[{i}:{s.State} pts={s.PtsSeconds:F3} epoch={s.Epoch}]";
             }
-            return $"serial={_serial} eof={_eofMarked} closed={_closed} {string.Join(" ", parts)}";
+            return $"epoch={_epoch} eof={_eofMarked} closed={_closed} {string.Join(" ", parts)}";
         }
     }
 
@@ -375,13 +412,13 @@ public sealed class SlotSequencer
         return -1;
     }
 
-    private int FindOldestReadyLocked(int minSerial)
+    private int FindOldestReadyLocked(SeekEpoch epoch)
     {
         int chosen = -1;
         double bestPts = double.MaxValue;
         for (int i = 0; i < _slots.Length; i++)
         {
-            if (_slots[i].State == SlotState.Ready && _slots[i].Serial >= minSerial &&
+            if (_slots[i].State == SlotState.Ready && _slots[i].Epoch == epoch &&
                 _slots[i].PtsSeconds < bestPts)
             {
                 chosen = i;

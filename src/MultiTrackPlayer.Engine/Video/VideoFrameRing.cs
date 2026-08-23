@@ -15,7 +15,7 @@ public sealed class VideoFrameRing : IVideoFrameRing
 
     /// <summary>BeginWrite の戻り値: Close 済み。</summary>
     public const int SlotClosed = SlotSequencer.SlotClosed;
-    /// <summary>BeginWrite の戻り値: 空き待ち中に Flush が発生（このフレームは破棄すべき）。</summary>
+    /// <summary>BeginWrite の戻り値: 書き込もうとしたフレームがすでに過去の世代（このフレームは破棄すべき）。</summary>
     public const int SlotFlushed = SlotSequencer.SlotFlushed;
 
     private sealed class Payload
@@ -36,17 +36,19 @@ public sealed class VideoFrameRing : IVideoFrameRing
         _seq = new SlotSequencer(SlotCount, FreePayload);
     }
 
-    public int CurrentSerial => _seq.CurrentSerial;
+    public SeekEpoch CurrentEpoch => _seq.CurrentEpoch;
 
     /// <summary>
-    /// Free スロットが空くまでブロックする。Close 済みなら SlotClosed、待機中に Flush が起きたら SlotFlushed。
+    /// Free スロットが空くまでブロックする。Close 済みなら SlotClosed、<paramref name="epoch"/> が
+    /// 現在の世代と一致しなければ SlotFlushed。
     /// 確保できたスロットには幅×高さ×4 バイトのネイティブバッファを（必要なら作り直して）割り当てる。
     /// </summary>
-    public int BeginWrite(int width, int height)
+    /// <param name="epoch">書き込むフレームを産んだパケットの世代（<see cref="SlotSequencer.BeginWrite"/> 参照）。</param>
+    public int BeginWrite(int width, int height, SeekEpoch epoch)
     {
         int stride = width * 4;
         int needed = stride * height;
-        return _seq.BeginWrite(idx =>
+        return _seq.BeginWrite(epoch, idx =>
         {
             var p = _payloads[idx];
             if (p.Capacity < needed)
@@ -90,11 +92,11 @@ public sealed class VideoFrameRing : IVideoFrameRing
 
     /// <summary>
     /// 最も古い Ready フレームを1枚リースする（クロック非依存。Step・一時停止中シーク用）。
-    /// minSerial 未満の世代（＝シーク前の残骸）は対象外。timeout 内に無ければ false。
+    /// <paramref name="epoch"/> と世代が一致するスロットだけを対象にする。timeout 内に無ければ false。
     /// </summary>
-    public bool TryLeaseOldest(TimeSpan timeout, int minSerial, out VideoFrameLease? lease)
+    public bool TryLeaseOldest(TimeSpan timeout, SeekEpoch epoch, out VideoFrameLease? lease)
     {
-        if (_seq.TryLeaseOldest(timeout, minSerial, out int idx, out double pts))
+        if (_seq.TryLeaseOldest(timeout, epoch, out int idx, out double pts))
         {
             var p = _payloads[idx];
             lease = new VideoFrameLease(idx, FrameKind.Cpu, p.Buffer, p.Width, p.Height, p.Stride,
@@ -109,12 +111,13 @@ public sealed class VideoFrameRing : IVideoFrameRing
     public void ReturnLease(int slotIndex) => _seq.ReturnLease(slotIndex);
 
     /// <summary>
-    /// シーク時: 世代番号を進めて Ready を Free に戻し、EOF 状態も解除する。どのスレッドから呼んでも安全
-    /// （BeginWrite で空き待ち中のデコーダは SlotFlushed で起床する）。これにより「リング満杯でブロック中の
-    /// デコードスレッドが FlushMarker を処理できない」デッドロック（後方シーク時に音声だけ流れて映像が止まる
-    /// 不具合）を demux スレッド側から解消できる。
+    /// シーク時: 世代を <paramref name="epoch"/> へ更新して Ready を Free に戻し、EOF 状態も解除する。
+    /// どのスレッドから呼んでも安全（BeginWrite で空き待ち中のデコーダは SlotFlushed で起床する）。
+    /// これにより「リング満杯でブロック中のデコードスレッドが Flush 番兵を処理できない」デッドロック
+    /// （後方シーク時に音声だけ流れて映像が止まる不具合）を demux スレッド側から解消できる。
+    /// 戻り値の意味は <see cref="SlotSequencer.Flush"/> を参照（false は呼び出し規約違反）。
     /// </summary>
-    public void Flush() => _seq.Flush();
+    public bool Flush(SeekEpoch epoch) => _seq.Flush(epoch);
 
     /// <summary>診断用: 全スロットの状態スナップショット（停止検知時のログ出力に使う）。</summary>
     public string DescribeSlots() => _seq.DescribeSlots();

@@ -18,22 +18,31 @@ public sealed unsafe class VideoDecodeThread
 
     private volatile bool _stopRequested;
     private readonly object _seekTargetLock = new();
-    // Flush 番兵の Serial をキーに目標値を対応付ける。FIFO（順序のみで対応付け）だと、
+    // シーク世代をキーに目標値を対応付ける。FIFO（順序のみで対応付け）だと、
     // BoundedSerialQueue.Flush() が短時間に連続で呼ばれた際に前の Flush 番兵が Clear() で
     // 消えて後続の1個しか生き残らない一方、SetSeekTarget は呼ばれた回数だけ積まれてしまい、
     // 生き残った番兵が本来とは別のシークの目標値を取り出してしまうバグがあった
-    // （ほぼ同時刻の2連続シークだけで再生が固まる不具合の原因。詳細は MediaEngine.PublishSeekTarget 参照）
-    private readonly Dictionary<int, double> _pendingSeekTargets = new();
-    /// <summary>最後に処理した Flush 番兵の世代。キューの Serial と一致していればシークに追いついている。</summary>
-    public int HandledSerial => _handledSerial;
-    private volatile int _handledSerial;
+    // （ほぼ同時刻の2連続シークだけで再生が固まる不具合の原因）
+    private readonly Dictionary<SeekEpoch, double> _pendingSeekTargets = new();
+
+    /// <summary>
+    /// 最後に処理した Flush 番兵の世代。キューの世代と一致していればシークに追いついている。
+    /// <c>SeekEpoch</c> は構造体で volatile にできないため、内部では int で保持して
+    /// <see cref="Volatile"/> で読み書きする（保持しているのは世代番号そのもの）。
+    /// </summary>
+    public SeekEpoch HandledEpoch => new(Volatile.Read(ref _handledEpochValue));
+    private int _handledEpochValue;
 
     private bool _prerollActive;
     private double _prerollTarget;
-    // このプリロールが属するキュー世代（Flush 番兵自身の Serial）。プリロール完了判定の瞬間に
-    // 現在のキュー Serial と比較することで、既に次のシークに割り込まれた「無効な世代の完了通知」を検出する
-    private int _prerollSerial;
-    // BeginWrite が SlotFlushed を返した（＝シークが発生した）後、FlushMarker に到達するまでの
+    // このプリロールが属するシーク世代（Flush 番兵の世代）。プリロール完了判定の瞬間に
+    // 現在のキュー世代と比較することで、既に次のシークに割り込まれた「無効な世代の完了通知」を検出する
+    private SeekEpoch _prerollEpoch = SeekEpoch.Initial;
+    // このスレッドが現在処理しているデータの世代。Flush 番兵で更新され、リングへの書き込み時に
+    // スロットへ刻まれる。demux がリングを Flush した後もこのスレッドはしばらく前の世代のパケットを
+    // 処理し続けるため、「リングの現在世代」ではなくこの値を渡すことで残骸フレームを弾く
+    private SeekEpoch _epoch = SeekEpoch.Initial;
+    // BeginWrite が SlotFlushed を返した（＝世代が変わった）後、Flush 番兵に到達するまでの
     // 残りフレームは全てシーク前の残骸なので、4K変換を行わずに捨てる
     private bool _abandonUntilFlush;
 
@@ -50,11 +59,11 @@ public sealed unsafe class VideoDecodeThread
 
     /// <summary>
     /// DemuxThread のシーク処理から、Flush 番兵を投入する前に呼ぶこと（happens-before の担保に必要）。
-    /// serial は、これから投入される Flush 番兵自身の Serial（呼び出し側で Flush() 前のキュー Serial + 1 として算出）。
+    /// <paramref name="epoch"/> は DemuxThread が採番した世代で、この後に投入される Flush 番兵が同じ値を持つ。
     /// </summary>
-    public void SetSeekTarget(int serial, double normalizedTargetSeconds)
+    public void SetSeekTarget(SeekEpoch epoch, double normalizedTargetSeconds)
     {
-        lock (_seekTargetLock) _pendingSeekTargets[serial] = normalizedTargetSeconds;
+        lock (_seekTargetLock) _pendingSeekTargets[epoch] = normalizedTargetSeconds;
     }
 
     public void RequestStop() => _stopRequested = true;
@@ -71,7 +80,7 @@ public sealed unsafe class VideoDecodeThread
                 switch (item.Kind)
                 {
                     case QueueItemKind.Flush:
-                        HandleFlush(item.Serial);
+                        HandleFlush(item.Epoch);
                         break;
                     case QueueItemKind.Eof:
                         HandleEof(frame);
@@ -124,29 +133,31 @@ public sealed unsafe class VideoDecodeThread
         }
     }
 
-    private void HandleFlush(int serial)
+    private void HandleFlush(SeekEpoch epoch)
     {
-        // キューの Serial と突き合わせて「このスレッドがシークに追いついたか」を外から判断できるようにする
-        _handledSerial = serial;
+        // キューの世代と突き合わせて「このスレッドがシークに追いついたか」を外から判断できるようにする
+        Volatile.Write(ref _handledEpochValue, epoch.Value);
+        _epoch = epoch;
         _decoder.FlushBuffers();
-        // demux スレッドがシーク時に既に ring.Flush 済み（デッドロック解消のため）。
-        // ここでもう一度呼び、demux の Flush 後にコミットされ得た残骸 Ready も掃除する
-        _sink.Flush();
+        // リングの Flush はここでは呼ばない。demux スレッドがシークを実行した時点で 1 回だけ
+        // 呼んでおり（リング満杯でこのスレッドがブロックしていても解けるように）、
+        // その後にコミットされ得た残骸フレームは BeginWrite の世代照合で弾かれる。
+        // ここで重ねて呼ぶと、新世代として正しく書き込まれたフレームまで掃除してしまう
         _abandonUntilFlush = false;
-        _prerollSerial = serial;
+        _prerollEpoch = epoch;
         lock (_seekTargetLock)
         {
-            _prerollActive = _pendingSeekTargets.Remove(serial, out _prerollTarget);
+            _prerollActive = _pendingSeekTargets.Remove(epoch, out _prerollTarget);
             if (!_prerollActive) _prerollTarget = double.NaN;
-            // この番兵より前の serial 宛ての目標は、対応する番兵が Flush() の Clear() で
+            // この番兵より前の世代宛ての目標は、対応する番兵が Flush() の Clear() で
             // 消えて二度と来ない残骸。溜め続けると意味のない対応関係が残るので掃除する
             if (_pendingSeekTargets.Count > 0)
             {
-                foreach (int staleKey in _pendingSeekTargets.Keys.Where(k => k <= serial).ToList())
+                foreach (SeekEpoch staleKey in _pendingSeekTargets.Keys.Where(k => k <= epoch).ToList())
                     _pendingSeekTargets.Remove(staleKey);
             }
         }
-        Diagnostics.DiagnosticLog.Write("video", $"flush 処理 serial={serial} preroll={( _prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
+        Diagnostics.DiagnosticLog.Write("video", $"flush 処理 epoch={epoch} preroll={( _prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
     }
 
     private void HandleEof(AVFrame* frame)
@@ -167,7 +178,7 @@ public sealed unsafe class VideoDecodeThread
     {
         if (!_prerollActive) return;
         _prerollActive = false;
-        if (_queue.Serial == _prerollSerial)
+        if (_queue.Epoch == _prerollEpoch)
         {
             Diagnostics.DiagnosticLog.Write("video", $"EOF 到達のためプリロールを完了扱いにする target={_prerollTarget:F3}");
             _onFirstFrameAfterFlush?.Invoke();
@@ -209,21 +220,21 @@ public sealed unsafe class VideoDecodeThread
             if (normalizedPts < _prerollTarget - _frameDurationSeconds / 2.0)
                 return; // hw転送・sws変換前に破棄（4Kの33MB転送を丸ごと省く）
 
-            // プリロール完了と判定できたが、その間に次のシークが割り込んでキューの Serial が
+            // プリロール完了と判定できたが、その間に次のシークが割り込んでキューの世代が
             // 既に進んでいる場合、これは無効な世代の完了通知（このデコードスレッドがまだ
             // 新しい Flush 番兵に到達していないだけ）。コールバックを発火せず残骸として捨てる。
             // 発火してしまうと MediaEngine 側が古いシーク目標を「映像プリロール完了」と誤認し、
             // 音声側が別世代で先に完了していた場合にミキサーの保留を誤って解除してしまう
             // （巻き戻し連打時に稀に発生する早送り/大量ドロップの原因）
-            if (_queue.Serial != _prerollSerial)
+            if (_queue.Epoch != _prerollEpoch)
             {
                 _abandonUntilFlush = true;
-                Diagnostics.DiagnosticLog.Write("video", $"stale preroll 破棄 prerollSerial={_prerollSerial} currentSerial={_queue.Serial} pts={normalizedPts:F3}");
+                Diagnostics.DiagnosticLog.Write("video", $"stale preroll 破棄 prerollEpoch={_prerollEpoch} currentEpoch={_queue.Epoch} pts={normalizedPts:F3}");
                 return;
             }
 
             _prerollActive = false;
-            Diagnostics.DiagnosticLog.Write("video", $"preroll 完了 firstPts={normalizedPts:F3} serial={_prerollSerial}");
+            Diagnostics.DiagnosticLog.Write("video", $"preroll 完了 firstPts={normalizedPts:F3} epoch={_prerollEpoch}");
             // シーク後、映像プリロールがここで完了する。MediaEngine 側はこれを合図に
             // ミキサーの音声出力保留（HoldOutput）を解除する（早送りバグの根治）
             _onFirstFrameAfterFlush?.Invoke();
@@ -233,9 +244,22 @@ public sealed unsafe class VideoDecodeThread
         // Teardown（RequestStop → ring.Close → Join）と破棄済み D3D リソースへのアクセスを競合させないため。
         if (_stopRequested) return;
 
-        int slot = _sink.BeginWrite(frame->width, frame->height);
+        // リングの現在世代ではなく、このフレームを産んだパケットの世代を渡す。
+        // demux が既に次の世代へリングを Flush していれば SlotFlushed が返り、残骸として捨てられる
+        int slot = _sink.BeginWrite(frame->width, frame->height, _epoch);
         if (slot == SlotSequencer.SlotClosed) return;
-        if (slot == SlotSequencer.SlotFlushed) { _abandonUntilFlush = true; return; }
+        if (slot == SlotSequencer.SlotFlushed)
+        {
+            // シークごとに数枚は必ず通る正常系（demux が先にリングを Flush するため）。
+            // 上の stale preroll 破棄と同じ「世代不一致でフレームを捨てた」事象なので記録も対称にする。
+            // 正常系なので Write（既定 no-op）で十分。世代の渡し方を誤ってここが延々と続く状態に
+            // なった場合は「映像が一切出ない」という明白な症状で露見するため、
+            // 連続回数を数えて WriteFatal へ昇格させる仕組みは置いていない
+            _abandonUntilFlush = true;
+            Diagnostics.DiagnosticLog.Write("video",
+                $"世代不一致でフレーム破棄 frameEpoch={_epoch} pts={normalizedPts:F3}");
+            return;
+        }
 
         // 変換手段（CPU sws_scale / GPU VideoProcessor）は sink 実装に委譲する。
         // 確保したスロットは、例外が飛んでも必ず Commit か Abort のどちらかで手放すこと。
