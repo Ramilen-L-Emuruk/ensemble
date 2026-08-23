@@ -109,10 +109,113 @@ public partial class MainViewModel : ObservableObject, IDisposable
         DiagnosticLog.Write("ui", $"既定ミュート保存 dir={directory} tracks=[{string.Join(",", mutedTracks)}]");
     }
 
+    /// <summary>ファイルを開き直すまで解除されない縮退の種類。</summary>
+    private enum ReopenRequiredCause
+    {
+        /// <summary>縮退していない。</summary>
+        None,
+        /// <summary>パイプラインのスレッドが停止しきらず、資源を解放できないまま取り残された。</summary>
+        PipelineQuarantined,
+        /// <summary>音声出力（WASAPI）が異常停止した。</summary>
+        AudioOutputFailed
+    }
+
+    /// <summary>
+    /// ファイルを開き直すまで解除されない縮退の有無と種類。**検出はここだけで行う。**
+    /// </summary>
+    /// <remarks>
+    /// 検疫中は、停止時に仕掛けたミキサー出力の保留（消音）が解けないまま <c>Play()</c> も拒否される。
+    /// 音声出力が死んでいる場合も音は出ず、位置クロックが音声出力基準のため再生も進まない。
+    /// どちらも <c>Open()</c> でのみ解除される。
+    /// この 2 つ以外の「一時的に音が出ない状態」を混ぜないこと。シーク中のミキサー出力の保留は
+    /// すぐ解けるので、それを理由に案内すると正常な操作へ誤った警告を出すことになる。
+    /// 文面は種類ごとに場面で決める（停止直後と操作時では言うべきことが違う。<see cref="Stop"/> と
+    /// <see cref="ReopenRequiredMessage"/> を参照）。ここで文面まで共有すると、後始末が完了している
+    /// 音声出力の失敗に対して「後始末を完了できませんでした」と言うような嘘になる。
+    /// </remarks>
+    private ReopenRequiredCause ReopenRequired =>
+        Engine.IsPipelineQuarantined ? ReopenRequiredCause.PipelineQuarantined
+        : Engine.IsAudioOutputFailed ? ReopenRequiredCause.AudioOutputFailed
+        : ReopenRequiredCause.None;
+
+    /// <summary>操作しても音が変わらない・位置が進まない理由。正常なら null。
+    /// 再生・シーク・チャプター移動・ミキサー操作で共通の文面を使う
+    /// （どれも復旧手段は開き直すことなので、場面ごとに言い換えても伝わる内容が増えない）。</summary>
+    private string? ReopenRequiredMessage => ReopenRequired switch
+    {
+        ReopenRequiredCause.PipelineQuarantined => "前回の停止処理が完了していません。ファイルを開き直してください",
+        ReopenRequiredCause.AudioOutputFailed => "音声出力が停止しています。ファイルを開き直してください",
+        _ => null
+    };
+
+    /// <summary>
+    /// 縮退のため操作が効かない場合に、理由を利用者へ伝える。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// エンジンは縮退中の要求を例外ではなく黙って捨てる。<c>Seek</c> は demux スレッドが無ければ
+    /// 何もせず戻る。<c>SetTrackVolume</c>/<c>SetTrackMute</c> は書き込み自体は成功するが、
+    /// 検疫時の停止が仕掛けたミキサー出力の保留（消音）と音声出力の停止のせいで聴感上は何も
+    /// 起きない。どちらも <see cref="InvokeEngine"/> は成功と判定するため、放っておくと操作が
+    /// 無言で消える。
+    /// </para>
+    /// <para>
+    /// **UI からエンジンを呼ぶ経路を新設したら、ここを通すか否かを必ず判断すること。**
+    /// 現在通しているのは 再生 / シーク / チャプター移動 / 再生速度 / トラック音量 /
+    /// ミュート・ソロ / マスター音量 / マスターミュート。停止は文面が違うため
+    /// <see cref="Stop"/> が自前で案内する。
+    /// </para>
+    /// <para>OSD は数秒で消えるため、後から報告と突き合わせられるよう操作名をログにも残す。</para>
+    /// <para>
+    /// 音声出力の失敗に対する免除（<paramref name="worksWhilePaused"/>）を
+    /// <see cref="PlaybackState.Paused"/> だけに限る理由。一時停止は「パイプラインが生きていて
+    /// （再生中と同じ）、かつ位置クロックの停止に足を取られない（再生中と違う）」状態であり、
+    /// シークが着地フレームを見せられると言い切れるのはここだけ。再生中を免除しないのは、
+    /// 位置クロックが音声出力基準で止まっていてシークしても位置も映像も進まないため。
+    /// </para>
+    /// <para>
+    /// 「再生中でなければ」と広げてはいけない。<see cref="PlaybackState.Stopped"/> は
+    /// EOF 到達（パイプラインは生きている）と明示的な停止（畳み済み）の両方を指し、
+    /// <see cref="PlaybackState"/> からは区別できない。畳んだ後にシークを通すと
+    /// <c>MediaEngine.Seek</c> が demux スレッド不在で要求を捨て、この案内が塞ごうとしている
+    /// 「無言で消える」に戻る（実際にそう書いて指摘された）。
+    /// **既知のトレードオフ**: その代償として、EOF 到達で停止した直後に音声出力が死んでいる場合は、
+    /// 実際には動くシークまで案内で止める。区別するにはエンジン側でパイプラインの生存を
+    /// 公開する必要があり、ここだけでは直せない。緩める方向へ直すなら上記の事故が再発しないことを
+    /// 先に確かめること。検疫中はパイプラインそのものが無いので、免除は一切効かせない。
+    /// </para>
+    /// </remarks>
+    /// <param name="worksWhilePaused">
+    /// 一時停止中なら、音声出力が死んでいても意味のある動作になる操作か（シーク・チャプター移動）。
+    /// true なら音声出力の失敗については一時停止中に限って案内を省く。パイプラインが生きているので
+    /// シーク要求は捨てられず、着地フレームを表示できる（映像側のプリロールは音声の消費に依存しない）。
+    /// 一律に止めると動く操作を塞ぐことになる。
+    /// </param>
+    /// <returns>縮退していて案内した場合 true（呼び出し側は操作を中止してよい）。</returns>
+    private bool NotifyIfReopenRequired(string operationName, bool worksWhilePaused = false)
+    {
+        var cause = ReopenRequired;
+        if (cause == ReopenRequiredCause.None) return false;
+        if (cause == ReopenRequiredCause.AudioOutputFailed && worksWhilePaused
+            && Engine.State == PlaybackState.Paused)
+            return false;
+        if (ReopenRequiredMessage is not string reason) return false;
+        DiagnosticLog.Write("ui", $"{operationName} は縮退中のため効かない: {reason}");
+        ShowOsd(reason);
+        return true;
+    }
+
     private void OnAudioTrackMuteOrSoloChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
     {
-        if (e.PropertyName == nameof(AudioTrackViewModel.IsMuted) || e.PropertyName == nameof(AudioTrackViewModel.IsSolo))
-            UpdateSoloMuting();
+        if (e.PropertyName != nameof(AudioTrackViewModel.IsMuted) && e.PropertyName != nameof(AudioTrackViewModel.IsSolo))
+            return;
+        UpdateSoloMuting();
+        // 縮退中は反映しても音が変わらない。無言だと故障と区別できないので理由を伝える。
+        // 案内をここに置くのは、UpdateSoloMuting がファイルを開くときにも呼ばれるため
+        // （利用者の操作に限って出す）。
+        // UpdateSoloMuting が失敗を通知していてもこちらで上書きする。「N 件失敗」だけでは
+        // 次に何をすればよいか分からないため、復旧手段の案内を優先する
+        NotifyIfReopenRequired("トラックミュート切替");
     }
 
     /// <summary>いずれかのトラックがソロ中なら、ソロ対象以外を実効的にミュートしてエンジンへ反映する。</summary>
@@ -146,14 +249,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
         if (!InvokeEngine("音量変更", () => Engine.SetMasterVolume((float)(value / 100.0)))) return;
-        ShowOsd($"音量 {value:0}%");
+        // 縮退中に「音量 80%」と出すと、操作が効いたように見えて実際には何も聞こえない
+        if (!NotifyIfReopenRequired("音量変更")) ShowOsd($"音量 {value:0}%");
     }
 
     partial void OnIsMasterMutedChanged(bool value)
     {
         if (!InvokeEngine("ミュート切替", () => Engine.SetMasterVolume(value ? 0f : (float)(MasterVolume / 100.0)))) return;
         DiagnosticLog.Write("ui", $"マスターミュート切替 muted={value}");
-        ShowOsd(value ? "ミュート" : "ミュート解除");
+        if (!NotifyIfReopenRequired("マスターミュート切替")) ShowOsd(value ? "ミュート" : "ミュート解除");
     }
 
     [RelayCommand]
@@ -291,19 +395,54 @@ public partial class MainViewModel : ObservableObject, IDisposable
     // JumpTo 系・StepBackward は内部で Seek を呼ぶため、シークと同じ失敗経路を持つ点に注意
 
     /// <summary>指定位置へシークする。UI からのシーク経路はすべてここを通すこと。</summary>
-    public bool SeekTo(TimeSpan position) => InvokeEngine("シーク", () => Engine.Seek(position));
+    /// <returns>シークを要求できた場合 true。縮退中は要求せず false を返す。</returns>
+    public bool SeekTo(TimeSpan position)
+    {
+        if (NotifyIfReopenRequired("シーク", worksWhilePaused: true))
+        {
+            // シークバーのつまみは指の位置へ楽観的に動いている（SeekBarControl.SeekTo）。
+            // 縮退中は位置の通知が二度と来ないため訂正されず、動いたように見えたまま残る
+            RestorePositionRatio();
+            return false;
+        }
+        return InvokeEngine("シーク", () => Engine.Seek(position));
+    }
 
+    /// <summary>シークバーのつまみを現在位置から描き直す。位置の通知が来ない状況で、
+    /// 楽観的に動かした表示を戻すために使う。尺が不明なときに何もしないのも含め、
+    /// 算出はコンストラクタの位置通知の購読と同じにそろえる（片方だけ 0 へ倒すと、
+    /// 同じ状況でつまみの行き先が経路によって変わる）。</summary>
+    private void RestorePositionRatio()
+    {
+        if (Duration > TimeSpan.Zero) PositionRatio = Position.TotalSeconds / Duration.TotalSeconds;
+    }
+
+    /// <summary>トラック個別の音量を反映する。正常時は OSD を出さない（スライダー操作のたびに
+    /// 出すと連続して上書きし合う）が、縮退中は音が変わらない理由を伝える。</summary>
     public void SetTrackVolume(int trackNumber, float volume)
-        => InvokeEngine("音量変更", () => Engine.SetTrackVolume(trackNumber, volume));
+    {
+        if (!InvokeEngine("音量変更", () => Engine.SetTrackVolume(trackNumber, volume))) return;
+        NotifyIfReopenRequired("トラック音量変更");
+    }
 
     public void AttachVideoOutput(IntPtr hwnd)
         => InvokeEngine("映像出力の接続", () => Engine.AttachVideoOutput(hwnd));
 
-    public bool JumpToNextChapter() => InvokeEngine("次のチャプターへ移動", Engine.JumpToNextChapter);
+    // チャプター移動は内部で Seek を呼ぶため、縮退中は同じく無言で消える。
+    // 呼び出し側は戻り値を見て「次のチャプター」等の OSD を出すので、ここで false を返さないと
+    // 移動していないのに移動したように見える
 
-    public bool JumpToPreviousChapter() => InvokeEngine("前のチャプターへ移動", Engine.JumpToPreviousChapter);
+    public bool JumpToNextChapter()
+        => !NotifyIfReopenRequired("次のチャプターへ移動", worksWhilePaused: true)
+           && InvokeEngine("次のチャプターへ移動", Engine.JumpToNextChapter);
 
-    public bool JumpToChapter(int index) => InvokeEngine("チャプターへ移動", () => Engine.JumpToChapter(index));
+    public bool JumpToPreviousChapter()
+        => !NotifyIfReopenRequired("前のチャプターへ移動", worksWhilePaused: true)
+           && InvokeEngine("前のチャプターへ移動", Engine.JumpToPreviousChapter);
+
+    public bool JumpToChapter(int index)
+        => !NotifyIfReopenRequired("チャプターへ移動", worksWhilePaused: true)
+           && InvokeEngine("チャプターへ移動", () => Engine.JumpToChapter(index));
 
     public bool RemoveUserChapter(ChapterInfo chapter)
         => InvokeEngine("チャプター削除", () => Engine.RemoveUserChapter(chapter));
@@ -388,20 +527,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
         else
         {
-            // 検疫中は Play() が必ず失敗する。InvokeEngine の汎用 OSD（「再生に失敗しました」）だけでは
-            // 原因も復旧手段も伝わらず、「ボタンを押しても何も起きない」ように見えるため個別に案内する
-            if (Engine.IsPipelineQuarantined)
-            {
-                ShowOsd("前回の停止処理が完了していません。ファイルを開き直してください");
-                return;
-            }
-            // 音声出力が死んだまま再生を押しても、位置クロックが音声出力基準のため何も進まない。
-            // 無言で失敗させず、OSD の一度きりの通知を見逃した場合でもここで案内する
-            if (Engine.IsAudioOutputFailed)
-            {
-                ShowOsd("音声出力が停止しています。ファイルを開き直してください");
-                return;
-            }
+            // 縮退中は Play() が必ず失敗する（検疫中はパイプラインの再構築を拒否し、音声出力が
+            // 死んでいる場合は位置クロックが進まない）。InvokeEngine の汎用 OSD
+            // （「再生に失敗しました」）だけでは原因も復旧手段も伝わらず、「ボタンを押しても
+            // 何も起きない」ように見えるため個別に案内する。
+            // OSD の一度きりの通知を見逃した場合でも、操作のたびにここで再案内される
+            if (NotifyIfReopenRequired("再生")) return;
             // Play() はパイプライン構築に失敗すると（自身を巻き戻したうえで）例外を送出する
             if (!InvokeEngine("再生", Engine.Play)) return;
             ShowOsd("再生");
@@ -413,12 +544,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         if (!InvokeEngine("停止", Engine.Stop)) return;
         Position = TimeSpan.Zero;
-        // 検疫が起きた場合、音声出力・バッファ・クロックの後始末は省略されている（消音のみ）。
-        // 「停止」とだけ出すと正常に停止したように見え、縮退したことに気づく手段が
-        // 「もう一度再生を押す」以外になくなる
-        ShowOsd(Engine.IsPipelineQuarantined
-            ? "停止（後始末を完了できませんでした。ファイルを開き直してください）"
-            : "停止");
+        // 縮退している場合に「停止」とだけ出すと正常に停止したように見え、気づく手段が
+        // 「もう一度再生を押す」以外になくなる。文面は種類ごとに変える。検疫では音声出力・
+        // バッファ・クロックの後始末が省略されている（消音のみ）が、音声出力の失敗では
+        // 後始末そのものは完了しているため、同じ文言では嘘になる
+        ShowOsd(ReopenRequired switch
+        {
+            ReopenRequiredCause.PipelineQuarantined => "停止（後始末を完了できませんでした。ファイルを開き直してください）",
+            ReopenRequiredCause.AudioOutputFailed => "停止（音声出力が停止しています。ファイルを開き直してください）",
+            _ => "停止"
+        });
     }
 
     [RelayCommand]
@@ -447,14 +582,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         PlaybackSpeed = Math.Clamp(PlaybackSpeed + delta, 0.1, 2.0);
         if (!InvokeEngine("速度変更", () => Engine.SetPlaybackSpeed(PlaybackSpeed))) return;
-        ShowOsd($"速度 {PlaybackSpeed:0.00}x");
+        // Engine.SetPlaybackSpeed は状態を見ずに値を書くだけなので、縮退中でも成功して見える。
+        // 音も映像も進んでいない状態で「速度 1.25x」と出すと、効いたように誤解させる
+        if (!NotifyIfReopenRequired("速度変更")) ShowOsd($"速度 {PlaybackSpeed:0.00}x");
     }
 
     public void SetSpeed(double speed)
     {
         PlaybackSpeed = speed;
         if (!InvokeEngine("速度変更", () => Engine.SetPlaybackSpeed(speed))) return;
-        ShowOsd($"速度 {PlaybackSpeed:0.00}x");
+        if (!NotifyIfReopenRequired("速度変更")) ShowOsd($"速度 {PlaybackSpeed:0.00}x");
     }
 
     public void ToggleChapterAtCurrentPosition()
