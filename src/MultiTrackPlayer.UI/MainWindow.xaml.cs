@@ -540,6 +540,7 @@ public partial class MainWindow : Window
 
     // ── Transport ──
     private void PlayPause_Click(object s, RoutedEventArgs e) => _vm.PlayPauseCommand.Execute(null);
+    private void Stop_Click(object s, RoutedEventArgs e) => _vm.StopCommand.Execute(null);
     private void SkipBack_Click(object s, RoutedEventArgs e) => _vm.Skip(-10);
     private void SkipFwd_Click(object s, RoutedEventArgs e) => _vm.Skip(10);
     private void PrevFile_Click(object s, RoutedEventArgs e) => _vm.PlayPrevious();

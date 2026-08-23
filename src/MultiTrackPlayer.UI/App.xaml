@@ -9,6 +9,15 @@
     <Application.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVis"/>
         <Style x:Key="TransportBtn" TargetType="Button">
+            <!-- Focusable="False": Button はクリックでキーボードフォーカスを取り、Space は
+                 フォーカス中のボタンを押す。そのため一度ボタンを押すと、以降の Space が
+                 再生/一時停止ではなく直前に押したボタンの再実行になる（⏹ を押した後の Space で
+                 停止し続ける、⏩ を押した後の Space で送り続ける）。
+                 この 6 ボタンの動作はすべてキーバインドを持つ（再生/一時停止=Space・S、送り/戻し=←→、
+                 前/次ファイル=P・N、停止=Ctrl+S）ため、ボタンにフォーカスを当てる価値は無い。
+                 マウス操作は影響を受けない。失うのは Tab でボタンへ辿って Enter で押す経路
+                 （ショートカットを知らない利用者向け）だけ -->
+            <Setter Property="Focusable" Value="False"/>
             <Setter Property="Width" Value="36"/>
             <Setter Property="Height" Value="32"/>
             <Setter Property="Margin" Value="2,0"/>

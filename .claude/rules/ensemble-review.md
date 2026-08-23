@@ -47,15 +47,49 @@
 - [ ] `CancellationTokenSource` を Dispose した後に参照しないこと（`26c03a5`。サムネイル生成で実際にクラッシュした）
 - [ ] 例外が飛ぶ経路でも解放されること。`try`/`finally` か `using` で保証する
 
-## 4. キー入力の経路が 4 つに分散している
+## 4. キー入力の経路が 3 つに分散している
 
 キー操作の不具合を 5 件出している。入力経路が複数あり、片方にだけ実装して漏れるのが原因。
 
-経路: `MainWindow.xaml.cs` の `PreviewKeyDown` / `MainWindow.xaml` の `InputBindings` / `Settings/KeyBindings.cs`（`%APPDATA%` の設定） / `Windows/SubWindowKeyHandling.cs`（子ウィンドウ）
+経路:
+
+1. `MainWindow.xaml` の `KeyDown="Window_KeyDown"` → `MainWindow.xaml.cs` の `HandleShortcutKey`
+2. `Settings/KeyBindings.cs`（`%APPDATA%\MultiTrackPlayer\keybindings.json` の設定と既定辞書）
+3. `Windows/SubWindowKeyHandling.cs`（ミキサー・プレイリスト・チャプター・デバッグ・ショートカット一覧の
+   5 つが購読し、メイン側へ転送する）
+
+**`MainWindow.xaml` の `InputBindings` は存在しない。** メニューの `InputGestureText="Ctrl+O"` 等は
+表示用の飾り文字列で、キーを捕捉していない（この節が以前 4 つ目の経路として挙げていたため、
+「全経路を確認した」と言いながら無い経路を数えていた）。`PreviewKeyDown` ではなく `KeyDown` である点も注意。
 
 - [ ] キー操作を追加・変更したら**全経路を確認**すること（`2615034` `748a7f0` `8027cf4` はいずれも「ショートカットが効かない」）
 - [ ] テキスト編集中（チャプタータイトル等）は Enter / Esc をグローバル操作に横取りさせないこと（`595696c` `d13f1c7`）
 - [ ] メニュー・ComboBox・キーボードのどの経路から操作しても、UI の状態表示が追従すること（`dc1ab6c`）
+- [ ] **既定キーを追加したら、既存の `keybindings.json` を持つ利用者へ届くか確認すること。**
+  `KeyBindings.Load` は保存済みの割り当てを既定辞書へ重ねる形にしてある。丸ごと差し替える実装に
+  戻すと、以後追加する既定キーは既存利用者に永久に現れない
+- [ ] **子ウィンドウにフォーカスを取るコントロールを置いたら、それが食うキーを確認すること。**
+  `SubWindowKeyHandling` は `KeyDown`（`HandledEventsToo` 無し）で購読しているため、フォーカス中の
+  コントロールが `Handled` にしたキーは届かない。WPF の `Slider` は `←→↑↓` `Home` `End`
+  `PageUp` `PageDown` を、`ListBox` は `↑↓` `Home` `End` `PageUp` `PageDown` を消費する
+
+### キーを取り上げるかどうかの判断基準
+
+**そのコントロールのキーボード操作に価値があるかで決める。** 一律にどちらかへ寄せない。
+
+| 対象 | 判断 | 理由 |
+|---|---|---|
+| `MixerWindow` のスライダー 2 つ | `Focusable="False"` で**取り上げた** | スライダーにフォーカスを当てて矢印で動かす操作に価値が無い。トラック個別の音量は数字キー＋`↑`/`↓`（`MainWindow.TryHandleTrackKey`）で操作でき、そちらはむしろスライダーがキーを食っていたせいでこの窓では効いていなかった |
+| `PlaylistWindow` / `ChapterWindow` の `ListBox` | **一覧側に残す（既知のトレードオフ）** | 選択の移動が削除ボタンの対象選びに要る。チャプター一覧は `Delete`/`Enter`/`F2` が選択に対して働く（`ChapterList_PreviewKeyDown`）。フォーカスを奪うとこれらが死ぬ |
+| トランスポートバーのボタン（`TransportBtn` スタイル） | `Focusable="False"` で**取り上げた** | `Button` はクリックでフォーカスを取り、`Space` はフォーカス中のボタンを押す。放置すると一度ボタンを押した後の `Space` が「再生/一時停止」ではなく直前のボタンの再実行になる（⏹ を足したときに実機で発覚）。各動作にキーバインドがあるので失う操作は無い |
+| サブウィンドウのボタン（プレイリストの追加・削除・クリア等） | **一覧側と同じく残す** | これらの動作にキーバインドが無く、フォーカスを奪うとキーボードから実行できなくなる。既定辞書が `S` を `PlayPause` に割り当てているのは、この状況（`Space` がボタンに取られる）への回避策 |
+| `ShortcutsWindow` の `ListBox` | **未対応（判断基準では取り上げる側）** | 読むだけの表示で、選択に依存する操作は無い（削除・編集ボタンも独自のキー処理も無い）。基準に照らせばスライダーと同じく `Focusable="False"` にすべき対象。2026-08-24 時点では「一覧側は触らない」判断に含めて据え置いたが、**これは他 2 窓と違って理由のあるトレードオフではない** |
+
+**結果として、これら 3 つの窓で一覧にフォーカスがある間は `↑↓` `Home` `End` `PageUp` `PageDown`
+（音量±・先頭/末尾・前後チャプター）がメイン側へ届かない。** 上 2 窓は判断の結果、
+`ShortcutsWindow` は未対応。
+上 2 窓の挙動を変えるなら「キーごとに配り分ける」（`↑`/`↓` は一覧・残り 4 つはグローバル）か
+「グローバル全面優先」を選ぶことになるが、どちらも一覧の操作性を削るためユーザーの判断が必要
 
 ## 5. テスト可能性の設計
 

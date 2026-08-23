@@ -17,8 +17,13 @@
                             <ColumnDefinition Width="50"/>
                         </Grid.ColumnDefinitions>
                         <TextBlock Grid.Column="0" Text="{Binding Name}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                        <!-- Focusable="False": フォーカスが乗ると Slider が ←→↑↓ Home End PageUp PageDown を
+                             消費し、メイン側のショートカット 8 個（Skip±10・音量±・先頭/末尾・前後チャプター）が
+                             届かなくなる。失うのは Slider 自体のキーボード操作だけで、トラック個別の音量は
+                             数字キーを押しながら ↑/↓（MainWindow.TryHandleTrackKey）で操作できる。
+                             むしろ Slider がキーを食っていたため、この窓では今までそれも効いていなかった -->
                         <Slider Grid.Column="1" Minimum="0" Maximum="200" Value="{Binding Volume}"
-                                VerticalAlignment="Center" Margin="4,0"/>
+                                Focusable="False" VerticalAlignment="Center" Margin="4,0"/>
                         <TextBlock Grid.Column="2" Text="{Binding Volume, StringFormat={}{0:0}%}"
                                    VerticalAlignment="Center" TextAlignment="Right"/>
                         <ToggleButton Grid.Column="3" Content="SOLO" IsChecked="{Binding IsSolo}"
@@ -38,8 +43,9 @@
                 <ColumnDefinition Width="50"/>
             </Grid.ColumnDefinitions>
             <TextBlock Grid.Column="0" Text="マスター音量" VerticalAlignment="Center"/>
+            <!-- 上のトラック音量スライダーと同じ理由でフォーカスを取らせない -->
             <Slider Grid.Column="1" Minimum="0" Maximum="100" Value="{Binding MasterVolume}"
-                    VerticalAlignment="Center" Margin="4,0"/>
+                    Focusable="False" VerticalAlignment="Center" Margin="4,0"/>
             <TextBlock Grid.Column="2" Text="{Binding MasterVolume, StringFormat={}{0:0}%}"
                        VerticalAlignment="Center" TextAlignment="Right"/>
             <ToggleButton Grid.Column="3" Content="MUTE" IsChecked="{Binding IsMasterMuted}"

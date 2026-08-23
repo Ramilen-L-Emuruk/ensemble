@@ -18,6 +18,8 @@ public class KeyBindings
         // サブウィンドウ表示中に Space を押すとフォーカス中のボタンが押されてしまい
         // 再生/一時停止に届かないことがあるため、ボタンのアクセスキーと衝突しにくい S にも割り当てる
         ["S"]            = "PlayPause",
+        // 停止は再生の隣に置く。単体の S は再生/一時停止に取られているため Ctrl 付きにした
+        ["Ctrl+S"]       = "Stop",
         ["OemPeriod"]    = "StepForward",
         ["OemComma"]     = "StepBackward",
         ["Right"]        = "Skip+10",
@@ -55,7 +57,20 @@ public class KeyBindings
         {
             var json = File.ReadAllText(FilePath);
             var loaded = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
-            if (loaded != null) Bindings = loaded;
+            if (loaded == null) return;
+            // 保存済みの割り当てを優先しつつ、既定にしか無いキーを残す。丸ごと差し替えると
+            // 「今後追加する既定キーは keybindings.json を持つ人へ永久に届かない」という欠陥になる
+            //（このファイルへ Ctrl+S=Stop を足しても既存利用者には現れない、が実際に起きた）。
+            // 副作用として、意図的に消したバインドは既定から復活する
+            var merged = DefaultBindings();
+            foreach (var pair in loaded) merged[pair.Key] = pair.Value;
+            // 補った既定キーを記録する。「消したはずのキーが戻っている」と言われたときに、
+            // 設定ファイルの側で消えていたのか、こちらが補ったのかを切り分けられるようにする
+            var restored = merged.Keys.Where(k => !loaded.ContainsKey(k)).ToList();
+            if (restored.Count > 0)
+                DiagnosticLog.Write("keybindings",
+                    $"保存済みに無い既定キーを補った: {string.Join(", ", restored)}");
+            Bindings = merged;
         }
         catch (Exception ex)
         {
