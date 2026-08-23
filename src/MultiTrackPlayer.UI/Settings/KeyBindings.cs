@@ -1,5 +1,6 @@
 ﻿using System.IO;
 using System.Text.Json;
+using MultiTrackPlayer.Engine.Diagnostics;
 
 namespace MultiTrackPlayer.UI.Settings;
 
@@ -56,7 +57,12 @@ public class KeyBindings
             var loaded = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
             if (loaded != null) Bindings = loaded;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            // 壊れた設定は既定のキー割り当てで起動する（起動不能にしない）。
+            // 記録しないと「設定した覚えのないキーに戻った」原因を追えない
+            DiagnosticLog.WriteFatal("keybindings", $"キー設定を読み込めなかったため既定値で起動する: {ex}");
+        }
     }
 
     public void Save()

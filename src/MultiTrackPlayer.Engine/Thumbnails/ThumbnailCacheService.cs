@@ -1,4 +1,4 @@
-using MultiTrackPlayer.Core.Models;
+﻿using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Diagnostics;
 
 namespace MultiTrackPlayer.Engine.Thumbnails;
@@ -28,7 +28,10 @@ public sealed class ThumbnailCacheService
         var cts = new CancellationTokenSource();
         _cts = cts;
 
-        var cached = ThumbnailCacheStore.Load(filePath);
+        var cached = ThumbnailCacheStore.Load(filePath, out string? cacheError);
+        // 読めなければ作り直すので致命ではないが、記録が無いと権限異常・破損が続いても気づけない
+        if (cacheError != null)
+            DiagnosticLog.Write("thumbnail", $"キャッシュ読み込み失敗（作り直す） path={filePath}: {cacheError}");
         if (cached != null)
         {
             DiagnosticLog.Write("thumbnail", $"キャッシュ命中 path={filePath} sheet={cached.SheetPath}");
@@ -76,7 +79,9 @@ public sealed class ThumbnailCacheService
 
             if (sheet == null)
             {
-                DiagnosticLog.Write("thumbnail", $"生成失敗（Generate が null を返却） path={filePath}");
+                // 失敗の記録は必ず残る側へ。診断ログは既定で無効なので、Write では
+                // 「シークバーにサムネイルが出ない」の原因を後から追えない
+                DiagnosticLog.WriteFatal("thumbnail", $"生成失敗（Generate が null を返却） path={filePath}");
                 ThumbnailsReady?.Invoke(this, null);
                 return;
             }
@@ -88,7 +93,7 @@ public sealed class ThumbnailCacheService
         }
         catch (Exception ex)
         {
-            DiagnosticLog.Write("thumbnail", $"生成失敗（例外） path={filePath} ex={ex}");
+            DiagnosticLog.WriteFatal("thumbnail", $"生成失敗（例外） path={filePath} ex={ex}");
             if (!token.IsCancellationRequested)
                 ThumbnailsReady?.Invoke(this, null);
         }

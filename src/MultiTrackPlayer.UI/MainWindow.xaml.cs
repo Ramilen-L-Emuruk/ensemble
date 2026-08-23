@@ -118,17 +118,20 @@ public partial class MainWindow : Window
             UpdateOverlayBounds();
 
             var files = App.StartupArgs.Where(System.IO.File.Exists).ToArray();
-            if (files.Length == 0) return;
             if (files.Length == 1)
             {
                 _vm.OpenSingleFile(files[0]);
             }
-            else
+            else if (files.Length > 1)
             {
                 _vm.Playlist.AddFiles(files);
                 _vm.OpenFile(files[0]);
             }
-            UpdateSeekBarChapters();
+            if (files.Length > 0) UpdateSeekBarChapters();
+            // 設定が既定値へ戻ったことは、開いたファイル名の表示より優先して伝えたい。
+            // OSD は 1 つしか出せないので、上書きされないよう最後に出す
+            if (_vm.Settings.WasRestoredToDefaults)
+                _vm.ShowOsd("設定を読み込めなかったため既定値で起動しました");
         };
     }
 
