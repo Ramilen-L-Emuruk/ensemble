@@ -5,6 +5,10 @@ namespace MultiTrackPlayer.Engine.Video;
 /// Close・due 選択（<see cref="FrameSelector"/> 委譲）を担う汎用コア。ペイロード（ネイティブバッファや
 /// GPU テクスチャ）は保持せず、呼び出し側がスロット index に対応づけて管理する。ペイロードの確保・解放は
 /// クリティカルセクション内で呼ばれるコールバックで行い、状態遷移との原子性を保つ。
+///
+/// 解放コールバックは生成時に 1 つだけ受け取る。以前は解放しうるメソッドごとに引数で渡していたが、
+/// それでは「解放しうる経路を新設したのに渡し忘れる」ことが型で防げない（実際に <see cref="DisposeSlots"/>
+/// が Writing スロットを保護しない不具合を生んでいた）。
 /// </summary>
 public sealed class SlotSequencer
 {
@@ -20,18 +24,27 @@ public sealed class SlotSequencer
         public SlotState State = SlotState.Free;
         public double PtsSeconds;
         public int Serial;
-        public bool PendingFreeOnReturn;
+        // 破棄時にまだ他スレッドが参照していて即解放できなかったスロットに立つ。
+        // 参照が離れる経路（Leased→ReturnLease / Writing→CommitWrite・AbortWrite）で解放する
+        public bool PendingFreeOnRelease;
     }
 
     private readonly Slot[] _slots;
+    private readonly Action<int> _onFreePayload;
     private readonly object _lock = new();
     private bool _closed;
     private bool _eofMarked;
     // Flush ごとに増える世代番号。古い世代のフレームの CommitWrite は棄却される
     private int _serial;
 
-    public SlotSequencer(int slotCount)
+    /// <param name="slotCount">スロット数。</param>
+    /// <param name="onFreePayload">
+    /// スロット index に対応するペイロードを解放するコールバック。必ずロック内から呼ばれるため、
+    /// この中で別のロックを取らないこと（デッドロック源）。
+    /// </param>
+    public SlotSequencer(int slotCount, Action<int> onFreePayload)
     {
+        _onFreePayload = onFreePayload ?? throw new ArgumentNullException(nameof(onFreePayload));
         _slots = new Slot[slotCount];
         for (int i = 0; i < slotCount; i++) _slots[i] = new Slot();
     }
@@ -67,29 +80,86 @@ public sealed class SlotSequencer
 
     public void CommitWrite(int slotIndex, double ptsSeconds)
     {
+        Exception? releaseError;
         lock (_lock)
         {
             var slot = _slots[slotIndex];
-            // 変換中に Flush が起きた（＝シーク前のフレーム）場合は Ready にせず破棄する
-            if (slot.Serial != _serial)
+            if (!TryReleaseDeferredLocked(slot, slotIndex, out releaseError))
             {
-                slot.State = SlotState.Free;
+                // 変換中に Flush が起きた（＝シーク前のフレーム）場合は Ready にせず破棄する
+                if (slot.Serial != _serial)
+                {
+                    slot.State = SlotState.Free;
+                }
+                else
+                {
+                    slot.PtsSeconds = ptsSeconds;
+                    slot.State = SlotState.Ready;
+                }
                 Monitor.PulseAll(_lock);
-                return;
             }
-            slot.PtsSeconds = ptsSeconds;
-            slot.State = SlotState.Ready;
-            Monitor.PulseAll(_lock);
         }
+        ReportReleaseFailure(slotIndex, releaseError);
     }
 
     public void AbortWrite(int slotIndex)
     {
+        Exception? releaseError;
         lock (_lock)
         {
-            _slots[slotIndex].State = SlotState.Free;
-            Monitor.PulseAll(_lock);
+            var slot = _slots[slotIndex];
+            if (!TryReleaseDeferredLocked(slot, slotIndex, out releaseError))
+            {
+                slot.State = SlotState.Free;
+                Monitor.PulseAll(_lock);
+            }
         }
+        ReportReleaseFailure(slotIndex, releaseError);
+    }
+
+    /// <summary>
+    /// 遅延解放が予約されているスロットなら、ここでペイロードを解放して Free に戻す（true を返す）。
+    /// Writing / Leased から抜ける全経路の先頭で呼ぶこと。呼ばない経路があると、破棄時に保護した
+    /// ペイロードを誰も解放せず恒久リークになる。
+    /// </summary>
+    /// <param name="error">
+    /// 解放コールバックが投げた例外（無ければ null）。記録はロックを抜けてから
+    /// <see cref="ReportReleaseFailure"/> で行うこと。
+    /// </param>
+    private bool TryReleaseDeferredLocked(Slot slot, int slotIndex, out Exception? error)
+    {
+        error = null;
+        if (!slot.PendingFreeOnRelease) return false;
+        // 予約は「消化を試みた」時点で必ず降ろし、状態も Free へ進める。解放が失敗したときに
+        // 予約を残すと、次に同じスロットへ来た呼び出しがもう一度解放を試みて二重解放になり、
+        // かつスロットが Free に戻らないまま 4 枠のうち 1 枠が恒久的に失われる
+        //（GPU 経路の ID3D11Texture2D.Dispose がデバイスロスト時に投げうる）。
+        // 解放できなかったペイロードはリークするが、それは検疫と同じ扱いで許容する
+        slot.PendingFreeOnRelease = false;
+        slot.State = SlotState.Free;
+        try
+        {
+            _onFreePayload(slotIndex);
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+        Monitor.PulseAll(_lock);
+        return true;
+    }
+
+    /// <summary>
+    /// ペイロード解放の失敗を記録する。**必ずロックを解放してから呼ぶこと。**
+    /// <c>DiagnosticLog.WriteFatal</c> はデバッグモード無効時（既定）にプロセス間ミューテックスの
+    /// 待機とファイル I/O を伴うため、クリティカルセクション内で呼ぶと <see cref="Monitor.Wait"/> で
+    /// 待っているデコードスレッド・vout スレッド・UI を数百ms 単位で足止めする。
+    /// </summary>
+    private static void ReportReleaseFailure(int slotIndex, Exception? error)
+    {
+        if (error == null) return;
+        Diagnostics.DiagnosticLog.WriteFatal("videoRing",
+            $"スロット {slotIndex} のペイロード解放に失敗（解放を諦めてスロットは再利用可能にする）: {error}");
     }
 
     /// <summary>
@@ -163,24 +233,24 @@ public sealed class SlotSequencer
     }
 
     /// <summary>
-    /// リース中のスロットを Free に戻す。Close 済みで PendingFreeOnReturn が立っていれば、ロック内で
-    /// <paramref name="onFreePayload"/> を呼んで呼び出し側にペイロードを解放させる。リース中でなければ何もしない。
+    /// リース中のスロットを Free に戻す。破棄時に遅延解放が予約されていれば、ロック内で解放コールバックを
+    /// 呼んでペイロードも解放する。リース中でなければ何もしない。
     /// </summary>
-    public void ReturnLease(int slotIndex, Action<int> onFreePayload)
+    public void ReturnLease(int slotIndex)
     {
+        Exception? releaseError;
         lock (_lock)
         {
             var slot = _slots[slotIndex];
             if (slot.State != SlotState.Leased) return;
 
-            if (slot.PendingFreeOnReturn)
+            if (!TryReleaseDeferredLocked(slot, slotIndex, out releaseError))
             {
-                onFreePayload(slotIndex);
-                slot.PendingFreeOnReturn = false;
+                slot.State = SlotState.Free;
+                Monitor.PulseAll(_lock);
             }
-            slot.State = SlotState.Free;
-            Monitor.PulseAll(_lock);
         }
+        ReportReleaseFailure(slotIndex, releaseError);
     }
 
     /// <summary>
@@ -238,24 +308,49 @@ public sealed class SlotSequencer
     }
 
     /// <summary>
-    /// Close 後の解放。Leased 中のスロットは呼び出し側がまだ参照している可能性があるため即座には解放せず、
-    /// PendingFreeOnReturn を立てて <see cref="ReturnLease"/> 時に解放させる。それ以外のスロットはロック内で
-    /// <paramref name="onFreePayload"/> を呼んで即解放させる。
+    /// Close 後の解放。他スレッドがまだペイロードを参照している可能性があるスロット（Leased＝読み取り中、
+    /// Writing＝デコーダが変換出力中）は即座に解放せず、遅延解放を予約して参照が離れる時に解放させる。
+    /// それ以外（Free / Ready）はロック内で即解放する。
+    ///
+    /// Leased の保護が実際に効く相手は映像を提示している側（GPU 経路の vout スレッド・CPU 経路の UI
+    /// スレッド）。<see cref="ReturnLease"/> で必ず戻ってくるため、遅延解放は確実に消化される。
+    ///
+    /// Writing の保護は防御的な保険。呼び出し側（<c>MediaEngine.TeardownPipeline</c>）はデコードスレッドの
+    /// 停止を確認できたときにしかリングを破棄しないため、通常ここに Writing は残らない。残るのは
+    /// 書き込み側が Commit / Abort を通さずに離脱した場合だけで、その経路は
+    /// <c>VideoDecodeThread.EmitFrame</c> の try/finally で塞いである。それでも即解放にしないのは、
+    /// <see cref="Flush"/> が「Writing はデコーダが変換中のため触らない」とするのと同じ理由
+    /// （sws_scale / VideoProcessorBlt の書き込み先が足元から消える）で、破棄条件が将来緩められた
+    /// ときにヒープ破壊へ直行させないため。予約が消化されなければペイロードはリークするが、
+    /// 生存中のスレッドの足元を解放するよりは安全側。
     /// </summary>
-    public void DisposeSlots(Action<int> onFreePayload)
+    public void DisposeSlots()
     {
+        // 1 スロットの解放失敗で残りの解放を諦めないよう、例外はここで受けて最後にまとめて記録する
+        //（記録自体はファイル I/O を伴うためロックの外で行う）
+        List<(int Slot, Exception Error)>? failures = null;
         lock (_lock)
         {
             for (int i = 0; i < _slots.Length; i++)
             {
-                if (_slots[i].State == SlotState.Leased)
+                if (_slots[i].State is SlotState.Leased or SlotState.Writing)
                 {
-                    _slots[i].PendingFreeOnReturn = true;
+                    _slots[i].PendingFreeOnRelease = true;
                     continue;
                 }
-                onFreePayload(i);
+                try
+                {
+                    _onFreePayload(i);
+                }
+                catch (Exception ex)
+                {
+                    (failures ??= new()).Add((i, ex));
+                }
             }
         }
+        if (failures != null)
+            foreach (var (slot, error) in failures)
+                ReportReleaseFailure(slot, error);
     }
 
     /// <summary>診断用: 全スロットの状態スナップショット（停止検知時のログ出力に使う）。</summary>

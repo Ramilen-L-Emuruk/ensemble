@@ -25,13 +25,15 @@ public sealed class VideoFrameRing : IVideoFrameRing
         public int Width, Height, Stride;
     }
 
-    private readonly SlotSequencer _seq = new(SlotCount);
+    private readonly SlotSequencer _seq;
     private readonly Payload[] _payloads;
 
     public VideoFrameRing()
     {
         _payloads = new Payload[SlotCount];
         for (int i = 0; i < SlotCount; i++) _payloads[i] = new Payload();
+        // _payloads を先に用意してから渡す（コールバックは後から呼ばれるが、順序を崩すと null 参照になる）
+        _seq = new SlotSequencer(SlotCount, FreePayload);
     }
 
     public int CurrentSerial => _seq.CurrentSerial;
@@ -49,8 +51,12 @@ public sealed class VideoFrameRing : IVideoFrameRing
             var p = _payloads[idx];
             if (p.Capacity < needed)
             {
+                // 先に新しいバッファを確保し、成功してから旧バッファを解放する。逆順にすると
+                // AllocHGlobal が OOM を投げたときに p.Buffer が解放済みポインタのまま残り、
+                // 以後の FreePayload（リング破棄時）が同じ領域を二重解放する
+                IntPtr fresh = Marshal.AllocHGlobal(needed);
                 if (p.Buffer != IntPtr.Zero) Marshal.FreeHGlobal(p.Buffer);
-                p.Buffer = Marshal.AllocHGlobal(needed);
+                p.Buffer = fresh;
                 p.Capacity = needed;
             }
             p.Width = width;
@@ -99,8 +105,8 @@ public sealed class VideoFrameRing : IVideoFrameRing
         return false;
     }
 
-    /// <summary>リース中のスロットを Free に戻す。Close 済みで PendingFreeOnReturn なら、ここでネイティブバッファも解放する。</summary>
-    public void ReturnLease(int slotIndex) => _seq.ReturnLease(slotIndex, FreePayload);
+    /// <summary>リース中のスロットを Free に戻す。破棄時に遅延解放が予約されていれば、ここでネイティブバッファも解放する。</summary>
+    public void ReturnLease(int slotIndex) => _seq.ReturnLease(slotIndex);
 
     /// <summary>
     /// シーク時: 世代番号を進めて Ready を Free に戻し、EOF 状態も解除する。どのスレッドから呼んでも安全
@@ -116,7 +122,7 @@ public sealed class VideoFrameRing : IVideoFrameRing
     /// <summary>VideoDecodeThread が EOF 受信・残フレーム drain 完了後に呼ぶ。</summary>
     public void MarkEof() => _seq.MarkEof();
 
-    /// <summary>EOF 済みかつ表示待ち・リース中のフレームが残っていない（再生完了検出に使う）。</summary>
+    /// <summary>EOF 済みかつ表示待ち（書き込み中・提示待ち）のフレームが残っていない。リース中は数えない（再生完了検出に使う）。</summary>
     public bool IsEofDrained => _seq.IsEofDrained;
 
     public void Close() => _seq.Close();
@@ -130,12 +136,12 @@ public sealed class VideoFrameRing : IVideoFrameRing
     }
 
     /// <summary>
-    /// Close 後に解放する。Leased 中のスロットは UI がまだ参照している可能性があるため即座には解放せず、
-    /// PendingFreeOnReturn を立てて ReturnLease 時に解放する。
+    /// Close 後に解放する。他スレッドがまだ参照している可能性があるスロット（UI がリース中・デコーダが
+    /// 書き込み中）は即座には解放せず、参照が離れる時に解放する。
     /// </summary>
     public void Dispose()
     {
         Close();
-        _seq.DisposeSlots(FreePayload);
+        _seq.DisposeSlots();
     }
 }

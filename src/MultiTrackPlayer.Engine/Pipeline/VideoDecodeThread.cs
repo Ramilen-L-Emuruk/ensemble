@@ -88,12 +88,39 @@ public sealed unsafe class VideoDecodeThread
         {
             // デコード／GPU 相互運用で想定外の例外が出ても、専用スレッドの未処理例外として
             // プロセス全体を fail-fast で巻き込まない（連続ファイル切替時の破棄競合など）。
-            // 握り潰しではなく異常は必ずログに残し、このスレッドは安全に終了する。
-            Diagnostics.DiagnosticLog.Write("video", $"デコードスレッド異常終了（以降の映像処理を停止）: {ex}");
+            // 握り潰しではなく異常は必ず記録し、このスレッドは安全に終了する。
+            // Write は診断ログ無効時（既定）に何もしないため、ここは WriteFatal を使う
+            //（この経路を無記録にすると「映像だけ静かに止まる」原因不明の不具合になる）
+            Diagnostics.DiagnosticLog.WriteFatal("video", $"デコードスレッド異常終了（以降の映像処理を停止）: {ex}");
+            AbandonVideoPipeline();
         }
         finally
         {
             av_frame_free(&frame);
+        }
+    }
+
+    /// <summary>
+    /// このスレッドが異常終了するときの後始末（<c>AudioDecodeThread.AbandonAudioPipeline</c> と対称）。
+    /// 映像側の待ち合わせを解かずに消えると、次の 3 つが同時に止まる:
+    /// ・プリロールゲートが解除されず、ミキサーの音声出力保留が永久に続く
+    /// ・映像リングが EOF にならず、再生完了が検出されない（次のファイルへ進めない）
+    /// ・誰も引き取らない映像キューが満杯になり、AVFormatContext を専有する demux スレッドが
+    ///   Put でブロックして音声の供給まで止まる（＝全パイプラインの凍結）
+    /// キューを閉じても demux は停止しない（停止判定は停止要求の有無で行う）ため、
+    /// 音声だけの再生が終端まで続き、そこで再生完了が正しく検出される。
+    /// </summary>
+    private void AbandonVideoPipeline()
+    {
+        try
+        {
+            ReleasePendingPreroll();
+            _sink.MarkEof();
+            _queue.Close();
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.DiagnosticLog.WriteFatal("video", $"映像パイプラインの後始末に失敗: {ex}");
         }
     }
 
@@ -211,9 +238,21 @@ public sealed unsafe class VideoDecodeThread
         if (slot == SlotSequencer.SlotFlushed) { _abandonUntilFlush = true; return; }
 
         // 変換手段（CPU sws_scale / GPU VideoProcessor）は sink 実装に委譲する。
-        if (_sink.WriteFrame(frame, slot))
-            _sink.CommitWrite(slot, normalizedPts);
-        else
-            _sink.AbortWrite(slot);
+        // 確保したスロットは、例外が飛んでも必ず Commit か Abort のどちらかで手放すこと。
+        // Writing のまま抜けると、リング破棄時に「まだ書き込み中」と見なされてペイロードが
+        // 遅延解放の予約に回り、このスレッドが戻ってこないぶんだけ恒久リークになる
+        bool committed = false;
+        try
+        {
+            if (_sink.WriteFrame(frame, slot))
+            {
+                _sink.CommitWrite(slot, normalizedPts);
+                committed = true;
+            }
+        }
+        finally
+        {
+            if (!committed) _sink.AbortWrite(slot);
+        }
     }
 }

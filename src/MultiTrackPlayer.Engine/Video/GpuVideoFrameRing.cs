@@ -35,7 +35,7 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
         public int Width, Height;
     }
 
-    private readonly SlotSequencer _seq = new(SlotCount);
+    private readonly SlotSequencer _seq;
     private readonly Payload[] _payloads;
     private readonly GpuDeviceContext _gpu;
 
@@ -47,6 +47,8 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
         _gpu = gpu ?? throw new ArgumentNullException(nameof(gpu));
         _payloads = new Payload[SlotCount];
         for (int i = 0; i < SlotCount; i++) _payloads[i] = new Payload();
+        // _payloads を先に用意してから渡す（コールバックは後から呼ばれるが、順序を崩すと null 参照になる）
+        _seq = new SlotSequencer(SlotCount, FreeSlot);
     }
 
     public int CurrentSerial => _seq.CurrentSerial;
@@ -77,8 +79,13 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
             var p = _payloads[idx];
             if (p.Texture == null || p.Width != width || p.Height != height)
             {
+                // 先に新しいテクスチャを作り、成功してから旧リソースを解放する
+                //（CPU 版 VideoFrameRing.BeginWrite と同じ alloc-then-free 原則）。
+                // 逆順にすると生成が失敗したときにスロットがテクスチャ無しの壊れた状態で残る
+                var (texture, sharedHandle) = CreateSlotTexture(width, height);
                 DisposePayloadResources(p);
-                CreateSlotTexture(p, width, height);
+                p.Texture = texture;
+                p.SharedHandle = sharedHandle;
                 p.Width = width;
                 p.Height = height;
             }
@@ -145,8 +152,8 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
         return false;
     }
 
-    /// <summary>リース中のスロットを Free に戻す。Close 済みで PendingFreeOnReturn なら、ここでテクスチャ／OutputView も解放する。</summary>
-    public void ReturnLease(int slotIndex) => _seq.ReturnLease(slotIndex, FreeSlot);
+    /// <summary>リース中のスロットを Free に戻す。破棄時に遅延解放が予約されていれば、ここでテクスチャ／OutputView も解放する。</summary>
+    public void ReturnLease(int slotIndex) => _seq.ReturnLease(slotIndex);
 
     /// <summary>シーク時: 世代番号を進めて Ready を Free に戻し EOF 状態も解除する（どのスレッドから呼んでも安全）。</summary>
     public void Flush() => _seq.Flush();
@@ -157,23 +164,30 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
     /// <summary>producer が EOF 受信・残フレーム drain 完了後に呼ぶ。</summary>
     public void MarkEof() => _seq.MarkEof();
 
-    /// <summary>EOF 済みかつ表示待ち・リース中のフレームが残っていない（再生完了検出に使う）。</summary>
+    /// <summary>EOF 済みかつ表示待ち（書き込み中・提示待ち）のフレームが残っていない。リース中は数えない（再生完了検出に使う）。</summary>
     public bool IsEofDrained => _seq.IsEofDrained;
 
     public void Close() => _seq.Close();
 
-    /// <summary>Close 後に解放する。Leased 中のスロットは UI または vout スレッドがまだ参照している可能性があるため <see cref="ReturnLease"/> 時に解放する。</summary>
+    /// <summary>
+    /// Close 後に解放する。UI・vout スレッドがリース中のスロットと、デコーダが書き込み中のスロットは
+    /// 参照が離れる時に解放する（<see cref="SlotSequencer.DisposeSlots"/>）。
+    /// </summary>
     public void Dispose()
     {
         Close();
         // enumerator は Converter 所有のため破棄しない。テクスチャ／OutputView のみ解放する。
-        _seq.DisposeSlots(FreeSlot);
+        _seq.DisposeSlots();
     }
 
-    private void CreateSlotTexture(Payload p, int width, int height)
+    /// <summary>
+    /// スロット用の共有 BGRA テクスチャと共有ハンドルを新規に作る。呼び出し側は成功した戻り値を
+    /// スロットへ入れてから旧リソースを解放すること（alloc-then-free）。
+    /// </summary>
+    private (ID3D11Texture2D Texture, IntPtr SharedHandle) CreateSlotTexture(int width, int height)
     {
         // 別デバイス（描画側）から共有ハンドルで開けるよう Shared フラグ付きの BGRA レンダーターゲットを作る。
-        p.Texture = _gpu.Device.CreateTexture2D(
+        var texture = _gpu.Device.CreateTexture2D(
             Format.B8G8R8A8_UNorm, (uint)width, (uint)height, arraySize: 1, mipLevels: 1,
             initialData: null,
             bindFlags: BindFlags.RenderTarget,
@@ -181,8 +195,18 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
             usage: ResourceUsage.Default,
             cpuAccessFlags: CpuAccessFlags.None);
 
-        using var dxgiResource = p.Texture.QueryInterface<IDXGIResource>();
-        p.SharedHandle = dxgiResource.SharedHandle;
+        try
+        {
+            using var dxgiResource = texture.QueryInterface<IDXGIResource>();
+            return (texture, dxgiResource.SharedHandle);
+        }
+        catch
+        {
+            // 共有ハンドルが取れなければテクスチャは使い物にならない。呼び出し側へ渡らないぶん
+            // ここで解放しないと漏れる
+            texture.Dispose();
+            throw;
+        }
     }
 
     private void FreeSlot(int slotIndex) => DisposePayloadResources(_payloads[slotIndex]);

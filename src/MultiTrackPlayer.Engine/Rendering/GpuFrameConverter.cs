@@ -30,7 +30,9 @@ public readonly record struct ColorInfo(bool IsBt709, bool IsFullRange)
 ///
 /// スレッド契約: <see cref="ConvertInto"/> は単一のデコードスレッドから呼ぶ前提（内部にロックは持たない）。
 /// 生成・<see cref="Dispose"/> は所有者（<c>MediaEngine</c>）のスレッドで行い、デコードスレッドの開始前の生成・
-/// Join 後の破棄という happens-before で安全性を担保する（ConvertInto を呼ぶスレッドとは別スレッド）。
+/// Join 成功後の破棄という happens-before で安全性を担保する（ConvertInto を呼ぶスレッドとは別スレッド）。
+/// Join がタイムアウトした場合は happens-before が成立しないため、<c>MediaEngine</c> は破棄せず検疫する
+/// （<c>MediaEngine.TeardownPipeline</c> 参照）。
 /// </summary>
 public sealed class GpuFrameConverter : IDisposable
 {

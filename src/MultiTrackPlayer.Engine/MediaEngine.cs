@@ -30,9 +30,12 @@ public unsafe class MediaEngine : IMediaEngine
     // 1つを全 VideoDecoder が av_buffer_ref で参照共有する。GPU 無し環境等では null のままとしフォールバックする。
     private AVBufferRef* _sharedHwDeviceCtx;
     private VideoDecoder? _videoDecoder;
-    private readonly List<AudioDecoder> _audioDecoders = new();
-    private readonly List<AudioTrackState> _audioStates = new();
-    private readonly Dictionary<int, int> _audioStreamToTrack = new();
+    // 検疫時は Clear ではなく「空インスタンスへの差し替え」で旧実体を残す必要があるため readonly にしない。
+    // 取り残されたデコード／demux スレッドは、コンストラクタで受け取った同一インスタンスを持ち続けており、
+    // Clear するとそのスレッドのインデックスアクセスと競合する
+    private List<AudioDecoder> _audioDecoders = new();
+    private List<AudioTrackState> _audioStates = new();
+    private Dictionary<int, int> _audioStreamToTrack = new();
     private MultiTrackMixer? _mixer;
     private WasapiOut? _wasapiOut;
 
@@ -49,6 +52,11 @@ public unsafe class MediaEngine : IMediaEngine
     private Thread? _demuxThreadHandle;
     private Thread? _videoDecodeThreadHandle;
     private Thread? _audioDecodeThreadHandle;
+    // パイプラインの世代。停止待ちがタイムアウトしたデコードスレッドが後から自力回復して
+    // プリロール完了を通知してくると、そのコールバックは MediaEngine の「現在の」フィールドを
+    // 触るため、新しいパイプラインの音声出力保留を実プリロール完了前に解除してしまう
+    //（早送り・A-V ズレの再発）。各スレッドは構築時の世代を握り、一致しない通知は捨てる
+    private volatile int _pipelineGeneration;
     private Timer? _statusTimer;
     private volatile bool _playbackEndedFired;
 
@@ -58,6 +66,12 @@ public unsafe class MediaEngine : IMediaEngine
     private SwapChainVideoPresenter? _swapPresenter;
     private Thread? _voutThreadHandle;
     private volatile bool _voutRunning;
+    // vout スレッドの世代。_voutRunning はインスタンス共有の単一フィールドなので、停止待ちが
+    // タイムアウトした旧 vout スレッドが Present から抜けたときに、新セッションが立てた
+    // _voutRunning=true を自分への継続指示と誤認して旧スワップチェーンへ Present し続けてしまう
+    //（同一 HWND を 2 つのスワップチェーンが二重駆動する）。各スレッドは開始時の世代を覚え、
+    // 一致しなくなったら自分が過去の世代だと判断して抜ける
+    private volatile int _voutGeneration;
     private long _lastVoutPull;
 
     // Paused 中に表示するフレーム（Step/Seek で更新）。Playing 中は使わず TryLeaseDue を直接使う
@@ -81,6 +95,30 @@ public unsafe class MediaEngine : IMediaEngine
     // 停止時に読み取り位置を巻き戻せなかった（スレッドが止まりきらなかった）ことを覚えておく。
     // このまま次の再生に入ると、実際の内容は停止位置からなのに表示だけ 0 秒から進んでしまう
     private bool _rewindSkipped;
+
+    // 停止待ちがタイムアウトし、パイプラインのスレッドがまだ生きている可能性がある状態。
+    // このとき AVFormatContext・デコーダ・キュー・リング・変換器はそのスレッドが触りうるため、
+    // 解放も再構築もしてはならない（解放すればネイティブヒープが壊れ、再構築すれば同じ
+    // AVFormatContext を 2 つの demux スレッドが読むことになる）。解除はファイルを開き直したときのみ。
+    private bool _threadsAbandoned;
+    // 上記のため解放できなかったオブジェクトの置き場。参照を持ち続けることでファイナライザ
+    //（Vortice の COM ラッパー等）経由の解放も起きないようにする。意図的なリーク
+    private readonly List<object> _quarantined = new();
+    // demux の I/O を中断するための門。ファイルごとに 1 つ作る
+    private IoInterruptGate? _ioGate;
+
+    /// <summary>
+    /// <c>av_read_frame</c> / <c>avformat_seek_file</c> の I/O を中断させるための門。
+    /// これが無いと、遅いストレージ（OneDrive のプレースホルダ・ネットワーク共有・スピンアップ中の
+    /// 外付けドライブ）で demux スレッドが数十秒戻らず、停止待ちが必ずタイムアウトする。
+    /// コールバックはネイティブ側が関数ポインタで保持するため、対応する AVFormatContext が生きている間は
+    /// このインスタンスを GC から守る必要がある（解放できなかった場合は検疫して永久に保持する）。
+    /// </summary>
+    private sealed class IoInterruptGate
+    {
+        public volatile bool Abort;
+        public AVIOInterruptCB_callback? Callback;
+    }
     private double _playbackSpeed = 1.0;
     private List<ChapterInfo> _chapters = new();
     // 映像の1フレーム時間（秒）: due 判定・プリロール猶予・フレームドロップ閾値に使用
@@ -93,6 +131,14 @@ public unsafe class MediaEngine : IMediaEngine
     /// <summary>現在の再生状態。UI 側はこの値を唯一の情報源として表示すること。</summary>
     /// <remarks>読み取りは volatile で足りる。書き込みだけ <c>_stateLock</c> で直列化している。</remarks>
     public CorePlaybackState State => _state;
+
+    /// <summary>
+    /// パイプラインのスレッドが停止しきらず、ネイティブ資源を解放できないまま取り残された状態。
+    /// この間は再生を再開できない（同じ AVFormatContext を 2 つの demux スレッドが読むのを避けるため）。
+    /// ファイルを開き直すと解除される。表示側はこれを見て復旧手段を案内すること。
+    /// </summary>
+    public bool IsPipelineQuarantined => _threadsAbandoned;
+
     public double PlaybackSpeed => _playbackSpeed;
 
     public TimeSpan Position
@@ -153,6 +199,11 @@ public unsafe class MediaEngine : IMediaEngine
                 throw new InvalidOperationException($"Cannot open file: {filePath} (ret={ret}: {err})");
             }
         }
+
+        // ここから先は新しい AVFormatContext。前のファイルで取り残したスレッドが触るのは
+        // 検疫した（解放していない）古いコンテキストだけなので、検疫状態を解除して再生可能に戻す
+        _threadsAbandoned = false;
+        InstallIoInterruptGate();
 
         try
         {
@@ -423,7 +474,9 @@ public unsafe class MediaEngine : IMediaEngine
             // 後始末は Stop() と同じ扱いにする（片方だけ丁寧にすると、読み取り位置が
             // 不明なまま次の再生に入って表示位置がずれる経路が残る）
             SetState(CorePlaybackState.Stopped);
-            HandleTeardownResult(TeardownPipeline());
+            // 既に検疫済み（＝EnsurePipelineStarted が構築を拒否した）なら畳むものは無い。
+            // 再実行しても no-op だが「停止待ちが完了しなかった」ログが二重に出て調査を誤導する
+            if (!_threadsAbandoned) HandleTeardownResult(TeardownPipeline());
             throw;
         }
     }
@@ -443,18 +496,33 @@ public unsafe class MediaEngine : IMediaEngine
         ReleaseHeldFrame();
         bool allThreadsStopped = TeardownPipeline();
         SetState(CorePlaybackState.Stopped);
-        // ここまで来るとパイプラインは畳み終わっていて後戻りできない。
-        // 音声デバイス側の停止に失敗しても停止状態として扱い、記録だけ残す
-        try { _wasapiOut?.Stop(); }
-        catch (Exception ex) { DiagnosticLog.WriteFatal("engine", $"音声出力の停止に失敗: {ex}"); }
-        foreach (var s in _audioStates) s.Buffer.ClearBuffer();
-        _clock.Reset();
-        _positionSource?.Reset();
         _playbackEndedFired = false;
         // シーク中断のまま Stop された場合に保留状態が次の Play() へ持ち越されないようにする
         _videoPrerollReady = true;
         _audioPrerollReady = true;
-        if (_mixer != null) _mixer.HoldOutput = false;
+
+        if (allThreadsStopped)
+        {
+            // パイプラインは畳み終わっていて後戻りできない。
+            // 音声デバイス側の停止に失敗しても停止状態として扱い、記録だけ残す
+            try { _wasapiOut?.Stop(); }
+            catch (Exception ex) { DiagnosticLog.WriteFatal("engine", $"音声出力の停止に失敗: {ex}"); }
+            foreach (var s in _audioStates) s.Buffer.ClearBuffer();
+            _clock.Reset();
+            _positionSource?.Reset();
+            if (_mixer != null) _mixer.HoldOutput = false;
+        }
+        else
+        {
+            // 検疫時。取り残されたスレッドが _wasapiOut(WASAPI COM) や各トラックのバッファを
+            // まだ触っている可能性がある。IAudioClient は並行アクセスに耐えないため、ここで
+            // Stop() すると状態タイマーの GetPosition() と競合してプロセスが落ちうる。
+            // 触るのはミキサー出力の保留（マネージドな volatile bool 1 つ）だけにして消音する。
+            // これらの資源は DisposeDecoders が検疫し、解放しないまま次のファイルへ引き継がない
+            if (_mixer != null) _mixer.HoldOutput = true;
+            DiagnosticLog.WriteFatal("engine",
+                "検疫中のため音声出力・バッファ・クロックの後始末を省略した（ミキサー出力の保留で消音）");
+        }
         HandleTeardownResult(allThreadsStopped);
     }
 
@@ -546,8 +614,9 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     /// <summary>音声プリロール完了時（AudioDecodeThread からのコールバック）。錨の要求と準備完了の両方を行う。</summary>
-    private void OnAudioPrerollReady(double targetSeconds)
+    private void OnAudioPrerollReady(int generation, double targetSeconds)
     {
+        if (!IsCurrentPipeline(generation, "audioPreroll")) return;
         RequestAnchor(targetSeconds);
         _audioPrerollReady = true;
         DiagnosticLog.Write("gate", $"audioPrerollReady=true target={targetSeconds:F3} video={_videoPrerollReady}");
@@ -555,11 +624,26 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     /// <summary>映像プリロール完了時（VideoDecodeThread からのコールバック）。</summary>
-    private void OnVideoPrerollReady()
+    private void OnVideoPrerollReady(int generation)
     {
+        if (!IsCurrentPipeline(generation, "videoPreroll")) return;
         _videoPrerollReady = true;
         DiagnosticLog.Write("gate", $"videoPrerollReady=true audio={_audioPrerollReady}");
         TryReleaseMixerHold();
+    }
+
+    /// <summary>
+    /// デコードスレッドからの通知が現在のパイプライン世代のものか。停止待ちがタイムアウトした
+    /// 旧スレッドが後から自力回復して通知してきた場合、それを現在のプリロールゲート・ミキサーへ
+    /// 適用すると、新しいパイプラインの実プリロール完了前に音声出力保留が解除される
+    /// （早送り・A-V ズレの再発）。世代が違う通知はここで捨てる。
+    /// </summary>
+    private bool IsCurrentPipeline(int generation, string what)
+    {
+        if (generation == _pipelineGeneration) return true;
+        DiagnosticLog.Write("gate",
+            $"{what} の通知を破棄（generation={generation} 現在={_pipelineGeneration}）");
+        return false;
     }
 
     /// <summary>音声・映像の両方のプリロールが完了して初めて、ミキサーの実音声出力保留を解除する。</summary>
@@ -759,6 +843,19 @@ public unsafe class MediaEngine : IMediaEngine
     {
         if (_demuxThread != null) return; // 既に構築済み
         if (_fmtCtx == null) return;
+        if (_threadsAbandoned)
+        {
+            // 前のパイプラインのスレッドが止まりきっていない。ここで新しい DemuxThread を作ると
+            // 同一の AVFormatContext を 2 つのスレッドが読み、av_read_frame の競合でネイティブヒープが
+            // 壊れる。ファイルを開き直すまで再生を再開しない（落とさずに縮退させる）
+            DiagnosticLog.WriteFatal("engine",
+                "前回のパイプラインが停止しきっていないため再生を再開しない（ファイルを開き直すこと）");
+            throw new InvalidOperationException(
+                "前回の停止処理が完了していないため再生できません。ファイルを開き直してください。");
+        }
+        // 停止時に立てた I/O 中断フラグを下ろす。下ろさないと av_read_frame が即エラーを返し、
+        // 開始直後に EOF と誤認される
+        if (_ioGate != null) _ioGate.Abort = false;
 
         int videoStreamIndex = _videoDecoder?.StreamIndex ?? -1;
         int trackCount = Math.Max(1, _audioDecoders.Count);
@@ -774,15 +871,18 @@ public unsafe class MediaEngine : IMediaEngine
             _fmtCtx, videoStreamIndex, _audioStreamToTrack,
             _videoQueue, _audioQueue, PublishSeekTarget);
 
+        // このパイプラインの世代。取り残された旧スレッドの遅延通知を弾くために使う
+        int pipelineGeneration = ++_pipelineGeneration;
+
         if (_videoDecoder != null && videoSink != null)
             _videoDecodeThread = new VideoDecodeThread(
                 _videoDecoder, _videoQueue, videoSink,
                 () => _demuxThread!.PtsSyncOffset, _videoFrameDuration,
-                onFirstFrameAfterFlush: OnVideoPrerollReady);
+                onFirstFrameAfterFlush: () => OnVideoPrerollReady(pipelineGeneration));
 
         _audioDecodeThread = new AudioDecodeThread(
             _audioDecoders, _audioStates, _audioQueue, () => _demuxThread!.PtsSyncOffset,
-            onFirstSamplesAfterFlush: OnAudioPrerollReady);
+            onFirstSamplesAfterFlush: target => OnAudioPrerollReady(pipelineGeneration, target));
 
         if (_mixer != null)
         {
@@ -874,15 +974,21 @@ public unsafe class MediaEngine : IMediaEngine
 
         _voutRunning = true;
         _lastVoutPull = 0;
-        _voutThreadHandle = StartBackgroundThread(VideoOutputLoop);
-        DiagnosticLog.Write("d3dPresenter", "vout スレッド開始");
+        int generation = _voutGeneration;
+        _voutThreadHandle = StartBackgroundThread(() => VideoOutputLoop(generation));
+        DiagnosticLog.Write("d3dPresenter", $"vout スレッド開始 generation={generation}");
     }
 
     /// <summary>
     /// vout スレッド本体。vsync（waitable object）ごとに起床し、再生中はクロックに対して due なフレームを
     /// リースしてバックバッファへコピー・Present する。UI 合成に依存しないためフレーム間引きが起きにくい。
     /// </summary>
-    private void VideoOutputLoop()
+    /// <param name="generation">
+    /// このスレッドが担当する vout 世代。<c>_voutGeneration</c> と一致しなくなったら、自分は
+    /// 停止待ちがタイムアウトした過去の世代だと判断してループを抜ける（旧スワップチェーンで
+    /// Present を続けて新しい vout と同一 HWND を二重駆動しないため）。
+    /// </param>
+    private void VideoOutputLoop(int generation)
     {
         var presenter = _swapPresenter;
         if (presenter == null) return;
@@ -900,10 +1006,14 @@ public unsafe class MediaEngine : IMediaEngine
 
         try
         {
-            while (_voutRunning)
+            while (_voutRunning && generation == _voutGeneration)
             {
                 presenter.WaitForVBlank();
-                if (!_voutRunning) break;
+                // 世代もここで見る。_voutRunning だけを見ると、停止待ちがタイムアウトした旧スレッドが
+                // 新セッションの立て直した true を素通りし、この下の共有統計フィールド
+                //（_lastVoutPull / _droppedFrames / _displayedFrames / _lastFrameServedTicks /
+                //   _lastVideoLagSec。いずれも非ロック）を新 vout と競合しながら書き換えてしまう
+                if (!_voutRunning || generation != _voutGeneration) break;
 
                 long pullNow = Stopwatch.GetTimestamp();
                 double gapMs = _lastVoutPull == 0 ? 0.0 : (pullNow - _lastVoutPull) * 1000.0 / Stopwatch.Frequency;
@@ -964,8 +1074,9 @@ public unsafe class MediaEngine : IMediaEngine
 
                 prevState = state;
 
-                // 停止要求後は Render/Present に入らず即脱出する（破棄途中の swapchain を触らせない）。
-                if (!_voutRunning) break;
+                // 停止要求後・世代交代後は Render/Present に入らず即脱出する
+                //（破棄途中の swapchain や、新しい vout が使っている HWND を触らせない）。
+                if (!_voutRunning || generation != _voutGeneration) break;
 
                 if (currentSlot >= 0)
                     presenter.Render(ring, currentSlot);
@@ -975,6 +1086,9 @@ public unsafe class MediaEngine : IMediaEngine
                 presenter.Present();
             }
 
+            if (generation != _voutGeneration)
+                DiagnosticLog.Write("d3dPresenter",
+                    $"vout スレッド generation={generation} が新世代({_voutGeneration})へ道を譲って終了");
             if (ownedByVout && currentSlot >= 0) ring.ReturnLease(currentSlot);
         }
         catch (Exception ex)
@@ -992,21 +1106,33 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     /// <summary>vout スレッドを停止する（リング破棄より先に呼ぶこと）。スワップチェーンの破棄は vout スレッド自身に委譲する。</summary>
-    private void StopVideoOutput()
+    /// <returns>
+    /// 時間内に停止した場合 true。false のとき、vout スレッドはまだ映像リングのスロットを
+    /// リースしている可能性がある（リングを破棄してはならない）。
+    /// </returns>
+    private bool StopVideoOutput()
     {
         _voutRunning = false;
+        // 世代を進める。Join がタイムアウトしても、旧スレッドは次にループ条件を評価した時点で
+        // 自分が過去の世代だと気づいて抜ける（新セッションが _voutRunning を立て直しても誤認しない）
+        _voutGeneration++;
         var handle = _voutThreadHandle;
+        bool stopped = true;
         if (handle != null)
         {
             // swapchain の破棄は vout スレッドの finally が行う。Join できれば破棄も完了している。
             // Present の vsync 待ちで稀に時間がかかるため長めに待つ。タイムアウト時もメインからは Dispose せず
             // （ゾンビが握るオブジェクトを消さない）、スレッド復帰後の自己破棄に委ねる。
             if (!handle.Join(TimeSpan.FromSeconds(5)))
-                DiagnosticLog.Write("d3dPresenter", "vout スレッドの停止待ちがタイムアウト（swapchain 破棄はスレッド側に委譲）");
+            {
+                DiagnosticLog.WriteFatal("d3dPresenter", "vout スレッドの停止待ちがタイムアウト（swapchain 破棄はスレッド側に委譲）");
+                stopped = false;
+            }
         }
         _voutThreadHandle = null;
         // 参照だけ手放す。実体の破棄は vout スレッドの finally が担う。
         _swapPresenter = null;
+        return stopped;
     }
 
     // demux スレッドがシーク実行直後（各キューへ FlushMarker を入れる前）に呼ぶ
@@ -1031,24 +1157,15 @@ public unsafe class MediaEngine : IMediaEngine
     /// <returns>すべてのスレッドが時間内に停止した場合 true。false のときネイティブ資源は他スレッドが触っている可能性がある。</returns>
     private bool TeardownPipeline()
     {
-        // StatusTick はスレッドプールで走り _positionSource(WASAPI COM) / _videoRing(D3D) 等のネイティブ資源を
-        // 触るため、以降の破棄より先に走行中コールバックの完了を待ってタイマーを止める。
-        // （Change(Infinite) や引数なし Dispose は走行中コールバックを止めないため、連続ファイル切替で
-        //   破棄済みネイティブ資源へアクセスしてプロセスが不正終了する原因になっていた。）
-        // ただし待ちには上限があり、時間内に止まらなければ「走行中のまま破棄へ進む」ことになる。
-        // その場合は上記の不正終了が起こりうるため、必ず記録を残す。
-        if (_statusTimer != null)
-        {
-            using var timerStopped = new ManualResetEvent(false);
-            _statusTimer.Dispose(timerStopped);
-            if (!timerStopped.WaitOne(TimeSpan.FromSeconds(2)))
-                DiagnosticLog.WriteFatal("engine", "状態タイマーが時間内に停止しなかった（走行中のまま破棄へ進む）");
-            _statusTimer = null;
-        }
+        bool timerStopped = StopStatusTimer();
 
         // vout はリング・スワップチェーンを使うため、他の停止・破棄より先に止める。
-        StopVideoOutput();
+        // vout スレッドはリングのスロットをリースし続けるため、停止の成否はリング破棄の可否に直結する
+        bool voutStopped = StopVideoOutput();
 
+        // 停止要求を先に立て、そのうえで I/O を中断する。順序が逆だと「停止要求は未設定・I/O は中断済み」
+        // という隙間が生じ、demux スレッドが中断による負値の戻りをファイル終端と誤認して
+        // EOF 番兵を積んでしまう（停止操作が再生完了として扱われる）
         _demuxThread?.RequestStop();
         _videoDecodeThread?.RequestStop();
         _audioDecodeThread?.RequestStop();
@@ -1057,20 +1174,42 @@ public unsafe class MediaEngine : IMediaEngine
         _audioQueue?.Close();
         _videoRing?.Close();
         _audioDecodeThread?.Wake();
+        // I/O でブロック中の av_read_frame / avformat_seek_file を中断させる
+        if (_ioGate != null) _ioGate.Abort = true;
 
         // 停止待ちがタイムアウトした場合、そのスレッドはまだ AVFormatContext やネイティブ資源を
-        // 触っている可能性がある。呼び出し元が「触ってよいか」を判断できるよう結果を返す
-        bool allStopped = true;
+        // 触っている可能性がある。破棄してよいかの判断にも、呼び出し元への戻り値にも使う。
+        // 過去の停止で取り残したスレッドが居る間は、今回何も残らなかったとしても「触ってよい」とは
+        // 言えない（そのスレッドが AVFormatContext を読み続けている可能性がある）
+        bool allStopped = timerStopped && voutStopped && !_threadsAbandoned;
         allStopped &= JoinOrLog(_demuxThreadHandle, "demux");
         allStopped &= JoinOrLog(_videoDecodeThreadHandle, "映像デコード");
         allStopped &= JoinOrLog(_audioDecodeThreadHandle, "音声デコード");
 
-        _videoQueue?.DrainAndDispose();
-        _audioQueue?.DrainAndDispose();
-        // リング（OutputView を保持）を先に破棄し、その後 enumerator/processor を持つ converter を破棄する。
-        // どちらも GpuDeviceContext より先（GpuDeviceContext はエンジン破棄時に解放）。
-        _videoRing?.Dispose();
-        _videoConverter?.Dispose();
+        if (allStopped)
+        {
+            _videoQueue?.DrainAndDispose();
+            _audioQueue?.DrainAndDispose();
+            // リング（OutputView を保持）を先に破棄し、その後 enumerator/processor を持つ converter を破棄する。
+            // どちらも GpuDeviceContext より先（GpuDeviceContext はエンジン破棄時に解放）。
+            _videoRing?.Dispose();
+            _videoConverter?.Dispose();
+            // 誰も I/O 待ちで止まっていないので中断フラグを下ろす。下ろさないと
+            // この後の RewindToStart（avformat_seek_file）まで中断されてしまう
+            if (_ioGate != null) _ioGate.Abort = false;
+        }
+        else if (!_threadsAbandoned)
+        {
+            // 止まりきらなかったスレッドがキュー・リング・変換器をまだ触っている可能性がある。
+            // 破棄すると解放済み領域への読み書きでネイティブヒープが壊れるため、破棄せず検疫する。
+            // 既に検疫済みの場合は再構築を拒否しているので新たに検疫すべきものは無い
+            // _ioGate は _fmtCtx と対の資源なので、検疫は DisposeDecoders 側に一本化する
+            _threadsAbandoned = true;
+            Quarantine(_videoQueue, _audioQueue, _videoRing, _videoConverter);
+            DiagnosticLog.WriteFatal("engine",
+                "パイプラインのスレッドが停止しなかったため、キュー・リング・変換器を解放せず検疫した" +
+                $"（ファイルを開き直すまで再生を再開しない。検疫済みオブジェクト数={_quarantined.Count}）");
+        }
 
         _demuxThread = null;
         _videoDecodeThread = null;
@@ -1092,6 +1231,53 @@ public unsafe class MediaEngine : IMediaEngine
         if (handle == null || handle.Join(TimeSpan.FromSeconds(3))) return true;
         DiagnosticLog.WriteFatal("engine", $"{name} スレッドが時間内に停止しなかった");
         return false;
+    }
+
+    /// <summary>
+    /// 状態タイマーを止め、走行中コールバックの完了を待つ。StatusTick はスレッドプールで走り
+    /// _positionSource(WASAPI COM) / _videoRing(D3D) 等のネイティブ資源を触るため、以降の破棄より
+    /// 先に完了させる必要がある（Change(Infinite) や引数なし Dispose は走行中コールバックを止めない。
+    /// 連続ファイル切替で破棄済みネイティブ資源へアクセスしてプロセスが不正終了する原因になっていた）。
+    /// </summary>
+    /// <returns>時間内に停止した場合 true。false のとき、コールバックがまだネイティブ資源を触っている可能性がある。</returns>
+    private bool StopStatusTimer()
+    {
+        if (_statusTimer == null) return true;
+
+        var stopped = new ManualResetEvent(false);
+        _statusTimer.Dispose(stopped);
+        _statusTimer = null;
+        if (stopped.WaitOne(TimeSpan.FromSeconds(2)))
+        {
+            stopped.Dispose();
+            return true;
+        }
+
+        // まだ走行中。この後コールバックが完了すると Timer 側がこのハンドルを Set するため、
+        // ここで Dispose すると破棄済みハンドルへの Set でスレッドプール側が落ちる。解放せず検疫する
+        Quarantine(stopped);
+        DiagnosticLog.WriteFatal("engine", "状態タイマーが時間内に停止しなかった（走行中のまま破棄へ進む）");
+        return false;
+    }
+
+    /// <summary>ゾンビスレッドが触りうるため解放できないオブジェクトを、参照を保持して隔離する（意図的なリーク）。</summary>
+    private void Quarantine(params object?[] items)
+    {
+        foreach (var item in items)
+            if (item != null) _quarantined.Add(item);
+    }
+
+    /// <summary>
+    /// 開いた AVFormatContext に I/O 中断コールバックを差し込む。<c>Open</c> の
+    /// <c>avformat_open_input</c> 成功直後に呼ぶこと。
+    /// </summary>
+    private void InstallIoInterruptGate()
+    {
+        var gate = new IoInterruptGate();
+        // ネイティブから関数ポインタで呼ばれる。デリゲートは gate 経由で生存させる（GC 回収でクラッシュする）
+        gate.Callback = _ => gate.Abort ? 1 : 0;
+        _fmtCtx->interrupt_callback = new AVIOInterruptCB { callback = gate.Callback, opaque = null };
+        _ioGate = gate;
     }
 
     // ── ステータス通知（100ms 周期。映像フレーム配送は UI 側の CompositionTarget.Rendering がプルする）──
@@ -1201,16 +1387,42 @@ public unsafe class MediaEngine : IMediaEngine
 
     private void DisposeDecoders()
     {
-        _videoDecoder?.Dispose(); _videoDecoder = null;
-        foreach (var d in _audioDecoders) d.Dispose();
-        _audioDecoders.Clear();
-        _audioStates.Clear();
-        _audioStreamToTrack.Clear();
-        _wasapiOut?.Dispose(); _wasapiOut = null;
+        if (_threadsAbandoned)
+        {
+            // 止まりきらなかったスレッド（デコード系・vout・状態タイマーのコールバック）が、この
+            // デコーダ・音声出力・AVFormatContext をまだ触っている可能性がある。解放すると解放済み領域や
+            // 破棄済み COM を触らせることになるため、参照だけ手放して検疫する（意図的なリーク。
+            // 次のファイルは新しい一式で動く）。特に _positionSource は _wasapiOut 自身を包んでおり、
+            // StatusTick が GetPosition() を呼び続けている可能性がある
+            //（StopStatusTimer がタイムアウトした状況とはまさにそれ）
+            Quarantine(_videoDecoder, _wasapiOut, _mixer, _positionSource, _ioGate);
+            foreach (var d in _audioDecoders) Quarantine(d);
+            // これらのコレクションは、取り残されたデコード／demux スレッドがコンストラクタで受け取った
+            // 同一インスタンスを保持している。Clear するとそのスレッドのインデックスアクセスと競合するため、
+            // 空インスタンスへ差し替えて旧実体はそのまま残す
+            _audioDecoders = new List<AudioDecoder>();
+            _audioStates = new List<AudioTrackState>();
+            _audioStreamToTrack = new Dictionary<int, int>();
+            DiagnosticLog.WriteFatal("engine",
+                "スレッドが停止しなかったため、デコーダ・音声出力・フォーマットコンテキストを解放せず検疫した" +
+                $"（検疫済みオブジェクト数={_quarantined.Count}）");
+        }
+        else
+        {
+            _videoDecoder?.Dispose();
+            foreach (var d in _audioDecoders) d.Dispose();
+            _audioDecoders.Clear();
+            _audioStates.Clear();
+            _audioStreamToTrack.Clear();
+            _wasapiOut?.Dispose();
+            if (_fmtCtx != null) { fixed (AVFormatContext** p = &_fmtCtx) avformat_close_input(p); }
+        }
+        _videoDecoder = null;
+        _wasapiOut = null;
         _mixer = null;
         _positionSource = null;
-        if (_fmtCtx != null) { fixed (AVFormatContext** p = &_fmtCtx) avformat_close_input(p); }
         _fmtCtx = null;
+        _ioGate = null;
         // 破棄後に CurrentMedia が残っていると、閉じたはずのメディアのパスを使う処理
         // （既定ミュートの保存など）が成立してしまう
         _currentMedia = null;
@@ -1221,6 +1433,17 @@ public unsafe class MediaEngine : IMediaEngine
     public void Dispose()
     {
         Close();
+        if (_threadsAbandoned)
+        {
+            // 取り残したスレッドが検疫済みのリング・変換器・デコーダ経由で共有 D3D11 デバイスと
+            // HW デバイスコンテキストを使い続けている可能性がある。ここで解放すると終了時に落ちるため、
+            // 参照を保持したまま手放す（プロセス終了で OS が回収する）
+            Quarantine(_gpuDevice);
+            _gpuDevice = null;
+            _sharedHwDeviceCtx = null;
+            DiagnosticLog.WriteFatal("engine", "スレッドが停止しなかったため、共有 GPU デバイスを解放せず検疫した");
+            return;
+        }
         // 共有 HW デバイスコンテキストを解放する。内部で共有 D3D11 デバイスを Release するため、デバイス破棄より先に行う。
         if (_sharedHwDeviceCtx != null)
         {

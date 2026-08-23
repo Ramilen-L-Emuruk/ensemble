@@ -45,7 +45,26 @@ public unsafe class VideoDecoder : IDisposable
         _ctx = avcodec_alloc_context3(codec);
         if (_ctx == null) throw new InvalidOperationException("Could not allocate video codec context");
 
-        avcodec_parameters_to_context(_ctx, stream->codecpar);
+        // ここから先で例外を投げると、確保済みの _ctx / _hwCtx を呼び出し元が解放できず恒久リークになる
+        //（コンストラクタが失敗するとインスタンスが返らないため、呼び出し元は Dispose を呼べない）。
+        // 残りの初期化を切り出し、失敗したら自分で解放してから送出する
+        try
+        {
+            Initialize(stream, codec, sharedHwDeviceCtx);
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    private void Initialize(AVStream* stream, AVCodec* codec, AVBufferRef* sharedHwDeviceCtx)
+    {
+        int paramRet = avcodec_parameters_to_context(_ctx, stream->codecpar);
+        if (paramRet < 0)
+            throw new InvalidOperationException(
+                $"Could not copy video codec parameters: {paramRet} ({FFmpegError.Describe(paramRet)})");
 
         // このデコーダが D3D11VA ハードウェアデコード（hw_device_ctx 注入方式）に対応するかをデコード前に確定させる。
         // get_format は最初のフレームをデコードした時点で初めて呼ばれるため、Open 時の経路選択（GPU/CPU）に間に合わない。
@@ -86,7 +105,9 @@ public unsafe class VideoDecoder : IDisposable
         }
 
         int ret = avcodec_open2(_ctx, codec, null);
-        if (ret < 0) throw new InvalidOperationException($"Could not open video codec: {ret}");
+        if (ret < 0)
+            throw new InvalidOperationException(
+                $"Could not open video codec: {ret} ({FFmpegError.Describe(ret)})");
     }
 
     // AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX（FFmpeg）。hw_device_ctx 注入方式で HW デコードできることを示すビット。

@@ -43,9 +43,27 @@ public unsafe class AudioDecoder : IDisposable
         if (codec == null) throw new InvalidOperationException("Audio codec not found");
 
         _ctx = avcodec_alloc_context3(codec);
-        avcodec_parameters_to_context(_ctx, stream->codecpar);
-        int ret = avcodec_open2(_ctx, codec, null);
-        if (ret < 0) throw new InvalidOperationException($"Could not open audio codec: {ret}");
+        if (_ctx == null) throw new InvalidOperationException("Could not allocate audio codec context");
+
+        // ここから先で例外を投げると、確保済みの _ctx を呼び出し元が解放できず恒久リークになる
+        //（コンストラクタが失敗するとインスタンスが返らないため、呼び出し元は Dispose を呼べない）
+        try
+        {
+            int paramRet = avcodec_parameters_to_context(_ctx, stream->codecpar);
+            if (paramRet < 0)
+                throw new InvalidOperationException(
+                    $"Could not copy audio codec parameters: {paramRet} ({FFmpegError.Describe(paramRet)})");
+
+            int ret = avcodec_open2(_ctx, codec, null);
+            if (ret < 0)
+                throw new InvalidOperationException(
+                    $"Could not open audio codec: {ret} ({FFmpegError.Describe(ret)})");
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     /// <summary>デコーダへパケットを送る（pkt に null を渡すと EOF フラッシュ）。avcodec_send_packet の戻り値をそのまま返す。</summary>

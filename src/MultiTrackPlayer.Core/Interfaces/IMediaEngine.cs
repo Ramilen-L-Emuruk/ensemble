@@ -11,6 +11,13 @@ public interface IMediaEngine : IDisposable
     PlaybackState State { get; }
 
     /// <summary>
+    /// 停止処理でパイプラインのスレッドが止まりきらず、内部資源を解放できないまま取り残された状態。
+    /// この間は <see cref="Play"/> が失敗する（ファイルを開き直すと解除される）。
+    /// 表示側はこれを見て、無言で失敗させる代わりに復旧手段を案内すること。
+    /// </summary>
+    bool IsPipelineQuarantined { get; }
+
+    /// <summary>
     /// 再生状態が変化したときに発火する。UI スレッド以外からも発火するため、
     /// 購読側でディスパッチャへ移すこと。
     /// </summary>
