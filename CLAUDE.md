@@ -174,7 +174,10 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
 
 ## 構成メモ
 
-- `src/MultiTrackPlayer.Core/`: モデル・インターフェース（依存なし）
+- `src/MultiTrackPlayer.Core/`: モデル・インターフェース（依存なし）。ViewModel から切り出した
+  純ロジック（`Models/PlaylistCursor` 等）もここに置く。理由は
+  [.claude/rules/ensemble-review.md](.claude/rules/ensemble-review.md) の
+  「5. テスト可能性の設計」を参照
 - `src/MultiTrackPlayer.Engine/`: FFmpeg デコード・NAudio ミキサー（unsafe コード有）
   - `Pipeline/`: ffplay 型スレッド分離パイプライン。`DemuxThread` が `AVFormatContext` を唯一専有し、
     `VideoDecodeThread`/`AudioDecodeThread` が `VideoPacketQueue`/`AudioPacketQueue`（シーク世代・Flush/EOF

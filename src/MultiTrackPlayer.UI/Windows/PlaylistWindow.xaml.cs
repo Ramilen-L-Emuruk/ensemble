@@ -24,11 +24,9 @@ public partial class PlaylistWindow : Window
 
     private void FileList_MouseDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
+        // 現在地の移動は OpenFile が入口で行う（開けなかった場合もそこに残る）
         if (FileList.SelectedItem is string path)
-        {
-            _vm.Playlist.SetCurrentByPath(path);
             _vm.OpenFile(path);
-        }
     }
 
     private void Add_Click(object sender, RoutedEventArgs e)
@@ -44,7 +42,7 @@ public partial class PlaylistWindow : Window
             _vm.Playlist.Remove(path);
     }
 
-    private void Clear_Click(object sender, RoutedEventArgs e) => _vm.Playlist.Files.Clear();
+    private void Clear_Click(object sender, RoutedEventArgs e) => _vm.Playlist.Clear();
 
     private void Window_DragOver(object sender, DragEventArgs e)
         => e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
