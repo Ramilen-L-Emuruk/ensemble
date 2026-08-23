@@ -39,6 +39,13 @@ public unsafe class MediaEngine : IMediaEngine
     private MultiTrackMixer? _mixer;
     private WasapiOut? _wasapiOut;
 
+    /// <summary>
+    /// UI が設定したマスター音量。ファイルを開くたびに MultiTrackMixer を作り直すため、ここで
+    /// 保持して SetupAudio で再適用しないと既定値（1.0）へ黙って戻る。ミュート中に別のファイルを
+    /// 開くと「ミュート表示のまま音が全開で鳴る」ことになる。
+    /// </summary>
+    private float _masterVolume = MultiTrackMixer.DefaultMasterVolume;
+
     // ffplay 型パイプライン: demux/デコードは各専用スレッドが担当し、AVFormatContext は DemuxThread が唯一専有する
     private VideoPacketQueue? _videoQueue;
     private AudioPacketQueue? _audioQueue;
@@ -139,6 +146,16 @@ public unsafe class MediaEngine : IMediaEngine
     /// </summary>
     public bool IsPipelineQuarantined => _threadsAbandoned;
 
+    /// <summary>
+    /// 音声出力（WASAPI）が異常停止した状態。この間は再生を再開できない（音声出力を基準に
+    /// 再生位置クロックを進めているため、再開しても位置と映像が進まない）。ファイルを開き直すと
+    /// 解除される。OSD の一度きりの通知は見逃されうるので、表示側が操作のたびに再案内できるよう
+    /// 状態としても残す。
+    /// </summary>
+    public bool IsAudioOutputFailed => _audioOutputFailed;
+
+    private volatile bool _audioOutputFailed;
+
     public double PlaybackSpeed => _playbackSpeed;
 
     public TimeSpan Position
@@ -178,6 +195,12 @@ public unsafe class MediaEngine : IMediaEngine
     public event EventHandler<TimeSpan>? PositionChanged;
     public event EventHandler? PlaybackEnded;
     public event EventHandler<PlaybackStatistics>? StatisticsUpdated;
+
+    /// <summary>
+    /// 再生を継続できない異常が起きたことを知らせる。UI スレッド以外からも発火するため、
+    /// 購読側でディスパッチャへ移すこと。引数はそのままユーザーへ提示できる文面。
+    /// </summary>
+    public event EventHandler<string>? PlaybackFailed;
 
     /// <summary>動画ファイルを開き、トラック・チャプター情報の構築と音声出力の準備までを行う。</summary>
     /// <exception cref="Exception">
@@ -401,6 +424,15 @@ public unsafe class MediaEngine : IMediaEngine
             throw new InvalidOperationException(
                 "音声出力デバイスを初期化できませんでした。既定の再生デバイスが利用可能か確認してください。", ex);
         }
+
+        // Read() で例外が起きると WASAPI はそのまま停止する。購読していないと、音が消えて
+        // クロックも進まなくなった（＝映像まで止まった）理由が何ひとつ残らない
+        _wasapiOut.PlaybackStopped += OnWasapiPlaybackStopped;
+        // 新しい音声出力を用意できたので、前のファイルで起きた異常停止の状態は解除する
+        _audioOutputFailed = false;
+
+        // ミキサーは作り直したばかりで既定音量のため、UI が設定済みの値を再適用する
+        _mixer.SetMasterVolume(_masterVolume);
 
         _clock.Reset();
         _positionSource = new WasapiPositionSource(
@@ -633,6 +665,21 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     /// <summary>
+    /// 音声トラックが切り離されたことをユーザーへ伝える。記録だけでは「なぜか一部のトラックだけ
+    /// 無音になった」ことが伝わらないため通知する。
+    /// 停止待ちがタイムアウトして検疫された旧スレッドが後から通知してくることがあるので、
+    /// プリロール完了通知と同じく現行パイプラインの世代でなければ捨てる（捨てないと、無関係な
+    /// 新しいファイルの再生中に前のファイルの障害が表示される）。
+    /// トラック番号は UI と同じ 1 起点にそろえる（SetTrackVolume の基準）。
+    /// </summary>
+    private void OnAudioTrackAbandoned(int generation, int trackIndex)
+    {
+        if (!IsCurrentPipeline(generation, "音声トラック切り離し")) return;
+        PlaybackFailed?.Invoke(this,
+            $"音声トラック {trackIndex + 1} を再生できないため切り離しました（このトラックは無音になります）");
+    }
+
+    /// <summary>
     /// デコードスレッドからの通知が現在のパイプライン世代のものか。停止待ちがタイムアウトした
     /// 旧スレッドが後から自力回復して通知してきた場合、それを現在のプリロールゲート・ミキサーへ
     /// 適用すると、新しいパイプラインの実プリロール完了前に音声出力保留が解除される
@@ -776,7 +823,30 @@ public unsafe class MediaEngine : IMediaEngine
             _audioStates[idx].IsMuted = muted;
     }
 
-    public void SetMasterVolume(float volume) => _mixer?.SetMasterVolume(volume);
+    public void SetMasterVolume(float volume)
+    {
+        // ファイル切替でミキサーを作り直しても復元できるよう、要求値を保持しておく
+        _masterVolume = volume;
+        _mixer?.SetMasterVolume(volume);
+    }
+
+    /// <summary>
+    /// WASAPI の再生が止まったときに呼ばれる。Stop()/Dispose() による正常停止では Exception が
+    /// null になるため、異常停止だけを記録・通知する。ここで止まると音声が出なくなるだけでなく、
+    /// audio-master クロックが進まなくなるので再生位置の表示と映像まで止まる。
+    /// </summary>
+    private void OnWasapiPlaybackStopped(object? sender, StoppedEventArgs e)
+    {
+        // NAudio はこのイベントを内部スレッドから非同期に発火する。購読解除と入れ違った旧
+        // WasapiOut（ファイル切替・検疫の直後）からの通知で、新しいファイルの再生中に
+        // 誤った失敗表示を出さないためのガード
+        if (!ReferenceEquals(sender, _wasapiOut)) return;
+        if (e.Exception == null) return;
+        _audioOutputFailed = true;
+        DiagnosticLog.WriteFatal("audio",
+            $"音声出力が異常停止した（以降 音声・再生位置ともに進まない）: {e.Exception}");
+        PlaybackFailed?.Invoke(this, "音声出力が停止しました。ファイルを開き直してください。");
+    }
 
     public IReadOnlyList<ChapterInfo> GetChapters() => _chapters;
 
@@ -882,7 +952,8 @@ public unsafe class MediaEngine : IMediaEngine
 
         _audioDecodeThread = new AudioDecodeThread(
             _audioDecoders, _audioStates, _audioQueue, () => _demuxThread!.PtsSyncOffset,
-            onFirstSamplesAfterFlush: target => OnAudioPrerollReady(pipelineGeneration, target));
+            onFirstSamplesAfterFlush: target => OnAudioPrerollReady(pipelineGeneration, target),
+            onTrackAbandoned: trackIndex => OnAudioTrackAbandoned(pipelineGeneration, trackIndex));
 
         if (_mixer != null)
         {
@@ -1387,6 +1458,9 @@ public unsafe class MediaEngine : IMediaEngine
 
     private void DisposeDecoders()
     {
+        // 検疫経路では WasapiOut を解放せず参照だけ手放すため、解除しないと検疫済みの出力が
+        // 停止イベントを発火し、新しいファイルの再生中に誤った失敗通知が出る
+        if (_wasapiOut != null) _wasapiOut.PlaybackStopped -= OnWasapiPlaybackStopped;
         if (_threadsAbandoned)
         {
             // 止まりきらなかったスレッド（デコード系・vout・状態タイマーのコールバック）が、この

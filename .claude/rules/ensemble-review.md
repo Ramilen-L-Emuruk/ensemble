@@ -57,7 +57,16 @@
 
 ## 5. テスト可能性の設計
 
-テスト対象は純ロジックのみ（`BoundedSerialQueue` / `PlaybackClock` / `PrerollCalculator` / `FrameSelector` / `SlotSequencer`）。unsafe / FFmpeg 依存のパイプライン本体はテストしていない。
+テスト対象は **FFmpeg・D3D11 に依存しないロジック**（ここが対象クラス一覧の単一の情報源。`CLAUDE.md` からも参照している）。NAudio やファイル I/O への依存は許容している（`MultiTrackMixer` は NAudio、`DiagnosticLog` は実ファイルに依存する）。デコード・描画パイプライン本体はテストしていない。
 
-- [ ] 同期ロジック・状態機械を新規に追加する場合は、**FFmpeg 依存から切り離した純ロジックとして実装し、テストを書く**こと。`SlotSequencer`（状態機械）と `GpuVideoFrameRing`（ペイロード管理）の分離がその手本
+| 領域 | 対象クラス |
+|---|---|
+| `Pipeline/` | `BoundedSerialQueue` |
+| `Sync/` | `PlaybackClock` |
+| `Audio/` | `PrerollCalculator` / `MultiTrackMixer` / `ResampleFailureTracker` |
+| `Video/` | `FrameSelector` / `SlotSequencer` / `VideoFrameRing` |
+| `Diagnostics/` | `DiagnosticLog` |
+| `Thumbnails/` | `ThumbnailPlan` |
+
+- [ ] 同期ロジック・状態機械を新規に追加する場合は、**FFmpeg・D3D11 依存から切り離してテスト可能な形で実装し、テストを書く**こと。`SlotSequencer`（状態機械）と `GpuVideoFrameRing`（ペイロード管理）の分離がその手本
 - [ ] 上記 1 の待ち合わせ不具合は、純ロジックとして切り出してあればテストで捕捉できる種類のもの

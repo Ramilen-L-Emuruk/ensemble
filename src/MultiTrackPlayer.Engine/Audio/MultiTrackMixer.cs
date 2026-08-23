@@ -9,7 +9,10 @@ public class MultiTrackMixer : IWaveProvider
     private readonly List<AudioTrackState> _tracks = new();
     private readonly WaveFormat _format;
     private readonly int _blockAlign;
-    private float _masterVolume = 1.0f;
+    /// <summary>マスター音量の既定値。MediaEngine 側の保持フィールドもこの値を初期値に使う。</summary>
+    public const float DefaultMasterVolume = 1.0f;
+
+    private float _masterVolume = DefaultMasterVolume;
     private byte[] _scratch = Array.Empty<byte>();
 
     public WaveFormat WaveFormat => _format;
@@ -60,12 +63,18 @@ public class MultiTrackMixer : IWaveProvider
         long audioFrames = holding ? 0 : common / _blockAlign;
         long silenceFrames = holding ? count / _blockAlign : (count - common) / _blockAlign;
 
-        // 全トラックが EOF に達した後の無音は、アンダーラン/priming待ちの無音とは違い
-        // 二度と実データが来ない。ここで OnSilenceWritten のままクロックを凍結させ続けると、
-        // 音声より僅かに長い映像側の末尾フレームが永遠に「期限到来」と判定されず、
-        // 再生完了検出（IsEofDrained）が働かなくなる（次の動画へ進めないバグの原因）。
-        // 実時間で進め続けるべき区間なので OnAudioWritten 側に計上する
-        if (!holding && silenceFrames > 0 && _tracks.Count > 0 && _tracks.All(t => t.IsEof))
+        // 二度と実データが来ない無音は、アンダーラン/priming待ちの無音とは違う。ここで
+        // OnSilenceWritten のままクロックを凍結させ続けると、音声より僅かに長い映像側の
+        // 末尾フレームが永遠に「期限到来」と判定されず、再生完了検出（IsEofDrained）が
+        // 働かなくなる（次の動画へ進めないバグの原因）。実時間で進め続けるべき区間なので
+        // OnAudioWritten 側に計上する。
+        //
+        // 該当するのは次の 2 つ。All は空集合に対して true を返すため、同じ条件式で両方を捕まえられる:
+        // ・全トラックが EOF に達した後の末尾無音
+        // ・音声トラックを 1 本も持たない動画（無音動画）。こちらは OnAudioWritten が一度も
+        //   発火しないとクロックが 0.0 に固定され、2 枚目以降の映像フレームが永久に
+        //   「期限到来」と判定されないため、最初のフレームで再生が固まる（GPU/CPU 両経路）
+        if (!holding && silenceFrames > 0 && _tracks.All(t => t.IsEof))
         {
             audioFrames += silenceFrames;
             silenceFrames = 0;
