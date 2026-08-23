@@ -191,7 +191,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 .ToList()
             : new List<string>();
 
-        Playlist.Files.Clear();
+        Playlist.Clear();
         Playlist.AddFiles(siblings.Count > 0 ? siblings : new[] { path });
         // 列挙結果に開くファイル自身が含まれないことがある（パス表記の違い等）。
         // 含まれないままだとプレイリスト内の位置が確定せず、自動送りの基準が狂う
@@ -203,20 +203,25 @@ public partial class MainViewModel : ObservableObject, IDisposable
     /// 同じフォルダの他ファイルは自動追加せず、渡された1件だけのプレイリストにする。</summary>
     public void OpenSingleFile(string path)
     {
-        Playlist.Files.Clear();
+        Playlist.Clear();
         Playlist.AddFiles(new[] { path });
         OpenFile(path);
     }
 
     /// <summary>
     /// ファイルを開いて再生を開始する。破損ファイル・非対応形式・フォルダの誤指定などで
-    /// 開けなかった場合は、現在の再生状態を保ったままユーザーへ通知して false を返す。
+    /// 開けなかった場合は、開きかけの状態を閉じて表示を「何も開いていない」状態へ戻し
+    /// （<see cref="ResetMediaState"/>）、ユーザーへ通知して false を返す。
     /// </summary>
     /// <returns>開けた場合 true。</returns>
     public bool OpenFile(string path)
     {
         if (_isDisposed) return false;
         DiagnosticLog.Write("open", $"OpenFile path={System.IO.Path.GetFileName(path)}");
+        // 現在地は開く前に移す。開けなかった場合もここに残ることで、「次へ」を押し直したときに
+        // 同じファイルを再試行し続けない。ファイルを開く経路はすべてここを通るため、
+        // 経路ごとに現在地を動かすことを覚えておく必要がない
+        Playlist.SetCursor(path);
         try
         {
             OpenFileCore(path);
@@ -311,7 +316,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
         CurrentMedia = info;
         Duration = info.Duration;
         Title = System.IO.Path.GetFileName(path) + " - MultiTrackPlayer";
-        Playlist.SetCurrentByPath(path);
 
         ThumbnailSheet = null;
         Thumbnails.RequestForFile(path, info.Duration, info.Width, info.Height);
@@ -471,19 +475,19 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     public void PlayNext()
     {
-        var next = Playlist.MoveNext();
+        var next = Playlist.PeekNext();
         if (next != null) OpenFile(next);
     }
 
     public void PlayPrevious()
     {
-        var prev = Playlist.MovePrevious();
+        var prev = Playlist.PeekPrevious();
         if (prev != null) OpenFile(prev);
     }
 
     // PlaybackEnded はスレッドプールのタイマーから発火する。PlaybackState は DebugWindow が
     // バインドしており、UI スレッド以外から更新するとバインディングが例外を投げてプロセスごと落ちる。
-    // 次ファイルの決定（CurrentIndex の更新を伴う）も UI 操作と同じスレッドで行いたいので、
+    // 次ファイルの決定も UI 操作と同じスレッドで行いたいので、
     // 分岐ごとではなくメソッド全体を UI スレッドへ移す。
     // 積んだ継続はウィンドウが閉じた後に実行されることがあるため _isDisposed で弾く
     private void OnPlaybackEnded()
@@ -499,13 +503,17 @@ public partial class MainViewModel : ObservableObject, IDisposable
             // 自動送りは「意図せず同じ動画が繰り返される」等の問い合わせが出やすい箇所なので、
             // どの位置を基準に何を選んだかを追えるようにしておく
             DiagnosticLog.Write("playlist",
-                $"自動送り判定 currentIndex={Playlist.CurrentIndex} fileCount={Playlist.Files.Count} " +
-                $"currentFile={Playlist.CurrentFile ?? "(なし)"}");
-            // プレイリスト内の位置が未確定のまま次送りすると、MoveNext が先頭のファイル
-            // （＝いま再生し終えたファイル自身になりうる）を返し、延々と再生を繰り返す
-            if (Playlist.CurrentIndex < 0) return;
-            // 次が無い場合の停止状態はエンジンが通知するので、ここでは何もしない
-            var next = Playlist.MoveNext();
+                $"自動送り判定 cursorIndex={Playlist.CursorIndex} fileCount={Playlist.Files.Count} " +
+                $"cursorPath={Playlist.CursorPath ?? "(なし)"} hasOrigin={Playlist.HasAdvanceOrigin}");
+            // 起点が未確定のまま次送りすると、PeekNext が先頭のファイル
+            // （＝いま再生し終えたファイル自身になりうる）を返し、延々と再生を繰り返す。
+            // 現在地のファイルをプレイリストから削除した場合は、空いた位置が起点として
+            // 残るため、CursorIndex が -1 でも自動送りは続く
+            if (!Playlist.HasAdvanceOrigin) return;
+            // 次が無い場合（末尾）の停止状態はエンジンが通知するので、ここでは何もしない。
+            // 次はあるが開けなかった場合は OpenFile がユーザーへ通知し、現在地は
+            // 開けなかったファイルへ移る（「次へ」でその先に進める）
+            var next = Playlist.PeekNext();
             DiagnosticLog.Write("playlist", $"自動送り結果 next={next ?? "(なし＝停止)"}");
             if (next != null) OpenFile(next);
         });

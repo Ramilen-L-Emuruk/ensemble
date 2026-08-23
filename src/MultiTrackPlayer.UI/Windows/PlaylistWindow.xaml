@@ -9,9 +9,12 @@
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
+        <!-- 選択はプレイリスト上の現在地（Playlist.CursorPath）とは別の状態へバインドする。
+             SelectedIndex は既定で TwoWay のため現在地へ直結すると、行をクリックしただけで
+             次に再生するファイルが書き換わる -->
         <ListBox x:Name="FileList" Grid.Row="0"
                  ItemsSource="{Binding Playlist.Files}"
-                 SelectedIndex="{Binding Playlist.CurrentIndex}"
+                 SelectedIndex="{Binding Playlist.SelectedIndex}"
                  MouseDoubleClick="FileList_MouseDoubleClick">
             <ListBox.ItemTemplate>
                 <DataTemplate>

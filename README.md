@@ -34,7 +34,7 @@
 
 ```
 src/
-├── MultiTrackPlayer.Core/    モデル・インターフェース（依存なし）
+├── MultiTrackPlayer.Core/    モデル・インターフェース（依存なし。ViewModel から切り出した純ロジックを含む）
 ├── MultiTrackPlayer.Engine/  FFmpeg デコード・NAudio ミキサー・GPU 描画（unsafe コード有）
 │   ├── Decoding/             映像/音声デコーダ（VideoDecoder は D3D11VA 対応デコーダを優先選択）
 │   ├── Pipeline/             ffplay 型スレッド分離パイプライン（Demux/Decode スレッド + 有界キュー）と
