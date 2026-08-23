@@ -38,7 +38,7 @@
             </MenuItem>
             <MenuItem Header="再生(_P)">
                 <MenuItem Header="再生/一時停止" InputGestureText="Space / S" Click="MenuPlayPause_Click"/>
-                <MenuItem Header="停止" Click="MenuStop_Click"/>
+                <MenuItem Header="停止" InputGestureText="Ctrl+S" Click="MenuStop_Click"/>
                 <Separator/>
                 <MenuItem Header="コマ送り" InputGestureText="." Click="MenuStepFwd_Click"/>
                 <MenuItem Header="コマ戻し" InputGestureText="," Click="MenuStepBwd_Click"/>
@@ -81,6 +81,7 @@
                     <Button Content="⏮" Click="PrevFile_Click" Style="{StaticResource TransportBtn}"/>
                     <Button Content="⏪" Click="SkipBack_Click" Style="{StaticResource TransportBtn}"/>
                     <Button Content="⏸" Click="PlayPause_Click" Style="{StaticResource TransportBtn}" Width="44"/>
+                    <Button Content="⏹" Click="Stop_Click" Style="{StaticResource TransportBtn}"/>
                     <Button Content="⏩" Click="SkipFwd_Click" Style="{StaticResource TransportBtn}"/>
                     <Button Content="⏭" Click="NextFile_Click" Style="{StaticResource TransportBtn}"/>
                     <ComboBox x:Name="SpeedBox" Width="60" Margin="8,0,0,0" VerticalAlignment="Center"
