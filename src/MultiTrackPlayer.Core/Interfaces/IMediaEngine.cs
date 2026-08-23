@@ -67,6 +67,13 @@ public interface IMediaEngine : IDisposable
     /// 引数はそのままユーザーへ提示できる文面。
     /// </summary>
     event EventHandler<string>? PlaybackFailed;
+
+    /// <summary>
+    /// 映像フレームリングを新規に構築したとき。共有テクスチャのハンドルが総入れ替えになるため、
+    /// ハンドルをキーにキャッシュしている描画側はここで破棄・再取得すること。
+    /// ファイル切替だけでなく、同じファイルの停止→再生でもパイプラインごと作り直されるため発火する。
+    /// </summary>
+    event EventHandler? VideoRingRebuilt;
 }
 
 public record PlaybackStatistics(int DroppedFrames, int DisplayedFrames, double VideoLagSec);

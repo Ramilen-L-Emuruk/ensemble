@@ -54,6 +54,9 @@ public partial class MainWindow : Window
             {
                 _presenter = new D3DImagePresenter();
                 VideoImage.Source = _presenter.D3DImage;
+                // CPU 経路のデバイス喪失も GPU vout 経路と同じく OSD で伝える。
+                // ディスパッチと破棄後ガードは ViewModel 側（PlaybackFailed と同じ流儀）に任せる
+                _presenter.VideoFailed += _vm.ReportVideoFailure;
             }
             catch (Exception ex)
             {
@@ -61,6 +64,12 @@ public partial class MainWindow : Window
                 _presenter = null;
             }
         }
+
+        // 共有サーフェスのキャッシュはハンドルをキーに持つため、フレームリングが作り直されると
+        // 全エントリが無効になる。ファイル切替だけでなく同じファイルの停止→再生でも作り直されるので、
+        // CurrentMedia の変化ではなくリング再構築そのものを合図にする
+        //（EnsurePipelineStarted は UI スレッドから呼ばれるためディスパッチ不要）
+        _vm.Engine.VideoRingRebuilt += (_, _) => _presenter?.InvalidateSurfaces();
 
         // SpeedBox はプリセット項目の静的な ComboBox で PlaybackSpeed に双方向バインドしていないため、
         // キーボードショートカットやメニューからの速度変更を選択表示へ手動で反映する

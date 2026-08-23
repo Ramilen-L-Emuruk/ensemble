@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Interop;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.Engine.Rendering;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -61,6 +62,35 @@ public sealed class D3DImagePresenter : IDisposable
     private int _gpuWidth;
     private int _gpuHeight;
     private readonly Dictionary<IntPtr, (D9.IDirect3DTexture9 Texture, D9.IDirect3DSurface9 Surface)> _gpuSurfaces = new();
+    // ファイル切替で共有サーフェスのキャッシュを作り直す必要がある状態。実際の破棄・再生成は
+    // 次の GPU 提示時にまとめて行う（ここで即破棄すると、WPF がバックバッファを参照したまま
+    // 解放済みサーフェスを指す隙間ができる）
+    private bool _surfacesInvalidated;
+
+    // 映像を出せない状態がこの時間続いたら、既定でも残る記録とユーザー通知を行う（猶予は
+    // VideoOutputPolicy.FailureGraceMs を単一の情報源として GPU 経路と共有する）。
+    //
+    // 「復旧処理の失敗回数」では数えられないのが要点。エンジン側の共有 D3D11 デバイスが
+    // 失われても、このクラスの TryRecoverDevices は自分の D3D9Ex/D3D11 デバイスを作り直すだけなので
+    // ふつうに成功してしまう。実際の失敗は次フレームの GetOrOpenSharedSurface（失われたデバイスが
+    // 発行した共有ハンドルは開けない）で起き、そこは例外ではなく null を返す静かな失敗。
+    // そのため「映像を 1 枚も出せていない時間」を基準にする
+    //
+    // 映像を出せなくなった時刻（0 なら出せている）。Environment.TickCount64 基準
+    private long _videoUnavailableSinceTicks;
+    private bool _deviceLostReported;
+
+    // 共有サーフェスのキャッシュ件数の警戒値。エンジンのフレームリングは 4 スロットなので、
+    // 同時に生きている共有ハンドルは 4 枚。これを大きく超えるのは無効化の合図が届いていない証拠
+    private const int SuspiciousSurfaceCacheCount = 12;
+    private bool _surfaceCacheLeakReported;
+
+    /// <summary>
+    /// 復旧できないデバイス喪失を検出したとき（引数は表示用メッセージ）。GPU vout 経路の
+    /// <c>IMediaEngine.PlaybackFailed</c> と役割をそろえるためのイベント。
+    /// 一時的なロストは自己修復するので発火しない。
+    /// </summary>
+    public event EventHandler<string>? VideoFailed;
     // D3DImage のバックバッファに固定する 1 枚の RenderTarget（=StretchRect のコピー先）。SetBackBuffer は生成時に一度だけ呼ぶ。
     private D9.IDirect3DSurface9? _gpuBackBuffer;
 
@@ -206,11 +236,43 @@ public sealed class D3DImagePresenter : IDisposable
             (uint)width, (uint)height, 1, D9.Usage.RenderTarget, D9SharedFormat, D9.Pool.Default, ref openHandle);
         _d3d9Surface = _d3d9Texture.GetSurfaceLevel(0);
 
+        // Lock と Unlock は必ず対で通す。間で例外が飛んで Unlock を飛ばすと D3DImage の
+        // ロックカウントが戻らず、以後の描画が永久に止まる（自己修復しない）。
+        // 外側の catch は _deviceLost を立てるだけで Unlock しないため、ここで保証する
         D3DImage.Lock();
-        D3DImage.SetBackBuffer(D3DResourceType.IDirect3DSurface9, _d3d9Surface.NativePointer);
-        D3DImage.Unlock();
+        try
+        {
+            D3DImage.SetBackBuffer(D3DResourceType.IDirect3DSurface9, _d3d9Surface.NativePointer);
+        }
+        finally
+        {
+            D3DImage.Unlock();
+        }
 
         DiagnosticLog.Write("d3dPresenter", $"サーフェス生成 {width}x{height}");
+    }
+
+    /// <summary>
+    /// ファイル切替時に呼ぶ。共有サーフェスのキャッシュを次の提示で作り直させる。
+    ///
+    /// <para>
+    /// キャッシュは共有ハンドルをキーに持つ。ファイルを切り替えるとエンジン側がフレームリングを
+    /// 作り直して 4 枚のハンドルが全て変わるため、呼ばないと古いエントリが解放されないまま
+    /// <b>切替ごとに 4 枚ずつ無制限に積み上がる</b>。解像度が変わったときだけは
+    /// <see cref="PresentGpu"/> 側の判定でも作り直されるが、同じ解像度の動画を続けて開くと
+    /// その判定に掛からない。
+    /// </para>
+    /// </summary>
+    public void InvalidateSurfaces()
+    {
+        _surfacesInvalidated = true;
+        // 通知の抑制もここで解除する。このクラスは MainWindow と同じ寿命で生き続けるため、
+        // 抑制フラグを残したままにすると「一度通知したらアプリを再起動するまで二度と通知しない」
+        // ことになる。案内どおりファイルを開き直したユーザーが、二度目の失敗で何も知らされない
+        // のは本末転倒（GPU 経路の SwapChainVideoPresenter はパイプラインごとに作り直されるため
+        // 同種のフラグが自然にリセットされる。寿命の違いをここで埋める）。
+        // この時点では 1 枚も表示できていないので、表示成功を含意しない Reset 側を呼ぶ
+        ResetVideoFailureTracking();
     }
 
     /// <summary>1 フレームを表示する。<see cref="FrameKind"/> に応じて GPU ゼロコピー経路か CPU 経路へ振り分ける。呼び出し直後に <c>ReturnFrame</c> できるよう同期完結する。</summary>
@@ -244,16 +306,24 @@ public sealed class D3DImagePresenter : IDisposable
         {
             // 解像度が変わったら旧サーフェス群は無効（エンジン側もスロットのテクスチャを作り直す）。まとめて破棄し、
             // 固定バックバッファを作り直して SetBackBuffer し直す。
-            if (_gpuBackBuffer == null || _gpuWidth != lease.Width || _gpuHeight != lease.Height)
+            if (_surfacesInvalidated || _gpuBackBuffer == null
+                || _gpuWidth != lease.Width || _gpuHeight != lease.Height)
             {
                 ReleaseGpuSurfaces();
                 CreateGpuBackBuffer(lease.Width, lease.Height);
                 _gpuWidth = lease.Width;
                 _gpuHeight = lease.Height;
+                _surfacesInvalidated = false;
             }
 
             D9.IDirect3DSurface9? source = GetOrOpenSharedSurface(lease.SharedSurfaceHandle, lease.Width, lease.Height);
-            if (source == null) return; // オープン失敗（ログ済み）。次フレームで再試行。
+            if (source == null)
+            {
+                // 例外ではなく null が返る静かな失敗。ここを単なる早期 return にしていると、
+                // エンジン側デバイスが失われたまま毎フレーム黙って抜け続け、通知に到達しない
+                NoteVideoUnavailable("共有サーフェスを開けない");
+                return;
+            }
 
             // 当該スロットの共有サーフェス → 固定バックバッファへ GPU 内コピー（CPU 不介入）。同解像度なので拡縮なし。
             // 全面矩形（LTRB=0,0,w,h）を渡す。同サイズのため XYWH 解釈でも同値。
@@ -262,13 +332,21 @@ public sealed class D3DImagePresenter : IDisposable
 
             // バックバッファは固定のまま。dirty 通知だけで WPF に再描画を促す（SetBackBuffer 切替はしない）。
             D3DImage.Lock();
-            D3DImage.AddDirtyRect(new Int32Rect(0, 0, lease.Width, lease.Height));
-            D3DImage.Unlock();
+            try
+            {
+                D3DImage.AddDirtyRect(new Int32Rect(0, 0, lease.Width, lease.Height));
+            }
+            finally
+            {
+                D3DImage.Unlock();
+            }
+            NoteVideoAvailable();
         }
         catch (Exception ex)
         {
             _deviceLost = true;
             DiagnosticLog.Write("d3dPresenter", $"GPU 提示失敗（デバイスロストとして扱う）: {ex.Message}");
+            NoteVideoUnavailable($"GPU 提示失敗: {ex.Message}");
         }
     }
 
@@ -279,8 +357,14 @@ public sealed class D3DImagePresenter : IDisposable
             (uint)width, (uint)height, D9SharedFormat, D9.MultisampleType.None, 0, lockable: false);
 
         D3DImage.Lock();
-        D3DImage.SetBackBuffer(D3DResourceType.IDirect3DSurface9, _gpuBackBuffer.NativePointer);
-        D3DImage.Unlock();
+        try
+        {
+            D3DImage.SetBackBuffer(D3DResourceType.IDirect3DSurface9, _gpuBackBuffer.NativePointer);
+        }
+        finally
+        {
+            D3DImage.Unlock();
+        }
         DiagnosticLog.Write("d3dPresenter", $"GPU バックバッファ生成 {width}x{height}");
     }
 
@@ -298,6 +382,15 @@ public sealed class D3DImagePresenter : IDisposable
                 (uint)width, (uint)height, 1, D9.Usage.RenderTarget, D9SharedFormat, D9.Pool.Default, ref openHandle);
             D9.IDirect3DSurface9 surface = texture.GetSurfaceLevel(0);
             _gpuSurfaces[sharedHandle] = (texture, surface);
+            // 無効化の合図（InvalidateSurfaces）が届いていれば件数はリングのスロット数（4）程度に収まる。
+            // 大きく超えるのは合図の経路が壊れている証拠なので、静かにリークさせず記録する
+            if (_gpuSurfaces.Count >= SuspiciousSurfaceCacheCount && !_surfaceCacheLeakReported)
+            {
+                _surfaceCacheLeakReported = true;
+                DiagnosticLog.WriteFatal("d3dPresenter",
+                    $"共有サーフェスのキャッシュが {_gpuSurfaces.Count} 件まで増えた" +
+                    "（InvalidateSurfaces が呼ばれていない疑い。以降は記録しない）");
+            }
             DiagnosticLog.Write("d3dPresenter", $"共有サーフェスを開いた {width}x{height} cache={_gpuSurfaces.Count}");
             return surface;
         }
@@ -358,14 +451,22 @@ public sealed class D3DImagePresenter : IDisposable
 
             // ⑥ 全面を dirty にして WPF に再描画を促す。
             D3DImage.Lock();
-            D3DImage.AddDirtyRect(new Int32Rect(0, 0, _width, _height));
-            D3DImage.Unlock();
+            try
+            {
+                D3DImage.AddDirtyRect(new Int32Rect(0, 0, _width, _height));
+            }
+            finally
+            {
+                D3DImage.Unlock();
+            }
+            NoteVideoAvailable();
         }
         catch (Exception ex)
         {
             // デバイスロスト系（GPU リセット・ドライバ更新等）は次フレームでの復旧に委ねる。
             _deviceLost = true;
             DiagnosticLog.Write("d3dPresenter", $"Present 失敗（デバイスロストとして扱う）: {ex.Message}");
+            NoteVideoUnavailable($"CPU 提示失敗: {ex.Message}");
         }
     }
 
@@ -386,7 +487,53 @@ public sealed class D3DImagePresenter : IDisposable
         {
             _deviceLost = true;
             DiagnosticLog.Write("d3dPresenter", $"デバイス復旧失敗: {ex.Message}");
+            NoteVideoUnavailable($"デバイス復旧失敗: {ex.Message}");
         }
+    }
+
+    /// <summary>1 枚表示できたことを記録する。</summary>
+    private void NoteVideoAvailable() => ResetVideoFailureTracking();
+
+    /// <summary>
+    /// 映像喪失の計測と通知の抑制を初期状態へ戻す。「実際に表示できた」場合（<see cref="NoteVideoAvailable"/>）と
+    /// 「まだ表示していないが計測をやり直す」場合（<see cref="InvalidateSurfaces"/>）の両方から呼ぶため、
+    /// 表示の成否を含意しない名前で分けている。
+    /// </summary>
+    private void ResetVideoFailureTracking()
+    {
+        _videoUnavailableSinceTicks = 0;
+        _deviceLostReported = false;
+    }
+
+    /// <summary>
+    /// 映像を出せなかったことを記録し、その状態が <see cref="VideoOutputPolicy.FailureGraceMs"/> を
+    /// 超えて続いたときだけ、既定でも残る記録とユーザー通知を行う。
+    ///
+    /// <para>
+    /// 一時的なデバイスロスト（GPU リセット直後等）は次フレームで自己修復するため、都度通知すると
+    /// かえって邪魔になる。一方で直らないまま続く場合、<c>DiagnosticLog.Write</c> は既定 no-op なので
+    /// <b>何も残らず「映像が出ない」だけ</b>になる。GPU vout 経路（<c>MediaEngine.VideoOutputLoop</c> の
+    /// 末尾の通知処理）は同じ状況を必ず伝えるので、こちらも揃える。
+    /// </para>
+    /// <para>
+    /// <b>一時停止中は呼ばれない。</b>この経路は <c>MainWindow</c> の
+    /// <c>CompositionTarget.Rendering</c> から新しいフレームが来たときだけ駆動される pull 型なので、
+    /// 一時停止中に喪失が起きても検出は再生再開後の最初のフレームまで遅れる（GPU vout 経路は
+    /// 状態を問わず毎 vsync 回るため、そこは非対称）。永久に無言になるわけではないため、
+    /// 一時停止中のポーリングは設けていない。
+    /// </para>
+    /// </summary>
+    private void NoteVideoUnavailable(string reason)
+    {
+        long now = Environment.TickCount64;
+        if (_videoUnavailableSinceTicks == 0) _videoUnavailableSinceTicks = now;
+        long elapsedMs = now - _videoUnavailableSinceTicks;
+        if (elapsedMs < VideoOutputPolicy.FailureGraceMs || _deviceLostReported) return;
+
+        _deviceLostReported = true;
+        DiagnosticLog.WriteFatal("d3dPresenter",
+            $"映像を {elapsedMs}ms 表示できていない（復旧の見込みなしと判断）: {reason}");
+        VideoFailed?.Invoke(this, "映像を表示できません（ファイルを開き直してください）");
     }
 
     private void ReleaseSurfaces()
@@ -419,8 +566,14 @@ public sealed class D3DImagePresenter : IDisposable
         try
         {
             D3DImage.Lock();
-            D3DImage.SetBackBuffer(D3DResourceType.IDirect3DSurface9, IntPtr.Zero);
-            D3DImage.Unlock();
+            try
+            {
+                D3DImage.SetBackBuffer(D3DResourceType.IDirect3DSurface9, IntPtr.Zero);
+            }
+            finally
+            {
+                D3DImage.Unlock();
+            }
         }
         catch (Exception ex)
         {

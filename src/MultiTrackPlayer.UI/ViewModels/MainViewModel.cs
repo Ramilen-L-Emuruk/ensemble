@@ -159,6 +159,17 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private void ToggleMute() => IsMasterMuted = !IsMasterMuted;
 
+    /// <summary>
+    /// 描画側から報告された映像の不具合を OSD へ出す。<c>Engine.PlaybackFailed</c> の購読と同じく、
+    /// ウィンドウを閉じた後に積み残された継続で破棄済みの OSD タイマーを再始動させないよう守る。
+    /// </summary>
+    public void ReportVideoFailure(object? sender, string message) =>
+        Application.Current.Dispatcher.BeginInvoke(() =>
+        {
+            if (_isDisposed) return;
+            ShowOsd(message);
+        });
+
     /// <summary>操作内容を一瞬だけ画面に表示する（何をしたか分かりにくいという声を受けて追加）。</summary>
     public void ShowOsd(string text)
     {
