@@ -86,7 +86,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
             StatusText = $"表示 {stats.DisplayedFrames} / ドロップ {stats.DroppedFrames} ({dropRate:F1}%)  映像遅延 {stats.VideoLagSec * 1000:F0}ms";
         };
 
-        IsDebugMode = Settings.DebugMode;
+        // 読み込んだ値はプロパティ経由で入れない。OnIsDebugModeChanged が走って、いま読んだ値を
+        // そのまま書き戻すことになる（無駄な書き込みであり、書き込みが失敗する環境では
+        // ウィンドウが出る前に保存失敗の案内を出して、誰にも見られないまま消える）。
+        // バインドはまだ張られていないので、ここは変更通知を出さなくてよい
+        _isDebugMode = Settings.DebugMode;
+        if (_isDebugMode) DiagnosticLog.Enable(LogDirectory);
     }
 
     partial void OnIsDebugModeChanged(bool value)
@@ -94,19 +99,37 @@ public partial class MainViewModel : ObservableObject, IDisposable
         if (value) DiagnosticLog.Enable(LogDirectory);
         else DiagnosticLog.Disable();
         Settings.DebugMode = value;
-        Settings.Save();
+        // 保存できなくても切り替え自体は効いている（次回起動時に元へ戻るだけ）ので、
+        // 操作を巻き戻さずに知らせるだけにする
+        if (!Settings.Save()) ShowOsd("設定を保存できませんでした");
     }
 
     /// <summary>現在の各トラックのミュート状態を、このファイルが置かれたフォルダの既定値として保存する。</summary>
     public void SaveCurrentMutesAsDefault()
     {
-        if (CurrentMedia == null) return;
+        // メニューはファイル未読み込みでも選べる。黙って何もしないと故障と区別できない
+        if (CurrentMedia == null)
+        {
+            ShowOsd("ファイルを開いてから実行してください");
+            return;
+        }
 
         string directory = System.IO.Path.GetDirectoryName(CurrentMedia.FilePath) ?? string.Empty;
         var mutedTracks = AudioTracks.Where(t => t.IsMuted).Select(t => t.TrackNumber).ToList();
+        bool hadPrevious = Settings.DefaultMutedTracksByDirectory.TryGetValue(directory, out var previous);
         Settings.DefaultMutedTracksByDirectory[directory] = mutedTracks;
-        Settings.Save();
+        // 成否を見ずに「保存した」と記録すると、失敗したときログが嘘をつく
+        if (!Settings.Save())
+        {
+            // 「保存できませんでした」と伝えるなら、メモリ上も元へ戻す。反映したままだと
+            // 同じフォルダの別ファイルを開いたときに、保存できなかった値が効いてしまう
+            if (hadPrevious) Settings.DefaultMutedTracksByDirectory[directory] = previous!;
+            else Settings.DefaultMutedTracksByDirectory.Remove(directory);
+            ShowOsd("既定ミュートを保存できませんでした");
+            return;
+        }
         DiagnosticLog.Write("ui", $"既定ミュート保存 dir={directory} tracks=[{string.Join(",", mutedTracks)}]");
+        ShowOsd("既定ミュートを保存しました");
     }
 
     private void OnAudioTrackMuteOrSoloChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)

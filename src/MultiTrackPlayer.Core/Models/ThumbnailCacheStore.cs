@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -26,8 +26,12 @@ public static class ThumbnailCacheStore
 
     public static void EnsureStorageDir() => Directory.CreateDirectory(StorageDir);
 
-    public static ThumbnailSheet? Load(string filePath)
+    /// <summary>キャッシュを読み込む。読めなければ null を返す（呼び出し側が作り直す）。</summary>
+    /// <param name="error">読み込みに失敗した理由。キャッシュが無い場合は null（異常ではない）。
+    /// このプロジェクトの Core は診断ログへ依存しないため、記録は呼び出し側に委ねる。</param>
+    public static ThumbnailSheet? Load(string filePath, out string? error)
     {
+        error = null;
         var (jpgPath, jsonPath) = GetCachePaths(filePath);
         if (!File.Exists(jpgPath) || !File.Exists(jsonPath)) return null;
 
@@ -35,14 +39,21 @@ public static class ThumbnailCacheStore
         {
             var json = File.ReadAllText(jsonPath, Encoding.UTF8);
             var entry = JsonSerializer.Deserialize<ThumbnailSheetEntry>(json);
-            if (entry == null) return null;
+            if (entry == null)
+            {
+                // 中身が JSON の null だと例外は飛ばない。理由を返さないと
+                // キャッシュ未生成と区別できず、記録が残らない
+                error = "キャッシュインデックスの中身が空";
+                return null;
+            }
 
             Touch(jpgPath, jsonPath);
             return new ThumbnailSheet(jpgPath, entry.Columns, entry.Rows, entry.TileWidth,
                 entry.TileHeight, entry.Count, entry.SampleIntervalSeconds, entry.SourceDurationSeconds);
         }
-        catch
+        catch (Exception ex)
         {
+            error = ex.Message;
             return null;
         }
     }
