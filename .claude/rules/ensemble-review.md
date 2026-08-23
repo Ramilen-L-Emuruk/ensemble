@@ -109,7 +109,7 @@
 
 同じ事実を生産側と消費側で別の言葉で書くと、範囲がずれて事故になる。
 
-**実際に起きたこと**: `MediaEngine._heldLease`（再生中以外に表示を保持するフレーム）を読むのは
+**実際に起きたこと**（`ac81733`）: `MediaEngine._heldLease`（再生中以外に表示を保持するフレーム）を読むのは
 `VideoOutputLoop` の **`Playing` 以外**の分岐と `TryGetFrame` の **`Playing` 以外**の分岐。ところが
 `Seek` 側でこれを手放す・掴み直す条件を「**一時停止中**」と書いたため、EOF 到達で `Stopped` へ落ちた
 状態（`CheckPlaybackEnded` はパイプラインを畳まずに状態だけ落とす）で「手放すが掴まない」経路が
