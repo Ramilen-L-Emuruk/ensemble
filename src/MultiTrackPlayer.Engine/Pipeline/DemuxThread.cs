@@ -22,7 +22,11 @@ public sealed unsafe class DemuxThread
     private double _ptsSyncOffset = double.NaN;
 
     private readonly object _seekLock = new();
-    private bool _hasPendingSeek;
+    // シーク要求は「受け付けた通番」と「処理し終えた通番」の差で表す。
+    // bool 1 つだと、要求を取り出してから実際にシークし終えるまでの間だけ
+    // 「保留なし・EOF のまま」という状態が見え、その隙に Play() が終端と誤判定する
+    private long _seekRequestSeq;
+    private long _seekHandledSeq;
     private double _pendingSeekTarget;
 
     public bool EofReached => _eofReached;
@@ -43,7 +47,7 @@ public sealed unsafe class DemuxThread
     /// <summary>UI/呼び出しスレッドから即座に返る。保留中のシークがあれば最新の目標で上書きする。</summary>
     public void RequestSeek(double targetSeconds)
     {
-        lock (_seekLock) { _pendingSeekTarget = targetSeconds; _hasPendingSeek = true; }
+        lock (_seekLock) { _pendingSeekTarget = targetSeconds; _seekRequestSeq++; }
         // demux スレッドが満杯キューの Put でブロック中だとシーク要求を永遠にチェックできない
         //（映像リング満杯→映像キュー満杯→demux ブロック→全パイプライン凍結、の実機で観測された連鎖）。
         // Put 待ちを中断させてループ先頭へ帰還させる
@@ -63,9 +67,12 @@ public sealed unsafe class DemuxThread
         using var pkt = new DemuxPacketHolder();
         while (!_stopRequested)
         {
-            if (TryTakePendingSeek(out double target))
+            if (TryTakePendingSeek(out double target, out long seekSeq))
             {
                 PerformSeek(target);
+                // 完了を記録するのはシークし終えた後。先に記録すると、その隙間で
+                // 「保留なし・EOF のまま」と見えて Play() が終端と誤判定する
+                MarkSeekHandled(seekSeq);
                 continue;
             }
 
@@ -101,22 +108,43 @@ public sealed unsafe class DemuxThread
         }
     }
 
-    private bool TryTakePendingSeek(out double target)
+    /// <summary>
+    /// シーク要求を抱えている、または処理の途中であるか。
+    /// RequestSeek は要求を積んで起こすだけで、EofReached が false に戻るのは
+    /// このスレッドが実際に PerformSeek を終えた後。その間に EofReached だけを見ると
+    /// 「まだ終端にいる」と誤って判断してしまうため、判定側はこれも併せて見ること。
+    /// 処理し終えるまで true を返し続けるので、取り出しから完了までの隙間も塞がる。
+    /// </summary>
+    public bool HasPendingSeek { get { lock (_seekLock) return _seekHandledSeq != _seekRequestSeq; } }
+
+    private bool TryTakePendingSeek(out double target, out long seq)
     {
         lock (_seekLock)
         {
-            if (!_hasPendingSeek) { target = 0; return false; }
+            if (_seekHandledSeq == _seekRequestSeq) { target = 0; seq = 0; return false; }
             target = _pendingSeekTarget;
-            _hasPendingSeek = false;
-            return true;
+            seq = _seekRequestSeq;
+            return true; // ここでは完了扱いにしない（PerformSeek 完了時に MarkSeekHandled で進める）
         }
+    }
+
+    /// <summary>処理し終えたシーク要求の通番を進める。処理中に来た新しい要求は保留のまま残る。</summary>
+    private void MarkSeekHandled(long seq)
+    {
+        lock (_seekLock) { if (_seekHandledSeq < seq) _seekHandledSeq = seq; }
     }
 
     private void PerformSeek(double targetSeconds)
     {
         double offset = double.IsNaN(PtsSyncOffset) ? 0.0 : PtsSyncOffset;
         long ts = (long)((targetSeconds + offset) * AV_TIME_BASE);
-        avformat_seek_file(_fmtCtx, -1, long.MinValue, ts, ts, (int)AVSEEK_FLAG.Backward);
+        int ret = avformat_seek_file(_fmtCtx, -1, long.MinValue, ts, ts, (int)AVSEEK_FLAG.Backward);
+        if (ret < 0)
+        {
+            // 読み取り位置が変わらないまま以降の処理を続ける。目標より後ろを読んでいれば
+            // いずれ到達して復帰し、到達しない場合も EOF 時にプリロールが解除される
+            Diagnostics.DiagnosticLog.Write("demux", $"シークに失敗（現在位置のまま続行） target={targetSeconds:F3} ret={ret}");
+        }
 
         // 各デコードスレッドの Flush 処理より前にプリロール目標を publish しておく必要がある
         // （Flush 番兵を受け取った時点で target が既に確定しているように、ロック経由の happens-before を利用する）

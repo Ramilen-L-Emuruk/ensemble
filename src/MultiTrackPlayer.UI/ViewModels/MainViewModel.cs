@@ -58,6 +58,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 PositionRatio = pos.TotalSeconds / Duration.TotalSeconds;
             UpdateCurrentChapterHighlight(pos);
         };
+        // 再生状態はエンジンが唯一の情報源。ここで受けて表示用プロパティへ反映するだけにし、
+        // ViewModel 側から直接書き換えないことで「表示は再生中なのに実際は止まっている」類の
+        // 食い違いを構造的になくす。状態タイマー（スレッドプール）からも発火するため UI スレッドへ移す
+        // 通知の引数ではなく、継続が走る時点の実状態を読み直す。SetState は状態の書き込みを
+        // ロック内、通知をロック外で行うため、2 スレッドがほぼ同時に遷移させると
+        // 「書き込み順」と「通知順」がずれうる。実値を読めば最終的に必ず正しい値へ収束する
+        Engine.StateChanged += (_, _) =>
+            Application.Current.Dispatcher.BeginInvoke(() => PlaybackState = Engine.State);
         Engine.PlaybackEnded += (_, _) => OnPlaybackEnded();
         Thumbnails.ThumbnailsReady += (_, sheet) =>
             Application.Current.Dispatcher.Invoke(() => ThumbnailSheet = sheet);
@@ -113,11 +121,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     [ObservableProperty] private double _positionRatio;
 
-    partial void OnPositionRatioChanged(double value)
-    {
-        if (Duration > TimeSpan.Zero && Math.Abs(value * Duration.TotalSeconds - Position.TotalSeconds) > 1)
-            SeekTo(TimeSpan.FromSeconds(value * Duration.TotalSeconds));
-    }
+    // PositionRatio は再生位置の表示専用。ここからシークを起こすと、シークバー操作 1 回につき
+    // 「バインド経由」と「Seeking イベント経由」で 2 回シークが走る（過去に UI が固まる原因になった）。
+    // シーク要求は SeekBarControl.Seeking → SeekTo(TimeSpan) の経路に一本化している
 
     partial void OnMasterVolumeChanged(double value)
     {
@@ -166,6 +172,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         Playlist.Files.Clear();
         Playlist.AddFiles(siblings.Count > 0 ? siblings : new[] { path });
+        // 列挙結果に開くファイル自身が含まれないことがある（パス表記の違い等）。
+        // 含まれないままだとプレイリスト内の位置が確定せず、自動送りの基準が狂う
+        if (!Playlist.Files.Contains(path)) Playlist.AddFiles(new[] { path });
         OpenFile(path);
     }
 
@@ -186,6 +195,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     public bool OpenFile(string path)
     {
         if (_isDisposed) return false;
+        DiagnosticLog.Write("open", $"OpenFile path={System.IO.Path.GetFileName(path)}");
         try
         {
             OpenFileCore(path);
@@ -222,8 +232,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         ThumbnailSheet = null;
         AudioTracks.Clear();
         Chapters.Clear();
-        PlaybackState = PlaybackState.Stopped;
-        // Duration を先に 0 にしてあるので、OnPositionRatioChanged のガードにより Seek は発火しない。
+        // PositionRatio は表示専用（値の変更からシークは起こらない）。
         // ここを省くとシークバーのつまみだけ前のファイルの位置に残る
         PositionRatio = 0.0;
     }
@@ -304,7 +313,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         RefreshChapters();
         Engine.Play();
-        PlaybackState = PlaybackState.Playing;
         ShowOsd(System.IO.Path.GetFileName(path));
     }
 
@@ -347,21 +355,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private void PlayPause()
     {
-        if (PlaybackState == PlaybackState.Playing)
+        // 分岐はエンジンの実状態で判断する（表示用プロパティは通知経由で遅れて追従するため）
+        if (Engine.State == PlaybackState.Playing)
         {
             if (!InvokeEngine("一時停止", Engine.Pause)) return;
-            PlaybackState = PlaybackState.Paused;
             ShowOsd("一時停止");
         }
         else
         {
             // Play() はパイプライン構築に失敗すると（自身を巻き戻したうえで）例外を送出する
-            if (!InvokeEngine("再生", Engine.Play))
-            {
-                PlaybackState = PlaybackState.Stopped;
-                return;
-            }
-            PlaybackState = PlaybackState.Playing;
+            if (!InvokeEngine("再生", Engine.Play)) return;
             ShowOsd("再生");
         }
     }
@@ -370,7 +373,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
     private void Stop()
     {
         if (!InvokeEngine("停止", Engine.Stop)) return;
-        PlaybackState = PlaybackState.Stopped;
         Position = TimeSpan.Zero;
         ShowOsd("停止");
     }
@@ -378,7 +380,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private void StepForward()
     {
-        if (PlaybackState != PlaybackState.Paused) return;
+        if (Engine.State != PlaybackState.Paused) return;
         if (!InvokeEngine("コマ送り", Engine.StepForward)) return;
         ShowOsd("コマ送り");
     }
@@ -386,7 +388,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private void StepBackward()
     {
-        if (PlaybackState != PlaybackState.Paused) return;
+        if (Engine.State != PlaybackState.Paused) return;
         if (!InvokeEngine("コマ戻し", Engine.StepBackward)) return;
         ShowOsd("コマ戻し");
     }
@@ -454,9 +456,18 @@ public partial class MainViewModel : ObservableObject, IDisposable
         System.Windows.Application.Current.Dispatcher.BeginInvoke(() =>
         {
             if (_isDisposed || generation != _sessionGeneration) return;
+            // 自動送りは「意図せず同じ動画が繰り返される」等の問い合わせが出やすい箇所なので、
+            // どの位置を基準に何を選んだかを追えるようにしておく
+            DiagnosticLog.Write("playlist",
+                $"自動送り判定 currentIndex={Playlist.CurrentIndex} fileCount={Playlist.Files.Count} " +
+                $"currentFile={Playlist.CurrentFile ?? "(なし)"}");
+            // プレイリスト内の位置が未確定のまま次送りすると、MoveNext が先頭のファイル
+            // （＝いま再生し終えたファイル自身になりうる）を返し、延々と再生を繰り返す
+            if (Playlist.CurrentIndex < 0) return;
+            // 次が無い場合の停止状態はエンジンが通知するので、ここでは何もしない
             var next = Playlist.MoveNext();
+            DiagnosticLog.Write("playlist", $"自動送り結果 next={next ?? "(なし＝停止)"}");
             if (next != null) OpenFile(next);
-            else PlaybackState = PlaybackState.Stopped;
         });
     }
 

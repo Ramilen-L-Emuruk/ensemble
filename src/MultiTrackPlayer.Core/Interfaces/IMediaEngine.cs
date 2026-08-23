@@ -6,7 +6,16 @@ namespace MultiTrackPlayer.Core.Interfaces;
 public interface IMediaEngine : IDisposable
 {
     MediaInfo? CurrentMedia { get; }
+
+    /// <summary>現在の再生状態。表示側はこの値を唯一の情報源とし、独自に状態を持たないこと。</summary>
     PlaybackState State { get; }
+
+    /// <summary>
+    /// 再生状態が変化したときに発火する。UI スレッド以外からも発火するため、
+    /// 購読側でディスパッチャへ移すこと。
+    /// </summary>
+    event EventHandler<PlaybackState> StateChanged;
+
     TimeSpan Position { get; }
     double PlaybackSpeed { get; }
 

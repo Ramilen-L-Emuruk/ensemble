@@ -207,10 +207,24 @@ public sealed class SlotSequencer
         lock (_lock) { _eofMarked = true; Monitor.PulseAll(_lock); }
     }
 
-    /// <summary>EOF 済みかつ表示待ち・リース中のスロットが残っていない（再生完了検出に使う）。</summary>
+    /// <summary>
+    /// EOF 済みかつ、まだ提示していないフレーム（Writing / Ready）が残っていない（再生完了検出に使う）。
+    /// リース中（Leased）は数えない。GPU 経路の vout スレッドは次のフレームが due になるまで
+    /// 最後のフレームをリースしたまま再提示し続けるため、全スロットが Free になるのを待つと
+    /// 「最後まで再生しても再生完了が検出されない」ことになる。
+    /// </summary>
     public bool IsEofDrained
     {
-        get { lock (_lock) return _eofMarked && AllFreeLocked(); }
+        get
+        {
+            lock (_lock)
+            {
+                if (!_eofMarked) return false;
+                foreach (var slot in _slots)
+                    if (slot.State is SlotState.Writing or SlotState.Ready) return false;
+                return true;
+            }
+        }
     }
 
     public void Close()
@@ -282,10 +296,4 @@ public sealed class SlotSequencer
         return chosen;
     }
 
-    private bool AllFreeLocked()
-    {
-        foreach (var slot in _slots)
-            if (slot.State != SlotState.Free) return false;
-        return true;
-    }
 }
