@@ -1,6 +1,11 @@
-﻿<Application x:Class="MultiTrackPlayer.UI.App"
+﻿<!-- ShutdownMode: 既定の OnLastWindowClose だと、サブウィンドウ（ミキサー・プレイリスト等）が
+     OnClosing で e.Cancel=true; Hide() する設計のため Application.Windows から除去されず、
+     メインウィンドウを閉じてもプロセスが終了しない（ゾンビ化して単一起動用の Mutex を握り続け、
+     以後アプリを起動できなくなる）。メインウィンドウの終了をアプリ終了とみなす -->
+<Application x:Class="MultiTrackPlayer.UI.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnMainWindowClose">
     <Application.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVis"/>
         <Style x:Key="TransportBtn" TargetType="Button">

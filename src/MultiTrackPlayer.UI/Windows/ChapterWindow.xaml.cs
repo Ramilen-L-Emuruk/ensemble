@@ -1,4 +1,4 @@
-using System.Windows;
+﻿using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using MultiTrackPlayer.Core.Models;
@@ -27,7 +27,7 @@ public partial class ChapterWindow : Window
     private void ChapterList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (ChapterList.SelectedItem is ChapterViewModel cvm)
-            _vm.Engine.JumpToChapter(cvm.Index);
+            _vm.JumpToChapter(cvm.Index);
     }
 
     private void ChapterList_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -40,13 +40,13 @@ public partial class ChapterWindow : Window
             case Key.Delete:
                 if (cvm.IsUserDefined)
                 {
-                    _vm.Engine.RemoveUserChapter(cvm.Chapter);
+                    if (!_vm.RemoveUserChapter(cvm.Chapter)) return;
                     _vm.RefreshChapters();
                 }
                 e.Handled = true;
                 break;
             case Key.Enter:
-                _vm.Engine.JumpToChapter(cvm.Index);
+                _vm.JumpToChapter(cvm.Index);
                 e.Handled = true;
                 break;
             case Key.F2:
@@ -62,7 +62,7 @@ public partial class ChapterWindow : Window
     {
         if ((sender as FrameworkElement)?.Tag is ChapterViewModel cvm && cvm.IsUserDefined)
         {
-            _vm.Engine.RemoveUserChapter(cvm.Chapter);
+            if (!_vm.RemoveUserChapter(cvm.Chapter)) return;
             _vm.RefreshChapters();
         }
     }

@@ -75,13 +75,15 @@ public partial class MainWindow : Window
                 // 動画切替時は前フレームの残像を残さないよう、再描画判定用の直近 PTS をリセットする
                 // （新動画の最初のフレームが前動画と同一 PTS でも確実に描き直させる）。
                 _lastRenderedPts = TimeSpan.MinValue;
+                // 別ファイルでの新たな描画異常も記録できるよう、抑止フラグを戻す
+                _renderErrorLogged = false;
                 UpdateVideoHostLayout();
                 UpdateOverlayBounds();
             }
         };
 
         SeekBar.Seeking += (_, ratio) =>
-            _vm.Engine.Seek(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
+            _vm.SeekTo(TimeSpan.FromSeconds(ratio * _vm.Duration.TotalSeconds));
         // フルスクリーン時のシークバー・無操作タイマー・マウス移動検知は AirspaceOverlayWindow 側へ移設した（段階2-2b）。
 
         CompositionTarget.Rendering += OnRendering;
@@ -92,7 +94,7 @@ public partial class MainWindow : Window
         {
             // 案Y: 映像子ウィンドウの HWND をエンジンへ接続する。GPU デコード経路の再生開始時に
             // この HWND へスワップチェーンが張られ、vout スレッドが vsync で Present する。
-            _vm.Engine.AttachVideoOutput(VideoHost.Hwnd);
+            _vm.AttachVideoOutput(VideoHost.Hwnd);
 
             // 案Y: 映像子ウィンドウが airspace で最前面になり OSD が隠れるため、透過オーバーレイを
             // その上に重ねて追従表示する（段階2-2a）。VideoHost のサイズ・ウィンドウ位置・状態変化で再配置する。
@@ -126,6 +128,26 @@ public partial class MainWindow : Window
     // GPU 非対応・初期化失敗時のみ WriteableBitmap にフォールバックする。
     private void OnRendering(object? sender, EventArgs e)
     {
+        try
+        {
+            RenderNextFrame();
+        }
+        catch (Exception ex)
+        {
+            // 毎フレーム呼ばれる経路なので、ここで例外を漏らすと未処理例外としてアプリ全体が落ちる。
+            // 同じ異常が毎フレーム続くとログが埋まるため、記録は初回だけにする
+            if (!_renderErrorLogged)
+            {
+                _renderErrorLogged = true;
+                DiagnosticLog.WriteFatal("render", $"映像フレームの取得・描画に失敗（以降この記録は出さない）: {ex}");
+            }
+        }
+    }
+
+    private bool _renderErrorLogged;
+
+    private void RenderNextFrame()
+    {
         bool videoOutputActive = _vm.Engine.IsVideoOutputActive;
         SyncVideoHostVisibility(videoOutputActive);
 
@@ -137,43 +159,50 @@ public partial class MainWindow : Window
         long t1 = Stopwatch.GetTimestamp();
         if (lease == null) return;
 
-        if (lease.Pts == _lastRenderedPts)
+        // リースは何があっても返す。返し損ねるとスロットが Leased のまま固着し、
+        // 4 スロットが枯渇して映像が止まる（このプロジェクトが過去に複数回踏んだ症状）。
+        // 特に WriteableBitmap 経路（_presenter が null のソフトウェアレンダリング環境）は
+        // WritePixels が例外を投げうるため、正常系・異常系とも finally に一本化する。
+        try
         {
-            _vm.Engine.ReturnFrame(lease);
-            return;
+            if (lease.Pts == _lastRenderedPts) return;
+
+            if (_presenter != null)
+            {
+                // D3DImage 経路: Present が Kind に応じて GPU ゼロコピー / CPU アップロードへ振り分ける。
+                _presenter.Present(lease);
+            }
+            else if (lease.Kind == FrameKind.Cpu)
+            {
+                // フォールバック経路: WriteableBitmap へ CPU コピーする。
+                if (_bitmap is null || _bitmap.PixelWidth != lease.Width || _bitmap.PixelHeight != lease.Height)
+                    _bitmap = new WriteableBitmap(lease.Width, lease.Height, 96, 96, PixelFormats.Bgra32, null);
+
+                _bitmap.WritePixels(
+                    new Int32Rect(0, 0, lease.Width, lease.Height),
+                    lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
+                VideoImage.Source = _bitmap;
+            }
+            // else: presenter 無し（WPF ソフトウェアレンダリング）かつ GPU リースは D3D を持たず表示できないため、
+            // この稀な組み合わせでは当該フレームをスキップする（クラッシュ回避）。
+            long t2 = Stopwatch.GetTimestamp();
+            _lastRenderedPts = lease.Pts;
+
+            double tryGetFrameMs = (t1 - t0) * 1000.0 / Stopwatch.Frequency;
+            // t1〜t2 の計測対象は、GPU 経路では Present 全体、フォールバックでは WritePixels。
+            // ラベルは両経路を包含する意味で uploadMs とする（旧名 writePixels から意味変更）。
+            double uploadMs = (t2 - t1) * 1000.0 / Stopwatch.Frequency;
+            if (tryGetFrameMs + uploadMs > RenderCostLogThresholdMs)
+            {
+                DiagnosticLog.Write("renderCost",
+                    $"total={tryGetFrameMs + uploadMs:F1}ms tryGetFrame={tryGetFrameMs:F1}ms uploadMs={uploadMs:F1}ms w={lease.Width} h={lease.Height}");
+            }
         }
-
-        if (_presenter != null)
+        finally
         {
-            // D3DImage 経路: Present が Kind に応じて GPU ゼロコピー / CPU アップロードへ振り分ける。
-            _presenter.Present(lease);
-        }
-        else if (lease.Kind == FrameKind.Cpu)
-        {
-            // フォールバック経路: WriteableBitmap へ CPU コピーする。
-            if (_bitmap is null || _bitmap.PixelWidth != lease.Width || _bitmap.PixelHeight != lease.Height)
-                _bitmap = new WriteableBitmap(lease.Width, lease.Height, 96, 96, PixelFormats.Bgra32, null);
-
-            _bitmap.WritePixels(
-                new Int32Rect(0, 0, lease.Width, lease.Height),
-                lease.PixelBuffer, lease.Stride * lease.Height, lease.Stride);
-            VideoImage.Source = _bitmap;
-        }
-        // else: presenter 無し（WPF ソフトウェアレンダリング）かつ GPU リースは D3D を持たず表示できないため、
-        // この稀な組み合わせでは当該フレームをスキップする（クラッシュ回避）。
-        long t2 = Stopwatch.GetTimestamp();
-        _lastRenderedPts = lease.Pts;
-
-        _vm.Engine.ReturnFrame(lease);
-
-        double tryGetFrameMs = (t1 - t0) * 1000.0 / Stopwatch.Frequency;
-        // t1〜t2 の計測対象は、GPU 経路では Present 全体、フォールバックでは WritePixels。
-        // ラベルは両経路を包含する意味で uploadMs とする（旧名 writePixels から意味変更）。
-        double uploadMs = (t2 - t1) * 1000.0 / Stopwatch.Frequency;
-        if (tryGetFrameMs + uploadMs > RenderCostLogThresholdMs)
-        {
-            DiagnosticLog.Write("renderCost",
-                $"total={tryGetFrameMs + uploadMs:F1}ms tryGetFrame={tryGetFrameMs:F1}ms uploadMs={uploadMs:F1}ms w={lease.Width} h={lease.Height}");
+            // finally 内で例外が出ると try 内の元例外が失われる。後始末の失敗は記録に留める
+            try { _vm.Engine.ReturnFrame(lease); }
+            catch (Exception returnEx) { DiagnosticLog.WriteFatal("render", $"フレームの返却に失敗: {returnEx}"); }
         }
     }
 
@@ -420,15 +449,15 @@ public partial class MainWindow : Window
             case "Skip-3":        _vm.Skip(-3); break;
             case "Skip+60":       _vm.Skip(60); break;
             case "Skip-60":       _vm.Skip(-60); break;
-            case "JumpToStart":   _vm.Engine.Seek(TimeSpan.Zero); _vm.ShowOsd("先頭へ"); break;
-            case "JumpToEnd":     _vm.Engine.Seek(_vm.Duration); _vm.ShowOsd("末尾へ"); break;
+            case "JumpToStart":   if (_vm.SeekTo(TimeSpan.Zero)) _vm.ShowOsd("先頭へ"); break;
+            case "JumpToEnd":     if (_vm.SeekTo(_vm.Duration)) _vm.ShowOsd("末尾へ"); break;
             case "VolumeUp":      _vm.MasterVolume = Math.Min(100, _vm.MasterVolume + 5); break;
             case "VolumeDown":    _vm.MasterVolume = Math.Max(0, _vm.MasterVolume - 5); break;
             case "Mute":          _vm.ToggleMuteCommand.Execute(null); break;
             case "SpeedUp":       _vm.ChangeSpeed(0.25); break;
             case "SpeedDown":     _vm.ChangeSpeed(-0.25); break;
-            case "NextChapter":   _vm.Engine.JumpToNextChapter(); _vm.ShowOsd("次のチャプター"); break;
-            case "PrevChapter":   _vm.Engine.JumpToPreviousChapter(); _vm.ShowOsd("前のチャプター"); break;
+            case "NextChapter":   if (_vm.JumpToNextChapter()) _vm.ShowOsd("次のチャプター"); break;
+            case "PrevChapter":   if (_vm.JumpToPreviousChapter()) _vm.ShowOsd("前のチャプター"); break;
             case "NextFile":      _vm.PlayNext(); break;
             case "PrevFile":      _vm.PlayPrevious(); break;
             case "ToggleChapter": _vm.ToggleChapterAtCurrentPosition(); UpdateSeekBarChapters(); break;
@@ -523,7 +552,17 @@ public partial class MainWindow : Window
 
     private void Window_Drop(object sender, DragEventArgs e)
     {
-        if (e.Data.GetData(DataFormats.FileDrop) is not string[] files || files.Length == 0) return;
+        if (e.Data.GetData(DataFormats.FileDrop) is not string[] dropped || dropped.Length == 0) return;
+
+        // 他の 2 経路（Loaded・HandleFilesFromAnotherInstance）と同じくファイルだけに絞る。
+        // フォルダをドロップされると avformat_open_input が失敗するため、ここで除外しておく
+        var files = dropped.Where(System.IO.File.Exists).ToArray();
+        if (files.Length == 0)
+        {
+            // ここで無言で捨てると「ドロップしても反応しない」ようにしか見えない
+            _vm.ShowOsd("開けるファイルがありません（フォルダは対象外です）");
+            return;
+        }
 
         if (files.Length == 1)
         {
