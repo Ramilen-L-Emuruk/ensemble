@@ -20,7 +20,7 @@
     <UseWPF>true</UseWPF>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.7.2</Version>
+    <Version>1.7.3</Version>
   </PropertyGroup>
 
   <ItemGroup>
