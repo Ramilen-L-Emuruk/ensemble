@@ -17,12 +17,13 @@
                 MouseLeftButtonDown="Canvas_MouseLeftButtonDown"
                 MouseMove="Canvas_MouseMove"
                 MouseLeftButtonUp="Canvas_MouseLeftButtonUp"
+                LostMouseCapture="Canvas_LostMouseCapture"
                 MouseEnter="Canvas_MouseEnter"
                 MouseLeave="Canvas_MouseLeave"
                 Cursor="Hand">
             <Rectangle x:Name="ProgressRect" Height="4" Fill="#FF2196F3"
                        Canvas.Left="0" Canvas.Top="10"/>
-            <ItemsControl x:Name="ChapterMarkers" Canvas.Left="0" Canvas.Top="0">
+            <ItemsControl x:Name="ChapterMarkerLayer" Canvas.Left="0" Canvas.Top="0">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
                         <Canvas/>

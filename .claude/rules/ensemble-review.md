@@ -106,7 +106,7 @@
 | `Video/` | `FrameSelector` / `SlotSequencer` / `VideoFrameRing` |
 | `Diagnostics/` | `DiagnosticLog` |
 | `Thumbnails/` | `ThumbnailPlan` |
-| `Core/Models/` | `PlaylistCursor` |
+| `Core/Models/` | `PlaylistCursor` / `ChapterMarkers` |
 
 - [ ] 同期ロジック・状態機械を新規に追加する場合は、**FFmpeg・D3D11 依存から切り離してテスト可能な形で実装し、テストを書く**こと。`SlotSequencer`（状態機械）と `GpuVideoFrameRing`（ペイロード管理）の分離がその手本
 - [ ] **ViewModel に書く状態遷移・位置決めのロジックも同じ扱いにする。** テストプロジェクトは WPF アセンブリ（`net10.0-windows`）を参照していないため、ViewModel に置いたままではテストできない。`Core` 側へ出して ViewModel を薄い包みにする（`PlaylistCursor` と `PlaylistViewModel` の分離がその例）

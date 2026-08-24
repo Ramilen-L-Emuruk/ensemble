@@ -4,6 +4,8 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Threading;
+using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.UI.Controls;
 using MultiTrackPlayer.UI.ViewModels;
 
 namespace MultiTrackPlayer.UI.Windows;
@@ -65,7 +67,19 @@ public partial class AirspaceOverlayWindow : Window
         };
 
         PreviewMouseUp += (_, _) => RestoreOwnerFocus();
+
+        // フルスクリーン側のシークバーにもチャプターマーカーを出す。以前はここへ届く経路が
+        // 1 つも無く、フルスクリーン中はマーカーが常に空だった（TransportBar が隠れるので、
+        // 古いものが残るのでもなく空）。DataContext は MainWindow が設定するため、
+        // 差し替えに追従できるようここで購読を張り替える
+        _chapterSync = new SeekBarChapterSync(FullscreenSeekBar);
+        DataContextChanged += (_, args) => _chapterSync.Bind(args.NewValue as MainViewModel);
     }
+
+    private readonly SeekBarChapterSync _chapterSync;
+
+    /// <summary>キー入力のフックを張った先。解除するために保持する。</summary>
+    private HwndSource? _hwndSource;
 
     protected override void OnSourceInitialized(EventArgs e)
     {
@@ -76,6 +90,64 @@ public partial class AirspaceOverlayWindow : Window
         int ex = GetWindowLong(hwnd, GWL_EXSTYLE);
         SetWindowLong(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
         SetClickThrough(true);
+
+        // キー入力を Win32 のメッセージとして直接拾う。
+        // このウィンドウは WPF のフォーカスを受ける要素を持たない（Focusable="False" /
+        // ShowActivated="False" / WS_EX_NOACTIVATE）ため、KeyDown は発火しない。購読を足しても
+        // 空振りする。一方でシークバーをクリックすると Win32 のフォーカスはこの HWND に移るので、
+        // WM_KEYDOWN 自体は届いている（WPF が配送先を見つけられず捨てている）。
+        // RestoreOwnerFocus はボタンを離したときにオーナーへ返すが、シークバーのドラッグ中
+        // （CaptureMouse〜ReleaseMouseCapture）は PreviewMouseUp が来ないため、その間の
+        // キー入力はここでしか拾えない
+        _hwndSource = HwndSource.FromHwnd(hwnd);
+        if (_hwndSource != null)
+        {
+            _hwndSource.AddHook(WndProcHook);
+        }
+        else
+        {
+            // ここを無言で流すと、フルスクリーンのキー操作が「昔から効かない」のと区別できない。
+            // この窓のキー入力はこのフックしか経路が無いので、張れなかった事実は必ず残す
+            DiagnosticLog.WriteFatal("overlay",
+                "HwndSource を取得できずキー入力のフックを張れなかった（フルスクリーン中のショートカットが効かない）");
+        }
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        // 現状この窓は MainWindow と同じ寿命なので実害は無いが、作り直す設計になったときに
+        // ハンドラが残らないよう対で外す
+        _hwndSource?.RemoveHook(WndProcHook);
+        _hwndSource = null;
+        base.OnClosed(e);
+    }
+
+    private const int WM_KEYDOWN = 0x0100;
+    // Alt 併用時は WM_SYSKEYDOWN で来る（既定のキーバインドに Alt 系は無いが、
+    // キー文字列の組み立ては Alt に対応しているので拾っておく）
+    private const int WM_SYSKEYDOWN = 0x0104;
+    // lParam の bit30 が「直前も押されていた」＝ OS のキーリピート
+    private const long KeyRepeatFlag = 0x40000000;
+
+    private IntPtr WndProcHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN) return IntPtr.Zero;
+        if (Owner is not MainWindow main) return IntPtr.Zero;
+
+        var key = KeyInterop.KeyFromVirtualKey(wParam.ToInt32());
+        bool isRepeat = (lParam.ToInt64() & KeyRepeatFlag) != 0;
+        // ここはウィンドウプロシージャの中。例外を漏らすとネイティブ側を巻き戻して落ちるため、
+        // WPF のルーティング経由（Window_KeyDown → App の未処理例外）とは記録の残り方が変わる。
+        // 他の経路と同じく記録して握り、キー 1 回分を捨てるだけにする
+        try
+        {
+            if (main.HandleKeyInput(key, isRepeat)) handled = true;
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.WriteFatal("overlay", $"フルスクリーンのキー処理で例外 key={key}: {ex}");
+        }
+        return IntPtr.Zero;
     }
 
     /// <summary>フルスクリーン開始。クリックスルーを解除して入力を受け付け、下部オーバーレイを一旦表示する。</summary>
@@ -89,10 +161,18 @@ public partial class AirspaceOverlayWindow : Window
         ShowFullscreenBar();
     }
 
-    /// <summary>フルスクリーン終了。下部オーバーレイを隠し、クリックスルーへ戻す。</summary>
+    /// <summary>フルスクリーン終了。下部オーバーレイを隠し、クリックスルーへ戻す。
+    /// キーボードフォーカスがこの窓に残っていればオーナーへ返す。</summary>
     public void ExitFullscreen()
     {
         _isFullscreen = false;
+        // シークバーを触ると Win32 のフォーカスがこの窓へ移る。クリックスルーへ戻した後も
+        // 残っていると、メニューのニーモニックや ComboBox のキー操作が、本ウィンドウを
+        // 一度クリックするまで効かない（WM_KEYDOWN フックでショートカットだけは動き続けるので
+        // 気づきにくい）。
+        // ここに残っているときだけ返す。無条件にオーナーを前面化すると、サブウィンドウで
+        // F / F11 を押して解除した場合にそちらの操作を奪う
+        if (GetFocus() == new WindowInteropHelper(this).Handle) RestoreOwnerFocus();
         _cursorWatchTimer.Stop();
         _hideTimer.Stop();
         FullscreenOverlay.Visibility = Visibility.Collapsed;
@@ -171,6 +251,11 @@ public partial class AirspaceOverlayWindow : Window
 
     [DllImport("user32.dll")]
     private static extern IntPtr SetFocus(IntPtr hWnd);
+
+    /// <summary>呼び出しスレッドのキーボードフォーカスを持つウィンドウ。
+    /// このアプリの窓はすべて同じ UI スレッドなので、これで自分に残っているか判定できる。</summary>
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetFocus();
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

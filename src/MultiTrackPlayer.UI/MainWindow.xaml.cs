@@ -8,6 +8,7 @@ using Microsoft.Win32;
 using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine.Diagnostics;
+using MultiTrackPlayer.UI.Controls;
 using MultiTrackPlayer.UI.Rendering;
 using MultiTrackPlayer.UI.Settings;
 using MultiTrackPlayer.UI.ViewModels;
@@ -27,6 +28,7 @@ public partial class MainWindow : Window
     private WriteableBitmap? _bitmap;
     private D3DImagePresenter? _presenter;
     private AirspaceOverlayWindow? _overlay;
+    private SeekBarChapterSync? _seekBarChapters;
     private TimeSpan _lastRenderedPts = TimeSpan.MinValue;
     // VideoHost（airspace の都合で常に最前面に来るネイティブ子ウィンドウ）の現在の表示状態。
     // vout 非稼働（CPU 経路）時に表示したままだと、下の VideoImage に描画される映像を覆い隠して
@@ -44,6 +46,10 @@ public partial class MainWindow : Window
         InitializeComponent();
         DataContext = _vm;
         _kb.Load();
+
+        // チャプターの変更をマーカーへ反映する配線（漏れの経緯は SeekBarChapterSync の doc を参照）
+        _seekBarChapters = new SeekBarChapterSync(SeekBar);
+        _seekBarChapters.Bind(_vm);
 
         // GPU が利用可能なら D3DImage による GPU ゼロコピー描画経路を使う。
         // RenderCapability.Tier の上位 16bit が 0 の場合はソフトウェアレンダリングのため従来の
@@ -127,7 +133,6 @@ public partial class MainWindow : Window
                 _vm.Playlist.AddFiles(files);
                 _vm.OpenFile(files[0]);
             }
-            if (files.Length > 0) UpdateSeekBarChapters();
             // 設定が既定値へ戻ったことは、開いたファイル名の表示より優先して伝えたい。
             // OSD は 1 つしか出せないので、上書きされないよう最後に出す
             if (_vm.Settings.WasRestoredToDefaults)
@@ -328,53 +333,58 @@ public partial class MainWindow : Window
         SpeedBox.SelectedIndex = -1;
     }
 
-    private void UpdateSeekBarChapters()
-    {
-        if (_vm.Duration <= TimeSpan.Zero) return;
-        Dispatcher.BeginInvoke(() =>
-        {
-            var markers = _vm.Chapters.Select(c => (c.Chapter.StartTime.TotalSeconds / _vm.Duration.TotalSeconds, c.Title));
-            SeekBar.SetChapters(markers);
-        });
-    }
-
     // ── Key handling ──
     private void Window_KeyDown(object sender, KeyEventArgs e)
     {
-        // OS のキーリピートを無視する。矢印キーを押しっぱなしにして巻き戻すと、
-        // 前のシークの映像プリロールが終わる前に次の Skip が発行され続け、
-        // シークパイプラインが常に再武装された状態になって映像が乱れる原因になる
-        if (e.IsRepeat) { e.Handled = true; return; }
+        if (HandleKeyInput(ResolveKey(e), e.IsRepeat)) e.Handled = true;
+    }
 
-        if (e.Key == Key.Escape && _vm.IsFullscreen)
+    /// <summary>Alt 併用時は e.Key が Key.System になり、実際のキーは SystemKey に入る。</summary>
+    private static Key ResolveKey(KeyEventArgs e) => e.Key == Key.System ? e.SystemKey : e.Key;
+
+    /// <summary>
+    /// キー入力 1 回分を処理する。**キー入力の入口はすべてここへ集約する。**
+    /// </summary>
+    /// <remarks>
+    /// 呼び出し元は 3 つ。①このウィンドウの <c>KeyDown</c> ②サブウィンドウからの転送
+    /// （<see cref="Windows.SubWindowKeyHandling"/>）③フルスクリーンのオーバーレイの
+    /// <c>WM_KEYDOWN</c> フック（<see cref="Windows.AirspaceOverlayWindow"/>）。
+    /// ③ が Win32 のメッセージを直接受けるため、<c>KeyEventArgs</c> ではなくキーと
+    /// リピートかどうかだけを受ける形にしてある（偽のイベントオブジェクトを作らない）。
+    /// </remarks>
+    /// <param name="isRepeat">OS のキーリピートによる入力か。矢印キーを押しっぱなしにすると
+    /// 前のシークの映像プリロールが終わる前に次の Skip が発行され続け、シークパイプラインが
+    /// 常に再武装された状態になって映像が乱れるため、リピートは捨てる。</param>
+    /// <returns>処理した（呼び出し元は入力を消費してよい）場合 true。</returns>
+    public bool HandleKeyInput(Key key, bool isRepeat)
+    {
+        if (isRepeat) return true;
+
+        if (key == Key.Escape && _vm.IsFullscreen)
         {
             ToggleFullscreen();
-            e.Handled = true;
-            return;
+            return true;
         }
         if (_vm.IsFullscreen) _overlay?.PokeFullscreenBar();
 
-        HandleShortcutKey(e);
+        if (TryHandleTrackKey(key)) return true;
+
+        string? cmd = _kb.GetCommand(BuildKeyStr(key));
+        if (cmd == null) return false;
+        ExecuteCommand(cmd);
+        return true;
     }
 
-    /// <summary>キーバインドに従いショートカットコマンドを実行する。サブウィンドウ表示中も
-    /// メインウィンドウのショートカットが使えるよう、各サブウィンドウのキー入力からも呼び出される。</summary>
+    /// <summary>サブウィンドウのキー入力から転送されてくる経路。</summary>
     public void HandleShortcutKey(KeyEventArgs e)
     {
-        if (e.IsRepeat) { e.Handled = true; return; }
-        if (TryHandleTrackKey(e)) { e.Handled = true; return; }
-
-        string keyStr = BuildKeyStr(e);
-        string? cmd = _kb.GetCommand(keyStr);
-        if (cmd == null) return;
-        e.Handled = true;
-        ExecuteCommand(cmd);
+        if (HandleKeyInput(ResolveKey(e), e.IsRepeat)) e.Handled = true;
     }
 
     // 数字キー(1〜9、テンキー含む)を押しっぱなしにしながら M/↑/↓ を押すと、
     // その番号のトラックに対してミュート切替・音量±5%を行う。
     // 対象トラックが存在しない場合は通常のキーバインド処理にフォールスルーする。
-    private bool TryHandleTrackKey(KeyEventArgs e)
+    private bool TryHandleTrackKey(Key key)
     {
         if (!TryGetHeldTrackNumber(out int trackNumber)) return false;
 
@@ -385,7 +395,6 @@ public partial class MainWindow : Window
         }
         if (track == null) return false;
 
-        var key = e.Key == Key.System ? e.SystemKey : e.Key;
         switch (key)
         {
             case Key.M:
@@ -436,9 +445,8 @@ public partial class MainWindow : Window
         [Key.Oem4] = "OemOpenBrackets",
     };
 
-    private static string BuildKeyStr(KeyEventArgs e)
+    private static string BuildKeyStr(Key key)
     {
-        var key = e.Key == Key.System ? e.SystemKey : e.Key;
         string prefix = string.Empty;
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control)) prefix += "Ctrl+";
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) prefix += "Shift+";
@@ -472,7 +480,7 @@ public partial class MainWindow : Window
             case "PrevChapter":   if (_vm.JumpToPreviousChapter()) _vm.ShowOsd("前のチャプター"); break;
             case "NextFile":      _vm.PlayNext(); break;
             case "PrevFile":      _vm.PlayPrevious(); break;
-            case "ToggleChapter": _vm.ToggleChapterAtCurrentPosition(); UpdateSeekBarChapters(); break;
+            case "ToggleChapter": _vm.ToggleChapterAtCurrentPosition(); break;
             case "Fullscreen":    ToggleFullscreen(); break;
             case "Open":          OpenFileDialog(); break;
             case "ShowShortcuts": GetShortcuts().Show(); break;
@@ -489,7 +497,6 @@ public partial class MainWindow : Window
         if (dlg.ShowDialog() == true)
         {
             _vm.OpenFileWithFolderPlaylist(dlg.FileName);
-            UpdateSeekBarChapters();
         }
     }
 
@@ -518,6 +525,9 @@ public partial class MainWindow : Window
             AppMenu.Visibility = Visibility.Visible;
             TransportBar.Visibility = Visibility.Visible;
             _vm.IsFullscreen = false;
+            // フォーカスの戻しは ExitFullscreen が「オーバーレイに残っているときだけ」行う。
+            // ここで無条件に Activate()/Focus() すると、サブウィンドウで F / F11 を押して
+            // 解除した場合にそちらの操作を奪ってしまう
             _overlay?.ExitFullscreen();
             _vm.ShowOsd("フルスクリーン解除");
         }
@@ -586,7 +596,6 @@ public partial class MainWindow : Window
             _vm.Playlist.AddFiles(files);
             _vm.OpenFile(files[0]);
         }
-        UpdateSeekBarChapters();
     }
 
     /// <summary>
@@ -600,7 +609,6 @@ public partial class MainWindow : Window
 
         _vm.Playlist.AddFiles(existing);
         _vm.OpenFile(existing[0]);
-        UpdateSeekBarChapters();
 
         if (WindowState == WindowState.Minimized)
             WindowState = WindowState.Normal;
