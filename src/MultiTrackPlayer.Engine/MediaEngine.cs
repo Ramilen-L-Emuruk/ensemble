@@ -178,6 +178,11 @@ public unsafe class MediaEngine : IMediaEngine
     {
         get
         {
+            // 停止中に受けたシーク位置はクロックへ反映されない（Stop がクロックを 0 へ戻すため。
+            // 検疫時はクロックの後始末ごと省略されるが、そのときは Seek が保持自体を断る）。
+            // ここで返さないと、時間表示が 0 のままつまみだけ動いた状態になり、さらに現在位置を
+            // 起点にする操作（JumpToNextChapter・Skip・チャプター追加）が先頭を基準にしてしまう
+            if (PendingStartPosition is TimeSpan pending) return pending;
             if (_wasapiOut == null) return TimeSpan.Zero;
             return TimeSpan.FromSeconds(GetMasterClockSeconds());
         }
@@ -185,6 +190,31 @@ public unsafe class MediaEngine : IMediaEngine
 
     private double GetMasterClockSeconds()
         => _positionSource == null ? 0.0 : _clock.PositionAt(_positionSource.GetPositionFrames());
+
+    /// <summary>
+    /// <see cref="PendingStartPosition"/> の「保持していない」を表す番兵。
+    /// <see cref="TimeSpan"/>? は複数ワードのため、状態タイマー（スレッドプール）から
+    /// <see cref="Position"/> を読まれたときに裂けた値を見せうる。<c>SeekEpoch</c> と同じ流儀で
+    /// Ticks の <see cref="long"/> ＋番兵にし、<see cref="Volatile"/> で読み書きする。
+    /// </summary>
+    private const long NoPendingStart = -1;
+    private long _pendingStartTicks = NoPendingStart;
+
+    /// <summary>
+    /// 停止中（パイプラインを畳んだ後）に受けたシーク位置。次の再生の開始位置になる。
+    /// 設定は <see cref="Seek"/>、消費は <see cref="Play"/>、破棄は <see cref="Stop"/>。
+    /// </summary>
+    private TimeSpan? PendingStartPosition => ToPendingStart(Volatile.Read(ref _pendingStartTicks));
+
+    private static TimeSpan? ToPendingStart(long ticks)
+        => ticks == NoPendingStart ? null : TimeSpan.FromTicks(ticks);
+
+    private void SetPendingStartPosition(TimeSpan? position)
+        => Volatile.Write(ref _pendingStartTicks, position?.Ticks ?? NoPendingStart);
+
+    /// <summary>保持している開始位置を取り出して同時に消す。</summary>
+    private TimeSpan? TakePendingStartPosition()
+        => ToPendingStart(Interlocked.Exchange(ref _pendingStartTicks, NoPendingStart));
 
     /// <summary>
     /// 再生状態が変化したときに発火する。UI スレッド以外（再生完了検出は状態タイマー＝
@@ -487,6 +517,15 @@ public unsafe class MediaEngine : IMediaEngine
         // パイプラインがまだ無い＝本当に停止状態からの新規開始。EOF で Stopped になった場合は
         // パイプラインが生きたまま残る（CheckPlaybackEnded は畳まない）ので区別できる
         bool pipelineWasFresh = _demuxThread == null;
+        // 停止中に受けたシーク位置はこの再生で使い切る。持ち越すと、次に停止して再生したときに
+        // 覚えのない位置から始まる
+        TimeSpan? pendingStart = TakePendingStartPosition();
+        // 保持位置が設定されるのは demux スレッドが居ないとき（＝Stopped）だけなので、
+        // 一時停止からの再開でこれが残っているのは呼び出し規約違反。ここで捨てているため、
+        // 記録しないと「覚えたはずの位置が使われない」という無言の食い違いになる
+        if (!wasStopped && pendingStart is not null)
+            DiagnosticLog.WriteFatal("engine",
+                $"一時停止からの再開に開始位置の保持が残っていた（破棄する） pending={pendingStart.Value.TotalSeconds:F3}");
         try
         {
             EnsurePipelineStarted();
@@ -495,21 +534,25 @@ public unsafe class MediaEngine : IMediaEngine
                 // 新規再生の開始点で提示統計をリセットし、この再生1本ごとのドロップ率を UI に表示する（性能検証・実運用の可視性）。
                 _droppedFrames = 0;
                 _displayedFrames = 0;
-                // Seek は着地後の最初の音声サンプル投入時に錨を要求するため、こちらでは要求しない。
-                // 巻き戻せていない場合も Seek を使う（RequestAnchor(0.0) だと、実際の内容は
-                // 停止位置からなのに表示だけ 0 秒から進むという食い違いになる）
-                if (restartFromEof || _rewindSkipped)
+                // どの開始位置にするかの判断は Core 側の純ロジックへ出してテストしてある
+                // （組み合わせの取り違えが「もう一度再生できない」等に直結するため）
+                var start = PlaybackStartDecision.Decide(
+                    wasStopped, pipelineWasFresh, restartFromEof, _rewindSkipped, pendingStart);
+                switch (start.Action)
                 {
-                    // 終端で音声出力を止めている間に実ハードウェア位置と書込カーソルが乖離し、
-                    // 位置ソースが実クロックからフォールバック（外挿）へ切り替わっていることがある。
-                    // Seek が先に表示用のガード（BeginSeek）を立てるので、その後で内部カウンタを戻す
-                    Seek(TimeSpan.Zero);
-                    _positionSource?.Reset();
-                    _rewindSkipped = false;
+                    case PlaybackStartAction.SeekTo:
+                        // Seek は着地後の最初の音声サンプル投入時に錨を要求するため、こちらでは要求しない。
+                        // 終端で音声出力を止めている間に実ハードウェア位置と書込カーソルが乖離し、
+                        // 位置ソースが実クロックからフォールバック（外挿）へ切り替わっていることがある。
+                        // Seek が先に表示用のガード（BeginSeek）を立てるので、その後で内部カウンタを戻す
+                        Seek(start.Target);
+                        _positionSource?.Reset();
+                        _rewindSkipped = false;
+                        break;
+                    case PlaybackStartAction.AnchorAtStart:
+                        RequestAnchor(0.0);
+                        break;
                 }
-                else if (pipelineWasFresh) RequestAnchor(0.0);
-                // 上記以外は「EOF 後に手動でシークしてから再生した」場合。そのシークが既に
-                // 正しい錨を張っているので、ここで 0 秒として上書きしてはいけない
             }
             // 音声出力の開始に失敗すると audio-master クロックが進まず再生が成立しないため、
             // ここも巻き戻しの対象に含める（呼び出し元は「失敗＝再生していない」と扱うため）
@@ -526,6 +569,9 @@ public unsafe class MediaEngine : IMediaEngine
             // 既に検疫済み（＝EnsurePipelineStarted が構築を拒否した）なら畳むものは無い。
             // 再実行しても no-op だが「停止待ちが完了しなかった」ログが二重に出て調査を誤導する
             if (!_threadsAbandoned) HandleTeardownResult(TeardownPipeline());
+            // 停止状態へ戻したので、利用者が選んだ開始位置も戻す（消費したままにすると、
+            // 再生を押し直したときに黙って先頭から始まる）。Stop() は通っていないので残る
+            SetPendingStartPosition(pendingStart);
             throw;
         }
     }
@@ -542,6 +588,9 @@ public unsafe class MediaEngine : IMediaEngine
 
     public void Stop()
     {
+        // 停止は「次の再生は先頭から」を意味する（下で RewindToStart までかける）ので、
+        // 停止中のシークで覚えた開始位置はここで捨てる。Close() 経由のファイル切替も通る
+        SetPendingStartPosition(null);
         ReleaseHeldFrame();
         bool allThreadsStopped = TeardownPipeline();
         SetState(CorePlaybackState.Stopped);
@@ -586,8 +635,10 @@ public unsafe class MediaEngine : IMediaEngine
         // 読み取り位置が不明なまま次の再生に入ると表示位置がずれるため覚えておく
         if (allThreadsStopped)
         {
-            RewindToStart();
-            _rewindSkipped = false;
+            // 巻き戻しそのものが失敗することもある（シーク不可のストリーム・壊れたインデックス）。
+            // 成否を見ずに false を立てると、読み取り位置は動いていないのに「先頭にある」と
+            // 記録され、次の再生が錨だけ張って「表示は 0:00 なのに停止位置の続きが流れる」になる
+            _rewindSkipped = !RewindToStart();
         }
         else
         {
@@ -602,12 +653,21 @@ public unsafe class MediaEngine : IMediaEngine
     /// 停止した位置の続きが流れる」「EOF 後に停止しても再生し直せない」ことになる。
     /// パイプラインを畳んだ後（demux スレッドが居ない状態）でのみ呼ぶこと。
     /// </summary>
-    private void RewindToStart()
+    /// <returns>
+    /// 読み取り位置が先頭にあると言える場合 true。呼び出し元はこれを <c>_rewindSkipped</c> へ
+    /// 反映すること。失敗を無視して「戻した」ことにすると、上記の食い違いが痕跡なく起きる。
+    /// </returns>
+    private bool RewindToStart()
     {
-        if (_fmtCtx == null) return;
+        // ファイルが無ければ戻すものも無い。次に開くファイルは先頭から読み始まる
+        if (_fmtCtx == null) return true;
         int ret = avformat_seek_file(_fmtCtx, -1, long.MinValue, 0, 0, (int)AVSEEK_FLAG.Backward);
         if (ret < 0)
+        {
             DiagnosticLog.Write("engine", $"停止時の巻き戻しに失敗 ret={ret} ({FFmpegError.Describe(ret)})");
+            return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -620,21 +680,54 @@ public unsafe class MediaEngine : IMediaEngine
     /// （スクラブ位置のフレームを見せるための意図的な待機。詳細は
     /// <see cref="TryHoldNextFrame"/> の remarks 参照）。
     /// </para>
+    /// <para>
+    /// <b>パイプラインを畳んだ後</b>（明示的に停止した状態）では、シークを実行せず位置だけを覚え、
+    /// 次の <see cref="Play"/> の開始位置にする。<see cref="Position"/> は覚えた位置を返し、
+    /// <see cref="PositionChanged"/> も発火するので、表示は実際の挙動に一致する。
+    /// ただし<b>検疫中</b>（<see cref="IsPipelineQuarantined"/>）は次の再生自体が成立しないため、
+    /// 覚えずに無視する。
+    /// </para>
     /// </summary>
     public void Seek(TimeSpan position)
     {
-        // demux スレッドが動いていない状態でシークを受け付けると、HoldOutput だけ立てて
-        // 解除側（プリロール完了通知）が永久に来ず、以後の再生が音も映像も出なくなる
-        var demuxThread = _demuxThread;
-        if (_fmtCtx == null || demuxThread == null)
+        if (_fmtCtx == null)
         {
-            DiagnosticLog.Write("engine", $"再生していないためシーク要求を無視 target={position.TotalSeconds:F3} state={_state}");
+            DiagnosticLog.Write("engine", $"ファイル未オープンのためシーク要求を無視 target={position.TotalSeconds:F3} state={_state}");
             return;
         }
 
         // 目標を [0, duration) にクランプ（スキップ連打で負値や duration 超えの目標が来る）
         double durationSec = _currentMedia?.Duration.TotalSeconds ?? 0.0;
         double target = Math.Clamp(position.TotalSeconds, 0.0, Math.Max(0.0, durationSec - 0.1));
+
+        // demux スレッドが動いていない状態でシーク本体を走らせると、HoldOutput だけ立てて
+        // 解除側（プリロール完了通知）が永久に来ず、以後の再生が音も映像も出なくなる。
+        // かつて要求を捨てていたが、シークバーのつまみは指の位置へ楽観的に動いているため
+        // 「動いたように見えて何も起きない」状態になっていた。次の再生の開始位置として覚える
+        var demuxThread = _demuxThread;
+        if (demuxThread == null)
+        {
+            // 検疫中は「次の再生」自体が成立しない（EnsurePipelineStarted が構築を拒む）。
+            // 覚えても使われない位置を表示へ反映すると、再生できるかのように見える。
+            // UI 側も NotifyIfReopenRequired で弾いているが、エンジンを直接呼ぶ経路が
+            // 増えたときのために、約束できないことはここでも引き受けない
+            if (_threadsAbandoned)
+            {
+                DiagnosticLog.Write("engine",
+                    $"検疫中のためシーク要求を無視 target={target:F3} state={_state}");
+                return;
+            }
+
+            var pending = TimeSpan.FromSeconds(target);
+            SetPendingStartPosition(pending);
+            DiagnosticLog.Write("engine",
+                $"停止中のシークを次の再生の開始位置として保持 target={target:F3} state={_state}");
+            // 表示（時間・つまみ・チャプターの現在位置）を保持位置へそろえる。停止中は状態タイマーが
+            // 止まっているので、ここで通知しないと時間表示だけ 0 のまま取り残される
+            PositionChanged?.Invoke(this, pending);
+            return;
+        }
+
         DiagnosticLog.Write("engine", $"Seek 要求 raw={position.TotalSeconds:F3} target={target:F3} state={_state}");
 
         _clock.BeginSeek(target);

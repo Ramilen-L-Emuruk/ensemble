@@ -106,10 +106,11 @@
 | `Video/` | `FrameSelector` / `SlotSequencer` / `VideoFrameRing` |
 | `Diagnostics/` | `DiagnosticLog` |
 | `Thumbnails/` | `ThumbnailPlan` |
-| `Core/Models/` | `PlaylistCursor` / `ChapterMarkers` |
+| `Core/Models/` | `PlaylistCursor` / `ChapterMarkers` / `PlaybackStartDecision` |
 
 - [ ] 同期ロジック・状態機械を新規に追加する場合は、**FFmpeg・D3D11 依存から切り離してテスト可能な形で実装し、テストを書く**こと。`SlotSequencer`（状態機械）と `GpuVideoFrameRing`（ペイロード管理）の分離がその手本
 - [ ] **ViewModel に書く状態遷移・位置決めのロジックも同じ扱いにする。** テストプロジェクトは WPF アセンブリ（`net10.0-windows`）を参照していないため、ViewModel に置いたままではテストできない。`Core` 側へ出して ViewModel を薄い包みにする（`PlaylistCursor` と `PlaylistViewModel` の分離がその例）
+- [ ] **エンジン側でも、条件が 3 つ以上絡む分岐は `Core` へ出す。** `MediaEngine.Play` の開始位置の決定（停止中のシーク・EOF からの再開・巻き戻し省略・新規開始の 4 通り）を `PlaybackStartDecision` として切り出したのがその例。組み合わせの取り違えは実際に「最後まで見た動画をもう一度再生できない」として現れた
 - [ ] 上記 1 の待ち合わせ不具合は、純ロジックとして切り出してあればテストで捕捉できる種類のもの
 
 ## 6. シーク世代（`SeekEpoch`）の扱い
