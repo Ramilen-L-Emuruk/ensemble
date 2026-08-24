@@ -66,7 +66,7 @@ public partial class SeekBarControl : UserControl
     public SeekBarControl()
     {
         InitializeComponent();
-        ChapterMarkers.ItemsSource = _markers;
+        ChapterMarkerLayer.ItemsSource = _markers;
         SizeChanged += (_, _) => UpdateVisuals();
 
         _hoverShowTimer = new DispatcherTimer { Interval = HoverShowDelay };
@@ -84,12 +84,14 @@ public partial class SeekBarControl : UserControl
             ctrl.UpdateVisuals();
     }
 
-    public void SetChapters(IEnumerable<(double ratio, string title)> chapters)
+    /// <summary>チャプターマーカーを差し替える。比率は 0.0〜1.0 に収まっている前提で、
+    /// ここでは範囲の判断をしない（丸めは <see cref="ChapterMarkers"/> の責任）。</summary>
+    public void SetChapters(IEnumerable<ChapterMarker> chapters)
     {
         _markers.Clear();
         double w = TrackCanvas.ActualWidth;
-        foreach (var (r, t) in chapters)
-            _markers.Add(new ChapterMarkerData { Ratio = r, X = r * w - 1, ToolTip = t });
+        foreach (var marker in chapters)
+            _markers.Add(new ChapterMarkerData { Ratio = marker.Ratio, X = marker.Ratio * w - 1, ToolTip = marker.Title });
     }
 
     private void UpdateVisuals()
@@ -133,6 +135,12 @@ public partial class SeekBarControl : UserControl
         _isDragging = false;
         TrackCanvas.ReleaseMouseCapture();
     }
+
+    // ドラッグ中にキャプチャを失う経路（フルスクリーン中にドラッグしたまま Escape を押すと
+    // オーバーレイが隠れてキャプチャが外れる等）でボタンアップが来ないことがある。
+    // _isDragging が立ったままだと OnRatioChanged のガードで表示の更新が止まり、
+    // 再生位置に合わせてつまみが動かなくなる
+    private void Canvas_LostMouseCapture(object sender, MouseEventArgs e) => _isDragging = false;
 
     private void Canvas_MouseEnter(object sender, MouseEventArgs e)
     {

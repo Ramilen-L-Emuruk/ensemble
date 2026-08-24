@@ -503,6 +503,11 @@ public partial class MainViewModel : ObservableObject, IDisposable
         ShowOsd(System.IO.Path.GetFileName(path));
     }
 
+    /// <summary>シークバーのマーカーを作る。算出（比率・範囲の丸め）は
+    /// <see cref="ChapterMarkers"/> にあり、ここは現在のチャプターと尺を渡すだけ。</summary>
+    public IReadOnlyList<ChapterMarker> BuildChapterMarkers()
+        => ChapterMarkers.Build(Chapters.Select(c => (c.Chapter.StartTime, c.Title)), Duration);
+
     public void RefreshChapters()
     {
         Chapters.Clear();
