@@ -651,14 +651,20 @@ public unsafe class MediaEngine : IMediaEngine
         // そろえること。ここを「一時停止中だけ」と書くと、EOF で Stopped に落ちた状態のシークが
         // 「手放すが掴まない」経路に入り、Play を押すまで永久に暗転する
         if (_state == CorePlaybackState.Playing) ReleaseHeldFrame();
-        // ミキサーに残る旧位置の音声を即座に破棄する（シーク中に古い音が鳴り続けるのを防ぐ）。
-        // クロックの錨は AudioDecodeThread が新サンプルを投入する瞬間に要求される（早期消費バグの根治）
-        foreach (var s in _audioStates) s.Buffer.ClearBuffer();
-
         // 映像プリロール（キーフレーム→目標地点の破棄デコード）は実時間がかかることがある。
         // 音声だけ先にプリロールを終えて実時間で再生を始めるとクロックが映像を置き去りにし、
         // 映像が追いつこうとして大量ドロップ（早送りに見える）が発生する。
-        // 音声・映像の両方のプリロールが完了するまでミキサーの実音声出力を保留する
+        // 音声・映像の両方のプリロールが完了するまでミキサーの実音声出力を保留する。
+        //
+        // **これは下のバッファ破棄より先に行うこと。** 逆順にすると、空にしてから保留を立てる
+        // までの隙間に音声デコードスレッドがシーク前のサンプルを書き足し、それをミキサーが
+        // 保留前の状態で出力しうる（シーク直前の音が一瞬鳴る）。この窓は数命令ぶんだが、
+        // UI スレッドがそこでプリエンプトされれば任意に広がる。
+        //
+        // 既知の穴（並べ替えとは独立に前からある）: ここから RequestSeek までの間に、前のシークの
+        // プリロール完了通知が割り込むとフラグが true へ戻り TryReleaseMixerHold が保留を早期解除する。
+        // OnAudioPrerollReady / OnVideoPrerollReady が照合しているのはパイプライン世代だけで、
+        // シーク世代（SeekEpoch）を見ていないため。直すならあちらに世代照合を足すことになる
         if (_mixer != null)
         {
             _videoPrerollReady = _videoDecoder == null;
@@ -666,6 +672,15 @@ public unsafe class MediaEngine : IMediaEngine
             _mixer.HoldOutput = true;
             DiagnosticLog.Write("gate", $"HoldOutput 設定 target={target:F3} videoQueueEpoch={_videoQueue?.Epoch.Value ?? -1} audioQueueEpoch={_audioQueue?.Epoch.Value ?? -1}");
         }
+
+        // ミキサーに残る旧位置の音声を即座に破棄する（シーク中に古い音が鳴り続けるのを防ぐ）。
+        // クロックの錨は AudioDecodeThread が新サンプルを投入する瞬間に要求される（早期消費バグの根治）。
+        //
+        // これは副作用として AudioDecodeThread の充填ゲート（残量 1 秒で待つ）の解放も兼ねている。
+        // 一時停止中と音声出力の異常停止後はミキサーの Read が呼ばれず、ゲートは自力ではほどけない。
+        // ここを RequestSeek より後ろへ動かす・条件付きにするなら、Flush 番兵の処理が遅れることを
+        // 承知のうえで行うこと（あちらにも世代不一致での脱出を用意してあるので単独では固まらない）
+        foreach (var s in _audioStates) s.Buffer.ClearBuffer();
 
         // このシークで採番された世代。以前は「リングの現在世代 + 1」と予測していたが、
         // リングの Flush 回数に依存する予測だったため、シーク前の残骸フレームを掴んでしまっていた

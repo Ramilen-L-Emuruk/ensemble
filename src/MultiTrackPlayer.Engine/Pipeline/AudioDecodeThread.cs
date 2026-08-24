@@ -43,6 +43,9 @@ public sealed unsafe class AudioDecodeThread
     // 異常が続くと毎フレーム記録されてログが埋まるため、トラックごとに最初の 1 回だけ残す
     private readonly bool[] _resampleFailureLogged;
     private readonly bool[] _sendPacketFailureLogged;
+    // EOF ドレインの flush パケット失敗。通常デコード中の失敗（_sendPacketFailureLogged）とは
+    // 原因もタイミングも別なので、抑制フラグを分けて片方が他方を隠さないようにする
+    private readonly bool[] _eofFlushFailureLogged;
 
     private readonly ResampleFailureTracker _resampleFailures;
 
@@ -78,6 +81,7 @@ public sealed unsafe class AudioDecodeThread
         _onTrackAbandoned = onTrackAbandoned;
         _resampleFailureLogged = new bool[decoders.Count];
         _sendPacketFailureLogged = new bool[decoders.Count];
+        _eofFlushFailureLogged = new bool[decoders.Count];
         _resampleFailures = new ResampleFailureTracker(decoders.Count);
         _abandonedTracks = new bool[decoders.Count];
         _abandonLogged = new bool[decoders.Count];
@@ -208,7 +212,30 @@ public sealed unsafe class AudioDecodeThread
         CompletePrerollWithoutSamples("EOF 到達");
         for (int i = 0; i < _decoders.Count; i++)
         {
-            _decoders[i].SendPacket(null);
+            // HandlePacket 側と同じ理由で戻り値を見る。ここが失敗すると後続の TryReceiveFrame が
+            // 空振りし、終端に残っていたフレームを出せないまま IsEof を立てるため、終端付近の音が
+            // 無言で欠ける。抑制フラグを HandlePacket と分けているのは、通常デコード中の失敗が
+            // 先に記録されていると EOF ドレイン特有の失敗が隠れて残らなくなるため。
+            //
+            // -EAGAIN の再送ループ（HandlePacket が持つもの）はここには置かない。あちらは
+            // 1 パケット送るごとに DrainInto で必ず出力を吸い切ってから次へ進むので、この時点で
+            // デコーダの出力キューは空。再送ループを足すと、EOF 経路に上限のない待ちを
+            // 1 つ増やすことになる（ここが止まると demux が Put でブロックして映像まで止まる）
+            int flushRet = _decoders[i].SendPacket(null);
+            if (flushRet < 0 && !_eofFlushFailureLogged[i])
+            {
+                _eofFlushFailureLogged[i] = true;
+                // AVERROR_EOF は「既に draining 状態のデコーダへ flush パケットを送った」の意。
+                // EOF 番兵は DemuxThread が _eofReached で 1 回に絞り、次の EOF までに必ず
+                // Flush 番兵（HandleFlush の FlushBuffers）が挟まるため、ここは常に 1 回目のはず。
+                // 返ってきたら呼び出し規約違反なので、診断ログの有効・無効に関わらず残す
+                if (flushRet == AVERROR_EOF)
+                    Diagnostics.DiagnosticLog.WriteFatal("audio",
+                        $"EOF ドレインの flush パケットが二重送信された track={i}（終端付近の音が欠ける）");
+                else
+                    Diagnostics.DiagnosticLog.Write("audio",
+                        $"EOF ドレインの SendPacket が失敗 track={i} ret={flushRet}");
+            }
             while (_decoders[i].TryReceiveFrame(frame))
             {
                 var pcm = _decoders[i].ResampleFrame(frame);
@@ -382,10 +409,24 @@ public sealed unsafe class AudioDecodeThread
     }
 
     // 通常運用でも充填ゲートの出入り自体は頻発するため、その都度はログしない。
-    // ここでの滞留はミキサー側の消費停止（HoldOutput 等）を示す異常シグナルなので、
-    // 一定時間を超えて抜けられない場合だけ記録する
+    // ここで長く滞留するのは「ミキサーの Read そのものが呼ばれていない」ときだけで、
+    // その原因は一時停止（正常）と音声出力の死亡（異常）の両方がありうる。この 2 つを
+    // 経過時間では区別できないため、記録は WriteFatal へ上げず診断ログに留める。
+    // なお HoldOutput 中は消費が続く（MultiTrackMixer.Read 参照）ので滞留の原因にはならない
     private static readonly TimeSpan GateStallLogThreshold = TimeSpan.FromSeconds(2.0);
 
+    /// <summary>
+    /// デコード済みサンプルをトラックのバッファへ足す。残量が閾値を超えている間は待つ（充填ゲート）。
+    /// </summary>
+    /// <remarks>
+    /// シーク世代の照合は待機ループの中だけで行う。ゲートに掛からない経路（残量が閾値以下）では
+    /// シーク前のサンプルが混ざりうるが、<c>MediaEngine.Seek</c> が「ミキサー出力の保留
+    /// （<c>HoldOutput</c>）を立てる → バッファを空にする → <c>RequestSeek</c>」の順で進めるため、
+    /// 混ざったサンプルは出力される前に保留され、直後に処理される Flush 番兵が同じバッファを空にする。
+    /// **この順序が保証しているので、Seek 側で並べ替えるならここでも照合が必要になる**
+    /// （毎フレーム世代を読む形になり、順序を保つ方が安い）。
+    /// <c>_mixer</c> が無い（音声トラックなし）場合は出力自体が無いので問題にならない。
+    /// </remarks>
     private void AddWithGate(int trackIndex, byte[] pcm, int offset, int count)
     {
         var track = _states[trackIndex];
@@ -396,6 +437,19 @@ public sealed unsafe class AudioDecodeThread
             while (track.Buffer.BufferedDuration > FillGateThreshold)
             {
                 if (_stopRequested) return;
+                // シークが入ったら、抱えているサンプルはシーク前の残骸。破棄して Get() へ戻り、
+                // Flush 番兵を処理する。この脱出条件を持たないと、シーク時にゲートを抜けられる
+                // 根拠が「MediaEngine.Seek が RequestSeek の手前で全トラックのバッファを空にする」
+                // という別スレッドの副作用だけになる。実際に抜けられてはいるが、待機の脱出条件が
+                // シークに言及していない形は ensemble-review.md §7（事実を代理値で置き換えるな）
+                // が禁じているもので、あちらを変えた瞬間に恒久ブロックへ化ける
+                SeekEpoch queueEpoch = _queue.Epoch;
+                if (queueEpoch != HandledEpoch)
+                {
+                    Diagnostics.DiagnosticLog.Write("audio-gate",
+                        $"充填ゲート中にシークを検出しサンプルを破棄 track={trackIndex} handled={HandledEpoch} current={queueEpoch}");
+                    return;
+                }
                 _wake.Wait(FillGatePollInterval);
                 _wake.Reset();
 
