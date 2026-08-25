@@ -102,7 +102,7 @@
 | ルート | `SeekEpoch` |
 | `Pipeline/` | `BoundedSerialQueue` |
 | `Sync/` | `PlaybackClock` / `PrerollGate` |
-| `Audio/` | `PrerollCalculator` / `MultiTrackMixer` / `ResampleFailureTracker` |
+| `Audio/` | `PrerollCalculator` / `MultiTrackMixer` / `ResampleFailureTracker` / `AudioStallDetector` |
 | `Video/` | `FrameSelector` / `SlotSequencer` / `VideoFrameRing` |
 | `Diagnostics/` | `DiagnosticLog` |
 | `Thumbnails/` | `ThumbnailPlan` |

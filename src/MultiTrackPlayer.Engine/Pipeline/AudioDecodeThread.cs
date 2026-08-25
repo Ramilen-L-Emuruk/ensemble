@@ -410,8 +410,10 @@ public sealed unsafe class AudioDecodeThread
 
     // 通常運用でも充填ゲートの出入り自体は頻発するため、その都度はログしない。
     // ここで長く滞留するのは「ミキサーの Read そのものが呼ばれていない」ときだけで、
-    // その原因は一時停止（正常）と音声出力の死亡（異常）の両方がありうる。この 2 つを
-    // 経過時間では区別できないため、記録は WriteFatal へ上げず診断ログに留める。
+    // その原因は一時停止（正常）と音声出力の死亡（異常）の両方がありうる。**この 2 つを
+    // 区別できないのは、ここが再生状態を知らないからで、経過時間の測り方の問題ではない。**
+    // 生死の判定は再生状態を持つ MediaEngine.DetectAudioStall（AudioStallDetector）が担い、
+    // ここでの滞留ログはその裏付けに使う診断情報にとどめる（WriteFatal へは上げない）。
     // なお HoldOutput 中は消費が続く（MultiTrackMixer.Read 参照）ので滞留の原因にはならない
     private static readonly TimeSpan GateStallLogThreshold = TimeSpan.FromSeconds(2.0);
 
