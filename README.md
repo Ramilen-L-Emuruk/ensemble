@@ -42,7 +42,7 @@ src/
 │   ├── Rendering/            GPU ゼロコピー描画の中核（共有 D3D11 デバイス・VideoProcessor 色変換・
 │   │                         スワップチェーンの vsync 提示）
 │   ├── Video/                映像フレームリング（GPU/CPU）とスロット状態機械（SlotSequencer）・due フレーム選択
-│   ├── Sync/                 audio-master 再生クロック
+│   ├── Sync/                 audio-master 再生クロック・シーク後のプリロール待ち合わせ
 │   ├── Audio/                マルチトラックミキサー・トラック状態
 │   ├── Thumbnails/           シークバー用サムネイル生成・キャッシュ
 │   ├── Utilities/            ハードウェアデバイス生成等のユーティリティ

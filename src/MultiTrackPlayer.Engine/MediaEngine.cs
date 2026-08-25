@@ -107,9 +107,9 @@ public unsafe class MediaEngine : IMediaEngine
     private double _pendingAnchorTarget;
     private int _awaitingAnchor;
 
-    // シーク後の音声・映像プリロール完了の両方を待つゲート（早送りバグの根治。詳細は Seek() 参照）
-    private volatile bool _videoPrerollReady = true;
-    private volatile bool _audioPrerollReady = true;
+    // シーク後の音声・映像プリロール完了の両方を待つゲート（早送りバグの根治。詳細は Seek() 参照）。
+    // ミキサー出力保留の反映まで担わせている（ApplyMixerHold の説明を参照）
+    private readonly PrerollGate _prerollGate;
 
     private MediaInfo? _currentMedia;
     // SetState 以外からも素の読み取りが多数あるため volatile にする（書き込みは _stateLock で直列化）
@@ -129,6 +129,22 @@ public unsafe class MediaEngine : IMediaEngine
     private readonly List<object> _quarantined = new();
     // demux の I/O を中断するための門。ファイルごとに 1 つ作る
     private IoInterruptGate? _ioGate;
+
+    public MediaEngine()
+    {
+        _prerollGate = new PrerollGate(ApplyMixerHold);
+    }
+
+    /// <summary>
+    /// ミキサーの実音声出力の保留を反映する。<b><see cref="PrerollGate"/> のロック内から呼ばれる</b>ため、
+    /// 別のロックを取る処理・ブロックしうる処理（診断ログのファイル I/O を含む）をここへ足さないこと。
+    /// 記録は呼び出し側（<see cref="Seek"/> / 各プリロール完了通知）で行う。
+    /// </summary>
+    private void ApplyMixerHold(bool hold)
+    {
+        MultiTrackMixer? mixer = _mixer;
+        if (mixer != null) mixer.HoldOutput = hold;
+    }
 
     /// <summary>
     /// <c>av_read_frame</c> / <c>avformat_seek_file</c> の I/O を中断させるための門。
@@ -568,7 +584,16 @@ public unsafe class MediaEngine : IMediaEngine
             SetState(CorePlaybackState.Stopped);
             // 既に検疫済み（＝EnsurePipelineStarted が構築を拒否した）なら畳むものは無い。
             // 再実行しても no-op だが「停止待ちが完了しなかった」ログが二重に出て調査を誤導する
-            if (!_threadsAbandoned) HandleTeardownResult(TeardownPipeline());
+            if (!_threadsAbandoned)
+            {
+                bool allThreadsStopped = TeardownPipeline();
+                // 開始位置の決定で Seek() を通っていれば、プリロール待ちと保留が立ったまま残る。
+                // Stop() と同じく 1 回で確定させる（検疫へ倒れたときは消音のため立てたまま）。
+                // ここを省くと、取り残されたデコードスレッドが同じ世代の完了通知を後から出して
+                // 保留を解き、停止したはずの旧ファイルの音が漏れる
+                _prerollGate.Reset(hold: !allThreadsStopped);
+                HandleTeardownResult(allThreadsStopped);
+            }
             // 停止状態へ戻したので、利用者が選んだ開始位置も戻す（消費したままにすると、
             // 再生を押し直したときに黙って先頭から始まる）。Stop() は通っていないので残る
             SetPendingStartPosition(pendingStart);
@@ -595,9 +620,12 @@ public unsafe class MediaEngine : IMediaEngine
         bool allThreadsStopped = TeardownPipeline();
         SetState(CorePlaybackState.Stopped);
         _playbackEndedFired = false;
-        // シーク中断のまま Stop された場合に保留状態が次の Play() へ持ち越されないようにする
-        _videoPrerollReady = true;
-        _audioPrerollReady = true;
+        // シーク中断のまま Stop された場合に保留状態が次の Play() へ持ち越されないようにする。
+        // ミキサー出力の保留もここで確定させる。検疫時は消音のため立てたまま残す（下の分岐の説明を参照）。
+        // 「解除してから分岐で立て直す」形にしないこと。取り残されたスレッドは旧ファイルの音声を
+        // 供給し続けているため、その隙間にミキサーの Read が走ると一瞬だけ実出力へ漏れる。
+        // 以降 Seek() までは、遅れて届いたプリロール完了通知は世代違いで捨てられ保留へ触れない
+        _prerollGate.Reset(hold: !allThreadsStopped);
 
         if (allThreadsStopped)
         {
@@ -608,7 +636,8 @@ public unsafe class MediaEngine : IMediaEngine
             foreach (var s in _audioStates) s.Buffer.ClearBuffer();
             _clock.Reset();
             _positionSource?.Reset();
-            if (_mixer != null) _mixer.HoldOutput = false;
+            // ミキサー出力の保留は上の _prerollGate.Reset() で解除済み。ここで重ねて書かない
+            //（同じ状態を 2 箇所から書くと、片方だけを直したときに食い違う）
         }
         else
         {
@@ -616,8 +645,9 @@ public unsafe class MediaEngine : IMediaEngine
             // まだ触っている可能性がある。IAudioClient は並行アクセスに耐えないため、ここで
             // Stop() すると状態タイマーの GetPosition() と競合してプロセスが落ちうる。
             // 触るのはミキサー出力の保留（マネージドな volatile bool 1 つ）だけにして消音する。
+            // その保留は上の _prerollGate.Reset(hold: !allThreadsStopped) で既に立っている（ここで
+            // 重ねて書かない。false を挟むと、その隙間に旧ファイルの音が漏れる）。
             // これらの資源は DisposeDecoders が検疫し、解放しないまま次のファイルへ引き継がない
-            if (_mixer != null) _mixer.HoldOutput = true;
             DiagnosticLog.WriteFatal("engine",
                 "検疫中のため音声出力・バッファ・クロックの後始末を省略した（ミキサー出力の保留で消音）");
         }
@@ -754,17 +784,16 @@ public unsafe class MediaEngine : IMediaEngine
         // 保留前の状態で出力しうる（シーク直前の音が一瞬鳴る）。この窓は数命令ぶんだが、
         // UI スレッドがそこでプリエンプトされれば任意に広がる。
         //
-        // 既知の穴（並べ替えとは独立に前からある）: ここから RequestSeek までの間に、前のシークの
-        // プリロール完了通知が割り込むとフラグが true へ戻り TryReleaseMixerHold が保留を早期解除する。
-        // OnAudioPrerollReady / OnVideoPrerollReady が照合しているのはパイプライン世代だけで、
-        // シーク世代（SeekEpoch）を見ていないため。直すならあちらに世代照合を足すことになる
-        if (_mixer != null)
-        {
-            _videoPrerollReady = _videoDecoder == null;
-            _audioPrerollReady = _audioDecoders.Count == 0;
-            _mixer.HoldOutput = true;
-            DiagnosticLog.Write("gate", $"HoldOutput 設定 target={target:F3} videoQueueEpoch={_videoQueue?.Epoch.Value ?? -1} audioQueueEpoch={_audioQueue?.Epoch.Value ?? -1}");
-        }
+        // BeginSeek はこのシークの世代が採番される前に呼ぶ（ここではまだ採番されていない）。
+        // ゲートは一旦「待つ世代なし」になり、前のシークの完了通知を落とす。デコードスレッド側の
+        // 照合（自分のプリロール世代 == キューの現在世代）は、demux が実際にシークして Flush する
+        // まで古い世代のまま素通りするため、受け取る側でも世代を見ないとこの窓を塞げない。
+        // 待つ世代は RequestSeek が採番と同時に確定させる（PrerollGate の説明を参照）。
+        //
+        // 保留の書き込みもゲートのロック内で行われる（判定と反映を分けると、次のシークが立てた保留を
+        // 旧シークの解除が上書きしうる）。待つ相手がいない場合は保留しないので戻り値は false になる
+        bool held = _prerollGate.BeginSeek(hasVideo: _videoDecoder != null, hasAudio: _audioDecoders.Count > 0);
+        DiagnosticLog.Write("gate", $"HoldOutput 設定={held} target={target:F3} videoQueueEpoch={_videoQueue?.Epoch.Value ?? -1} audioQueueEpoch={_audioQueue?.Epoch.Value ?? -1}");
 
         // ミキサーに残る旧位置の音声を即座に破棄する（シーク中に古い音が鳴り続けるのを防ぐ）。
         // クロックの錨は AudioDecodeThread が新サンプルを投入する瞬間に要求される（早期消費バグの根治）。
@@ -799,23 +828,55 @@ public unsafe class MediaEngine : IMediaEngine
         DiagnosticLog.Write("clock", $"anchor 要求 target={targetSeconds:F3}");
     }
 
-    /// <summary>音声プリロール完了時（AudioDecodeThread からのコールバック）。錨の要求と準備完了の両方を行う。</summary>
-    private void OnAudioPrerollReady(int generation, double targetSeconds)
+    /// <summary>
+    /// 音声プリロール完了時（AudioDecodeThread からのコールバック）。錨の要求と準備完了の両方を行う。
+    /// 古い世代の通知では錨も要求しない（要求すると、既に次のシークへ進んでいるのに旧シークの
+    /// 目標でクロックを起点合わせしてしまう）。正しい世代の通知が後から来て改めて要求する。
+    /// </summary>
+    private void OnAudioPrerollReady(int generation, SeekEpoch epoch, double targetSeconds)
     {
         if (!IsCurrentPipeline(generation, "audioPreroll")) return;
+        PrerollNotifyResult result = _prerollGate.NotifyAudioReady(epoch);
+        if (result == PrerollNotifyResult.Stale)
+        {
+            LogStalePreroll("audioPreroll", epoch, $" target={targetSeconds:F3}");
+            return;
+        }
         RequestAnchor(targetSeconds);
-        _audioPrerollReady = true;
-        DiagnosticLog.Write("gate", $"audioPrerollReady=true target={targetSeconds:F3} video={_videoPrerollReady}");
-        TryReleaseMixerHold();
+        DiagnosticLog.Write("gate", $"audioPrerollReady=true epoch={epoch} target={targetSeconds:F3} result={result}");
     }
 
     /// <summary>映像プリロール完了時（VideoDecodeThread からのコールバック）。</summary>
-    private void OnVideoPrerollReady(int generation)
+    private void OnVideoPrerollReady(int generation, SeekEpoch epoch)
     {
         if (!IsCurrentPipeline(generation, "videoPreroll")) return;
-        _videoPrerollReady = true;
-        DiagnosticLog.Write("gate", $"videoPrerollReady=true audio={_audioPrerollReady}");
-        TryReleaseMixerHold();
+        PrerollNotifyResult result = _prerollGate.NotifyVideoReady(epoch);
+        if (result == PrerollNotifyResult.Stale)
+        {
+            LogStalePreroll("videoPreroll", epoch, "");
+            return;
+        }
+        DiagnosticLog.Write("gate", $"videoPrerollReady=true epoch={epoch} result={result}");
+    }
+
+    /// <summary>
+    /// 世代違いで捨てたプリロール完了通知を記録する。
+    /// <para>
+    /// <b>ここを <c>WriteFatal</c>（常に記録される側）へ引き上げないこと。</b> シークが完了前に
+    /// 次のシークへ飲み込まれるのは連打時の正常な挙動で、規約違反ではない。<c>WriteFatal</c> は
+    /// プロセス間ミューテックス待ちで数百 ms ブロックするため、連打のたびに呼ぶと
+    /// 「シークが引っかかる」という別の症状を自分で作ることになる
+    ///（<c>DemuxThread._flushViolationLogged</c> のコメントと同じ理由）。
+    /// </para>
+    /// <para>
+    /// 「待機中」は判定に使った値ではなく読み直した現在値。この間に次のシークが入れば表示だけずれる
+    /// （診断用途のみで判定には影響しない）。
+    /// </para>
+    /// </summary>
+    private void LogStalePreroll(string what, SeekEpoch epoch, string extra)
+    {
+        string awaited = _prerollGate.AwaitedEpoch?.ToString() ?? "未採番";
+        DiagnosticLog.Write("gate", $"{what} の通知を破棄（epoch={epoch} 待機中={awaited}）{extra}");
     }
 
     /// <summary>
@@ -845,16 +906,6 @@ public unsafe class MediaEngine : IMediaEngine
         DiagnosticLog.Write("gate",
             $"{what} の通知を破棄（generation={generation} 現在={_pipelineGeneration}）");
         return false;
-    }
-
-    /// <summary>音声・映像の両方のプリロールが完了して初めて、ミキサーの実音声出力保留を解除する。</summary>
-    private void TryReleaseMixerHold()
-    {
-        if (_videoPrerollReady && _audioPrerollReady && _mixer != null)
-        {
-            _mixer.HoldOutput = false;
-            DiagnosticLog.Write("gate", "HoldOutput 解除");
-        }
     }
 
     public void SetPlaybackSpeed(double speed)
@@ -1132,9 +1183,16 @@ public unsafe class MediaEngine : IMediaEngine
         // CurrentMedia の変化を代わりに使うと、同じファイルの停止→再生では発火せず取りこぼす
         VideoRingRebuilt?.Invoke(this, EventArgs.Empty);
 
+        // onSeekEpochIssued は RequestSeek が世代を採番するのと同じロック内で呼ばれる。
+        // これにより「待つ世代」の確定が、その世代のプリロール完了通知より必ず先に起きる
         _demuxThread = new DemuxThread(
             _fmtCtx, videoStreamIndex, _audioStreamToTrack,
-            _videoQueue, _audioQueue, PublishSeekTarget);
+            _videoQueue, _audioQueue, PublishSeekTarget,
+            onSeekEpochIssued: _prerollGate.IssueEpoch);
+
+        // 作りたてのパイプラインは待つものが無い。停止を経ずにここへ来る経路が増えても、
+        // 前のファイルのシークで倒したままのゲートを引き継がないようにする
+        _prerollGate.Reset(hold: false);
 
         // このパイプラインの世代。取り残された旧スレッドの遅延通知を弾くために使う
         int pipelineGeneration = ++_pipelineGeneration;
@@ -1145,11 +1203,11 @@ public unsafe class MediaEngine : IMediaEngine
             _videoDecodeThread = new VideoDecodeThread(
                 _videoDecoder, _videoQueue, videoSink,
                 () => _demuxThread!.PtsSyncOffset, _videoFrameDuration,
-                onFirstFrameAfterFlush: () => OnVideoPrerollReady(pipelineGeneration));
+                onFirstFrameAfterFlush: epoch => OnVideoPrerollReady(pipelineGeneration, epoch));
 
         _audioDecodeThread = new AudioDecodeThread(
             _audioDecoders, _audioStates, _audioQueue, () => _demuxThread!.PtsSyncOffset,
-            onFirstSamplesAfterFlush: target => OnAudioPrerollReady(pipelineGeneration, target),
+            onFirstSamplesAfterFlush: (epoch, target) => OnAudioPrerollReady(pipelineGeneration, epoch, target),
             onTrackAbandoned: trackIndex => OnAudioTrackAbandoned(pipelineGeneration, trackIndex));
 
         if (_mixer != null)

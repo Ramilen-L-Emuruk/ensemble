@@ -101,7 +101,7 @@
 |---|---|
 | ルート | `SeekEpoch` |
 | `Pipeline/` | `BoundedSerialQueue` |
-| `Sync/` | `PlaybackClock` |
+| `Sync/` | `PlaybackClock` / `PrerollGate` |
 | `Audio/` | `PrerollCalculator` / `MultiTrackMixer` / `ResampleFailureTracker` |
 | `Video/` | `FrameSelector` / `SlotSequencer` / `VideoFrameRing` |
 | `Diagnostics/` | `DiagnosticLog` |
@@ -130,6 +130,8 @@
 - [ ] 世代は**連番を保証しない**。シーク要求はコアレスされるため、採番されたまま使われない飛び番が残る。「+1 したら次の世代」という前提のコードを書かない
 - [ ] `MediaEngine` の `_pipelineGeneration`（パイプライン実体の世代）・`_voutGeneration`（vout スレッドの世代）は寿命も目的も別物。`SeekEpoch` と混ぜない（型が違うのでコンパイルエラーになる）
 - [ ] **`Flush` の戻り値（適用したか）を捨てない**。`false` は呼び出し規約違反なので `WriteFatal` で記録すること（`DemuxThread.PerformSeek` / `MediaEngine.PublishSeekTarget` が実装例）
+- [ ] **デコードスレッドが出す合図（プリロール完了通知など）は、受け取る側でも世代を等値照合すること。** 出す側は「自分のプリロール世代 == キューの現在世代」を確かめてから発火するが、**キューの世代が進むのは demux スレッドが実際にシークして `Flush` した時点**であって `RequestSeek` の時点ではない。`MediaEngine.Seek` が待ち合わせを張ってからその Flush までの間、前のシークの通知はその照合を素通りする（`avformat_seek_file` を含むので数十 ms 開くことがある）
+  - ただし**受け取る側が「待つ世代」を確定するのは、採番と同じクリティカルセクション内**に限る（`DemuxThread.RequestSeek` の `onSeekEpochIssued`）。外に出すと、その世代の通知が確定より先に届いて捨てられ、ミキサーの出力保留が永久に解けない。§1 の恒久ブロックを新しく作ることになる
 
 ### 同じ世代で Flush を二度呼ぶと固まる（機構）
 
