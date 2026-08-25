@@ -10,6 +10,23 @@ namespace MultiTrackPlayer.Engine.Pipeline;
 public sealed unsafe class AudioDecodeThread
 {
     private static readonly TimeSpan FillGateThreshold = TimeSpan.FromSeconds(1.0);
+
+    /// <summary>
+    /// 「デコーダが前進しない」を何回連続で観測したらトラックを畳むか。
+    /// 値は <see cref="ResampleFailureTracker.DefaultThreshold"/> と同じ 50 にしてあるが、
+    /// 数えている事実が違う（あちらはリサンプル失敗）ので互いに追従する義務はない。
+    /// <para>
+    /// 数えている単位はデコード後のフレームではなく<b>受け取ったパケット</b>。1 パケットの時間長は
+    /// コーデック依存（AAC のような固定フレーム長なら 1024 サンプル＝48kHz で約 21ms だが、
+    /// Opus の可変フレーム長や生 PCM では大きく変わる）。したがって 50 回が何秒ぶんに当たるかは
+    /// ファイルによる。おおむね数百 ms〜1 秒程度を見込んだ値で、厳密な時間の保証ではない。
+    /// </para>
+    /// <para>
+    /// ResampleFailureTracker を共用せず別に数えているのは、畳んだ理由を取り違えないため。
+    /// 共用すると「リサンプル 30 回＋前進不能 20 回」で閾値に達し、記録に残す理由が実態と食い違う。
+    /// </para>
+    /// </summary>
+    private const int NoProgressAbandonThreshold = 50;
     private static readonly TimeSpan FillGatePollInterval = TimeSpan.FromMilliseconds(50);
 
     private readonly IReadOnlyList<AudioDecoder> _decoders;
@@ -42,10 +59,16 @@ public sealed unsafe class AudioDecodeThread
 
     // 異常が続くと毎フレーム記録されてログが埋まるため、トラックごとに最初の 1 回だけ残す
     private readonly bool[] _resampleFailureLogged;
-    private readonly bool[] _sendPacketFailureLogged;
-    // EOF ドレインの flush パケット失敗。通常デコード中の失敗（_sendPacketFailureLogged）とは
-    // 原因もタイミングも別なので、抑制フラグを分けて片方が他方を隠さないようにする
+    // EOF ドレインの flush パケット失敗。通常デコード中の失敗（NoteNotProgressing が数える）とは
+    // 原因もタイミングも別なので、抑制を分けて片方が他方を隠さないようにする
     private readonly bool[] _eofFlushFailureLogged;
+    // 規約違反（WriteFatal で常に残す）の抑制。診断ログ限りの失敗と分けているのは、
+    // 先に起きた軽い失敗が規約違反の記録を永久に打ち消さないようにするため
+    private readonly bool[] _dataAfterDrainingLogged;
+    private readonly bool[] _eofFlushDoubleSendLogged;
+    // 「このパケットは送れなかった」を連続で観測した回数（NoteNotProgressing が数える）。
+    // 記録の抑制もこの値で行うため、専用フラグは置かない
+    private readonly int[] _noProgressStreak;
 
     private readonly ResampleFailureTracker _resampleFailures;
 
@@ -80,8 +103,10 @@ public sealed unsafe class AudioDecodeThread
         _onFirstSamplesAfterFlush = onFirstSamplesAfterFlush;
         _onTrackAbandoned = onTrackAbandoned;
         _resampleFailureLogged = new bool[decoders.Count];
-        _sendPacketFailureLogged = new bool[decoders.Count];
         _eofFlushFailureLogged = new bool[decoders.Count];
+        _dataAfterDrainingLogged = new bool[decoders.Count];
+        _eofFlushDoubleSendLogged = new bool[decoders.Count];
+        _noProgressStreak = new int[decoders.Count];
         _resampleFailures = new ResampleFailureTracker(decoders.Count);
         _abandonedTracks = new bool[decoders.Count];
         _abandonLogged = new bool[decoders.Count];
@@ -170,6 +195,14 @@ public sealed unsafe class AudioDecodeThread
         Diagnostics.DiagnosticLog.Write("audio", message);
     }
 
+    /// <summary>呼び出し規約違反のように、診断ログが無効でも残さなければ追えない事象を 1 回だけ記録する。</summary>
+    private static void LogFatalOnce(bool[] logged, int trackIndex, string message)
+    {
+        if (trackIndex < 0 || trackIndex >= logged.Length || logged[trackIndex]) return;
+        logged[trackIndex] = true;
+        Diagnostics.DiagnosticLog.WriteFatal("audio", message);
+    }
+
     private void HandleFlush(SeekEpoch epoch)
     {
         // キューの世代と突き合わせて「このスレッドがシークに追いついたか」を外から判断できるようにする
@@ -184,6 +217,7 @@ public sealed unsafe class AudioDecodeThread
             _states[i].Buffer.ClearBuffer();
             _states[i].IsEof = false;
             _abandonedTracks[i] = false;
+            _noProgressStreak[i] = 0;
         }
         _prerollEpoch = epoch;
         lock (_seekTargetLock)
@@ -222,20 +256,16 @@ public sealed unsafe class AudioDecodeThread
             // デコーダの出力キューは空。再送ループを足すと、EOF 経路に上限のない待ちを
             // 1 つ増やすことになる（ここが止まると demux が Put でブロックして映像まで止まる）
             int flushRet = _decoders[i].SendPacket(null);
-            if (flushRet < 0 && !_eofFlushFailureLogged[i])
-            {
-                _eofFlushFailureLogged[i] = true;
-                // AVERROR_EOF は「既に draining 状態のデコーダへ flush パケットを送った」の意。
-                // EOF 番兵は DemuxThread が _eofReached で 1 回に絞り、次の EOF までに必ず
-                // Flush 番兵（HandleFlush の FlushBuffers）が挟まるため、ここは常に 1 回目のはず。
-                // 返ってきたら呼び出し規約違反なので、診断ログの有効・無効に関わらず残す
-                if (flushRet == AVERROR_EOF)
-                    Diagnostics.DiagnosticLog.WriteFatal("audio",
-                        $"EOF ドレインの flush パケットが二重送信された track={i}（終端付近の音が欠ける）");
-                else
-                    Diagnostics.DiagnosticLog.Write("audio",
-                        $"EOF ドレインの SendPacket が失敗 track={i} ret={flushRet}");
-            }
+            // AVERROR_EOF は「既に draining 状態のデコーダへ flush パケットを送った」の意。
+            // EOF 番兵は DemuxThread が _eofReached で 1 回に絞り、次の EOF までに必ず
+            // Flush 番兵（HandleFlush の FlushBuffers）が挟まるため、ここは常に 1 回目のはず。
+            // 返ってきたら呼び出し規約違反なので、診断ログの有効・無効に関わらず残す
+            if (flushRet == AVERROR_EOF)
+                LogFatalOnce(_eofFlushDoubleSendLogged, i,
+                    $"EOF ドレインの flush パケットが二重送信された track={i}（終端付近の音が欠ける）");
+            else if (flushRet < 0)
+                LogOnce(_eofFlushFailureLogged, i,
+                    $"EOF ドレインの SendPacket が失敗 track={i} ret={flushRet}");
             while (_decoders[i].TryReceiveFrame(frame))
             {
                 var pcm = _decoders[i].ResampleFrame(frame);
@@ -327,23 +357,108 @@ public sealed unsafe class AudioDecodeThread
         int ret = decoder.SendPacket(pkt);
         while (ret == -EAGAIN)
         {
-            DrainInto(trackIndex, decoder, frame);
+            // 1 枚も吸えていないのに再送してもデコーダの状態は変わらないため、前進を確かめずに
+            // 回すとこのループは永久に抜けない（VideoDecodeThread.HandlePacket と同じ形。
+            // あちらは停止要求でドレインが止まるぶん確実に踏むが、こちらも TryReceiveFrame が
+            // エラーを返し続ければ同じことになる）。
+            //
+            // 対称性を求めて DrainInto へ停止要求のガードを足してはいけない。映像側でこのループが
+            // 確実にスピンするのは、まさにそのガードで停止要求中に 1 枚も吸わなくなるからで、
+            // 足せば同じ危険を音声側にも作ることになる。停止は Run のループ条件で見れば足りる
+            if (!DrainInto(trackIndex, decoder, frame))
+            {
+                // 記録だけで抜けてはいけない。ミキサーは「EOF かつ残量ゼロ」のトラックしか
+                // 共通利用可能量の計算から除外しないため、残量ゼロのまま居座らせると common が
+                // 0 に固定され、健全な他トラックまで無音になる（AbandonTrack の doc コメント参照）。
+                // しかもその無音は AudioStallDetector に引っかからない（Read は呼ばれ続ける）。
+                //
+                // ただし単発では畳まない。TryReceiveFrame は -EAGAIN・AVERROR_EOF・本物のデコード
+                // エラーをまとめて false にするため、破損パケット由来の単発エラーもここへ来る。
+                // 一度で畳むと、次のパケットで回復できるトラックを残り再生時間ずっと無音にして
+                // しまう（ResampleFailureTracker が閾値方式を採っているのと同じ理由）
+                NoteNotProgressing(trackIndex, "デコーダが入力を受け付けず出力も出せない");
+                return;
+            }
             ret = decoder.SendPacket(pkt);
         }
-        // TryReceiveFrame 側は失敗をログするのに SendPacket だけ無言だと、
-        // 特定トラックが無音になったときに手がかりが残らない
-        if (ret < 0)
-            LogOnce(_sendPacketFailureLogged, trackIndex, $"SendPacket が失敗 track={trackIndex} ret={ret}");
+        // AVERROR_EOF は「draining 状態のデコーダへ通常パケットを送った」の意。EOF 番兵の後に
+        // Flush 番兵を挟まず Data パケットが来たことになり、HandleEof の二重送信と同じ規約違反。
+        // 連続回数には数えない。この状態なら HandleEof が既に走っていて IsEof が立っており、
+        // ミキサーの共通利用可能量からは除外済みなので、畳む必要が無い
+        if (ret == AVERROR_EOF)
+        {
+            LogFatalOnce(_dataAfterDrainingLogged, trackIndex,
+                $"draining 状態のデコーダへ通常パケットを送った track={trackIndex}（Flush 番兵を挟まず Data が届いた）");
+        }
+        else if (ret < 0)
+        {
+            // 送信が恒常的に失敗するトラックは、-EAGAIN で詰まるのと結末が同じ。フレームが
+            // 出ないまま IsEof も立たず、ミキサーの共通利用可能量を 0 に固定して健全な他トラックまで
+            // 無音にする。症状も畳む判断も同じなので同じカウンタで数える。TryReceiveFrame 側は
+            // 失敗をログするのに SendPacket だけ無言だと、特定トラックが無音になったときに
+            // 手がかりが残らないため、記録も NoteNotProgressing に任せる（初回の 1 行に ret を載せている）
+            NoteNotProgressing(trackIndex, $"SendPacket が失敗した（ret={ret}）");
+        }
+        else
+        {
+            // パケットが受け付けられた＝このトラックは前進した。連続失敗を数え直す。
+            // ここで戻さないと、ファイル全体に散らばった単発の失敗が積み上がって「連続」ではない
+            // 数え方になり、健全なトラックがいつか閾値に達して畳まれる
+            _noProgressStreak[trackIndex] = 0;
+        }
         DrainInto(trackIndex, decoder, frame);
     }
 
-    private void DrainInto(int trackIndex, AudioDecoder decoder, AVFrame* frame)
+    /// <summary>
+    /// このパケットをデコーダへ送れなかったことを記録し、連続が閾値に達したらトラックを畳む。
+    /// <para>
+    /// 畳むのが要る理由は <see cref="AbandonTrack"/> の doc を参照（残量ゼロのトラックを
+    /// 居座らせるとミキサーの共通利用可能量が 0 に固定され、健全な他トラックまで無音になる）。
+    /// 単発で畳まないのは、破損パケット由来の一時的な失敗で回復できるトラックを
+    /// 残り再生時間ずっと無音にしてしまわないため（<see cref="ResampleFailureTracker"/> と同じ判断）。
+    /// </para>
+    /// <para>
+    /// 記録は初回だけ診断ログへ。閾値に達しないまま回復したケースは <see cref="AbandonTrack"/> の
+    /// 記録に現れないため、「音が途切れたが回復した」を追う手がかりをここで残す。
+    /// 常に残す <c>WriteFatal</c> は、畳むと確定した時点（<see cref="AbandonTrack"/>）に任せる。
+    /// </para>
+    /// <para>
+    /// 対象は<b>送信できなかった</b>場合だけで、「送信は通ったのに
+    /// <c>avcodec_receive_frame</c> が本物のエラーを返し続ける」経路は数えていない
+    /// （<c>TryReceiveFrame</c> がエラーと -EAGAIN を <c>false</c> に畳んでいるため区別できない）。
+    /// </para>
+    /// </summary>
+    /// <param name="trackIndex">対象トラック。</param>
+    /// <param name="reason">ログに残す理由。</param>
+    private void NoteNotProgressing(int trackIndex, string reason)
     {
+        // 閾値に達した瞬間だけ畳む。ResampleFailureTracker.RecordFailure が「その瞬間だけ true」を
+        // 返すのと同じ意味づけで、超えた後も呼び続けても AbandonTrack を無駄に再実行しない
+        // 理由は括弧に入れて渡す。テンプレートの地の文へ直に埋めると reason の文末
+        //（体言か述語か）に文法が依存し、呼び出し側を増やすたびに日本語が壊れる
+        int streak = ++_noProgressStreak[trackIndex];
+        if (streak == 1)
+            Diagnostics.DiagnosticLog.Write("audio",
+                $"パケットを破棄 track={trackIndex}（{reason}）。"
+                + $"連続 {NoProgressAbandonThreshold} 回でこのトラックを畳む");
+        else if (streak == NoProgressAbandonThreshold)
+            AbandonTrack(trackIndex,
+                $"前進しない状態が {NoProgressAbandonThreshold} 回連続した（{reason}）");
+    }
+
+    /// <summary>デコーダの出力を吸い出してトラックのバッファへ流す。</summary>
+    /// <returns>1 枚以上取り出した場合 true。デコードエラーで 1 枚も取り出せなかった場合 false
+    /// （呼び出し側は「再送しても前進しない」と判断する）。</returns>
+    private bool DrainInto(int trackIndex, AudioDecoder decoder, AVFrame* frame)
+    {
+        bool drainedAny = false;
         while (decoder.TryReceiveFrame(frame))
         {
+            drainedAny = true;
             HandleDecodedFrame(trackIndex, decoder, frame);
             av_frame_unref(frame);
         }
+        return drainedAny;
     }
 
     private void HandleDecodedFrame(int trackIndex, AudioDecoder decoder, AVFrame* frame)
