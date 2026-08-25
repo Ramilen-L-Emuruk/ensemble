@@ -199,6 +199,9 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
   - `Sync/PlaybackClock.cs`: audio-master クロック（mixer 出力サンプル軸のセグメントマップ）。
     `WasapiPositionSource`（`IWavePosition` ベース、異常検知で `FallbackPositionSource` へ自動切替）と組み合わせて
     `MediaEngine.Position` を算出する
+  - `Sync/PrerollGate.cs`: シーク後、音声・映像の**両方**のプリロールが終わるまでミキサーの実出力を
+    保留する門番。完了通知はシーク世代で等値照合する（採番前は「待つ世代なし」として全て捨てる）。
+    待つ世代を確定する順序に制約があり、誤ると保留が永久に解けない。詳細はクラスの doc コメント
   - 映像提示は経路で二系統: GPU デコード時は専用 vout スレッドが `SwapChainVideoPresenter` で vsync 直接提示
     する（`IsVideoOutputActive`）。CPU デコード時は従来どおり pull 型で、UI 側の `CompositionTarget.Rendering`
     が毎フレーム `TryGetFrame`/`ReturnFrame` を呼ぶ

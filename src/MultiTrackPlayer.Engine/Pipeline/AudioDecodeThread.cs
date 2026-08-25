@@ -16,7 +16,7 @@ public sealed unsafe class AudioDecodeThread
     private readonly IReadOnlyList<AudioTrackState> _states;
     private readonly AudioPacketQueue _queue;
     private readonly Func<double> _getPtsSyncOffset;
-    private readonly Action<double>? _onFirstSamplesAfterFlush;
+    private readonly Action<SeekEpoch, double>? _onFirstSamplesAfterFlush;
     private readonly Action<int>? _onTrackAbandoned;
     private readonly ManualResetEventSlim _wake = new(false);
 
@@ -64,7 +64,7 @@ public sealed unsafe class AudioDecodeThread
     public AudioDecodeThread(
         IReadOnlyList<AudioDecoder> decoders, IReadOnlyList<AudioTrackState> states,
         AudioPacketQueue queue, Func<double> getPtsSyncOffset,
-        Action<double>? onFirstSamplesAfterFlush = null,
+        Action<SeekEpoch, double>? onFirstSamplesAfterFlush = null,
         Action<int>? onTrackAbandoned = null)
     {
         // 両者は常に同じトラック番号で添字アクセスされる。不一致のまま走らせると
@@ -268,7 +268,7 @@ public sealed unsafe class AudioDecodeThread
         if (!epochMatches) return;
 
         Diagnostics.DiagnosticLog.Write("audio", $"{reason}のためプリロールを完了扱いにする target={target:F3}");
-        _onFirstSamplesAfterFlush?.Invoke(target);
+        _onFirstSamplesAfterFlush?.Invoke(_prerollEpoch, target);
     }
 
     /// <summary>
@@ -469,7 +469,7 @@ public sealed unsafe class AudioDecodeThread
             // キューの世代が進んでいたら、この完了通知はもう無効な世代のもの。
             // 錨要求もプリロール完了通知も発火しない（本物の Flush が後で来て正しく上書きする）
             if (_queue.Epoch == _prerollEpoch)
-                _onFirstSamplesAfterFlush?.Invoke(_anchorTarget);
+                _onFirstSamplesAfterFlush?.Invoke(_prerollEpoch, _anchorTarget);
             else
                 Diagnostics.DiagnosticLog.Write("audio", $"stale preroll 破棄 prerollEpoch={_prerollEpoch} currentEpoch={_queue.Epoch} target={_anchorTarget:F3}");
         }

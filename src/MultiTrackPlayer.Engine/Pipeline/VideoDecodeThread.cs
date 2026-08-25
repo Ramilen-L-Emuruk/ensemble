@@ -14,7 +14,7 @@ public sealed unsafe class VideoDecodeThread
     private readonly IVideoFrameSink _sink;
     private readonly Func<double> _getPtsSyncOffset;
     private readonly double _frameDurationSeconds;
-    private readonly Action? _onFirstFrameAfterFlush;
+    private readonly Action<SeekEpoch>? _onFirstFrameAfterFlush;
 
     private volatile bool _stopRequested;
     private readonly object _seekTargetLock = new();
@@ -47,7 +47,7 @@ public sealed unsafe class VideoDecodeThread
     private bool _abandonUntilFlush;
 
     public VideoDecodeThread(VideoDecoder decoder, VideoPacketQueue queue, IVideoFrameSink sink,
-        Func<double> getPtsSyncOffset, double frameDurationSeconds, Action? onFirstFrameAfterFlush = null)
+        Func<double> getPtsSyncOffset, double frameDurationSeconds, Action<SeekEpoch>? onFirstFrameAfterFlush = null)
     {
         _decoder = decoder;
         _queue = queue;
@@ -181,7 +181,7 @@ public sealed unsafe class VideoDecodeThread
         if (_queue.Epoch == _prerollEpoch)
         {
             Diagnostics.DiagnosticLog.Write("video", $"EOF 到達のためプリロールを完了扱いにする target={_prerollTarget:F3}");
-            _onFirstFrameAfterFlush?.Invoke();
+            _onFirstFrameAfterFlush?.Invoke(_prerollEpoch);
         }
     }
 
@@ -237,7 +237,7 @@ public sealed unsafe class VideoDecodeThread
             Diagnostics.DiagnosticLog.Write("video", $"preroll 完了 firstPts={normalizedPts:F3} epoch={_prerollEpoch}");
             // シーク後、映像プリロールがここで完了する。MediaEngine 側はこれを合図に
             // ミキサーの音声出力保留（HoldOutput）を解除する（早送りバグの根治）
-            _onFirstFrameAfterFlush?.Invoke();
+            _onFirstFrameAfterFlush?.Invoke(_prerollEpoch);
         }
 
         // 停止要求後は新規スロットの GPU テクスチャ生成（CreateSlotTexture）に入らない。

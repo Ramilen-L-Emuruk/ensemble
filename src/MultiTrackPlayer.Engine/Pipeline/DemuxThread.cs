@@ -36,6 +36,9 @@ public sealed unsafe class DemuxThread
     // パケットと EOF 番兵に刻む。このスレッド専有のため同期は不要
     private SeekEpoch _epoch = SeekEpoch.Initial;
 
+    // 世代を採番した瞬間に呼ぶ通知（_seekLock 内から呼ぶ。RequestSeek のコメント参照）
+    private readonly Action<SeekEpoch>? _onSeekEpochIssued;
+
     // Flush の呼び出し規約違反を記録したか（このスレッド専有）。WriteFatal はプロセス間
     // ミューテックス待ちで数百ms ブロックするため、毎シーク記録すると「固まる」症状が
     // 「毎回のシークがワンテンポ遅れる」という別の症状に化けて診断しづらくなる。
@@ -47,7 +50,8 @@ public sealed unsafe class DemuxThread
 
     public DemuxThread(
         AVFormatContext* fmtCtx, int videoStreamIndex, IReadOnlyDictionary<int, int> audioStreamToTrack,
-        VideoPacketQueue videoQueue, AudioPacketQueue audioQueue, Action<SeekEpoch, double> publishSeekTarget)
+        VideoPacketQueue videoQueue, AudioPacketQueue audioQueue, Action<SeekEpoch, double> publishSeekTarget,
+        Action<SeekEpoch>? onSeekEpochIssued = null)
     {
         _fmtCtx = fmtCtx;
         _videoStreamIndex = videoStreamIndex;
@@ -55,6 +59,7 @@ public sealed unsafe class DemuxThread
         _videoQueue = videoQueue;
         _audioQueue = audioQueue;
         _publishSeekTarget = publishSeekTarget;
+        _onSeekEpochIssued = onSeekEpochIssued;
     }
 
     /// <summary>
@@ -75,6 +80,18 @@ public sealed unsafe class DemuxThread
             _lastIssuedEpoch = _lastIssuedEpoch.Next();
             epoch = _lastIssuedEpoch;
             _seekRequestSeq++;
+            // 採番と同時に「この世代を待つ」ことを呼び出し側へ確定させる。
+            // **ロックの外へ出してはならない。** demux スレッドはこの要求を TryTakePendingSeek で
+            // 同じロックを取らないと観測できないため、ロック内で通知しておけば、この世代の
+            // プリロール完了通知（Flush 番兵を経てデコードスレッドが出す）より必ず先に確定する。
+            // 外に出すと通知が先に届いて「待っていない世代」として捨てられ、ミキサーの出力保留が
+            // 永久に解けない（.claude/rules/ensemble-review.md §1 の恒久ブロック）。
+            // 渡す先はフィールド代入だけで、別のロックを取らないこと（ロック内コールバックの規約）。
+            // ロックの外へ出てしまってもコンパイルは通り、症状は「特定のシーク操作でだけ稀に固まる」
+            // という再現困難な形でしか出ない。テストで縛れない位置なのでアサートで代替する
+            System.Diagnostics.Debug.Assert(Monitor.IsEntered(_seekLock),
+                "onSeekEpochIssued は _seekLock 内から呼ぶこと");
+            _onSeekEpochIssued?.Invoke(epoch);
         }
         // demux スレッドが満杯キューの Put でブロック中だとシーク要求を永遠にチェックできない
         //（映像リング満杯→映像キュー満杯→demux ブロック→全パイプライン凍結、の実機で観測された連鎖）。
