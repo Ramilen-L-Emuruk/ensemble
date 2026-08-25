@@ -25,6 +25,18 @@ public interface IMediaEngine : IDisposable
     bool IsAudioOutputFailed { get; }
 
     /// <summary>
+    /// 音声出力が一定時間まったく動いていない状態。<see cref="IsAudioOutputFailed"/> と違って
+    /// <b>出力が戻れば自動で解除される</b>（ファイルを開き直す必要はない）。再生中しか真にならない。
+    /// </summary>
+    /// <remarks>
+    /// 例外を伴わずに音声出力が止まると、音が消えるうえに再生位置と映像も進まない。
+    /// これは経過時間による判定なので <see cref="IsAudioOutputFailed"/> より弱い観測にとどまる。
+    /// 表示側はこれを見て、無反応な操作を無言で受け流す代わりに状況を案内すること。
+    /// ただし<b>開き直しを強いる形の案内にはしないこと</b>（自動で解除されうるため）。
+    /// </remarks>
+    bool IsAudioStalled { get; }
+
+    /// <summary>
     /// 再生状態が変化したときに発火する。UI スレッド以外からも発火するため、
     /// 購読側でディスパッチャへ移すこと。
     /// </summary>

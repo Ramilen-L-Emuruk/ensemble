@@ -36,7 +36,10 @@ public unsafe class MediaEngine : IMediaEngine
     private List<AudioDecoder> _audioDecoders = new();
     private List<AudioTrackState> _audioStates = new();
     private Dictionary<int, int> _audioStreamToTrack = new();
-    private MultiTrackMixer? _mixer;
+    // volatile: 書き換えるのは UI スレッド（ファイル切替・破棄）だが、OnRead のフックは音声
+    // レンダースレッドからこの値を読んで「今のパイプラインのミキサーか」を判定する。
+    // 片側だけ Volatile.Read で読んでも書き込み側と対にならないので、フィールドごと揃える
+    private volatile MultiTrackMixer? _mixer;
     private WasapiOut? _wasapiOut;
 
     /// <summary>
@@ -187,6 +190,18 @@ public unsafe class MediaEngine : IMediaEngine
     public bool IsAudioOutputFailed => _audioOutputFailed;
 
     private volatile bool _audioOutputFailed;
+
+    /// <summary>
+    /// 音声出力（ミキサーの <c>Read</c>）が閾値を超えて動いていない状態。<see cref="IsAudioOutputFailed"/>
+    /// と違い、出力が戻れば自動で解除される（ファイルを開き直す必要はない）。
+    /// </summary>
+    /// <remarks>
+    /// 再生中に限って真になる。一時停止中は <c>Read</c> が止まるのが正常なので、状態を条件に含めないと
+    /// 一時停止しているだけで滞留と申告してしまう。判定は <see cref="DetectAudioStall"/> と同じ述語
+    /// （<c>AudioStallDetector</c> が唯一の定義元）を使う。
+    /// </remarks>
+    public bool IsAudioStalled =>
+        _state == CorePlaybackState.Playing && _audioStallDetector.IsStalled(Environment.TickCount64);
 
     public double PlaybackSpeed => _playbackSpeed;
 
@@ -519,9 +534,16 @@ public unsafe class MediaEngine : IMediaEngine
         if (_fmtCtx == null) return;
         if (_state == CorePlaybackState.Playing) return;
         bool wasStopped = _state == CorePlaybackState.Stopped;
+        long playTicks = Environment.TickCount64;
+        // 一時停止中はミキサーの Read が止まるため、Playing へ入る前に滞留判定の基準を置き直す。
+        // 省くと、一時停止していた時間がそのまま経過時間になり復帰直後に必ず誤検出する。
+        // **SetState より前に置く。** 後ろに置くと、その数命令の間に状態タイマーが割り込んだとき
+        // 「Playing だが基準は一時停止前のまま」を観測して誤報告しうる（Playing へ入る経路が
+        // 増えたときはそちらでも同じ順序を守ること。現状 SetState(Playing) はここだけ）
+        _audioStallDetector.Prime(playTicks);
         SetState(CorePlaybackState.Playing);
         _playbackEndedFired = false;
-        _lastFrameServedTicks = Environment.TickCount64;
+        _lastFrameServedTicks = playTicks;
         _lastPullTimestamp = Stopwatch.GetTimestamp();
         DiagnosticLog.Write("engine", $"Play wasStopped={wasStopped}");
         ReleaseHeldFrame();
@@ -739,7 +761,7 @@ public unsafe class MediaEngine : IMediaEngine
         {
             // 検疫中は「次の再生」自体が成立しない（EnsurePipelineStarted が構築を拒む）。
             // 覚えても使われない位置を表示へ反映すると、再生できるかのように見える。
-            // UI 側も NotifyIfReopenRequired で弾いているが、エンジンを直接呼ぶ経路が
+            // UI 側も NotifyIfDegraded で弾いているが、エンジンを直接呼ぶ経路が
             // 増えたときのために、約束できないことはここでも引き受けない
             if (_threadsAbandoned)
             {
@@ -922,8 +944,15 @@ public unsafe class MediaEngine : IMediaEngine
 
     private long EstimateBufferedFramesAheadOfCursor()
     {
-        if (_audioStates.Count == 0 || _mixer == null) return 0;
-        int blockAlign = _mixer.WaveFormat.BlockAlign;
+        // DetectVideoStall と同じくローカルへ捕捉してから使う。現状の呼び出し元（SetPlaybackSpeed）と
+        // null 化する側（DisposeDecoders。Close() とファイルを開く経路からしか呼ばれない）はどちらも
+        // UI スレッドなので競合しないが、フィールドを 2 度読む形は、別スレッドから呼ばれる経路が
+        // 増えた瞬間に null 参照へ化ける。
+        // なお _mixer は TeardownPipeline では null にならない（Stop→Play の再生サイクルでは
+        // 作り直されず生き続ける）。あちらで null 化される _videoRing とは寿命が違う
+        var mixer = _mixer;
+        if (_audioStates.Count == 0 || mixer == null) return 0;
+        int blockAlign = mixer.WaveFormat.BlockAlign;
         int maxBufferedBytes = _audioStates.Max(s => s.Buffer.BufferedBytes);
         return maxBufferedBytes / blockAlign;
     }
@@ -1213,7 +1242,17 @@ public unsafe class MediaEngine : IMediaEngine
         if (_mixer != null)
         {
             var audioThread = _audioDecodeThread;
-            _mixer.OnRead = () => audioThread.Wake();
+            var mixer = _mixer;
+            _mixer.OnRead = () =>
+            {
+                // 検疫で取り残された旧ミキサーは、破棄されない旧 WasapiOut から Read され続けることが
+                // ある。その Read を「音声出力は生きている」と数えると、新しいパイプラインの滞留を
+                // 見逃す（OnWasapiPlaybackStopped が sender を照合しているのと同じ理由）。
+                // _mixer は volatile 宣言済みなので、ここは素の読みでよい
+                if (ReferenceEquals(_mixer, mixer))
+                    _audioStallDetector.NoteRead(Environment.TickCount64);
+                audioThread.Wake();
+            };
         }
 
         _demuxThreadHandle = StartBackgroundThread(_demuxThread.Run);
@@ -1672,6 +1711,14 @@ public unsafe class MediaEngine : IMediaEngine
     private double _lastVideoLagSec;
     private long _lastFrameServedTicks;
     private const int VideoStallThresholdMs = 2000;
+    // 映像側より緩めてある。理由は 2 つ:
+    // ・こちらは記録が WriteFatal（既定運用でも残る）で、利用者への通知も伴うため誤検出の代償が大きい
+    // ・Play() は SetState(Playing) の後、最後の _wasapiOut.Play() まで到達するのに時間がかかる経路を
+    //   持つ（停止中シークの着地フレーム待ちで最大 500ms）。その間 Read は来ない
+    // WASAPI 共有モード・レイテンシ 100ms なので Read の周期は 50ms 前後。3 秒はその 60 回分で、
+    // 正常運用では起こりえない（バッファは 100ms しか無いので、この時点で音は完全に途切れている）
+    private const int AudioStallThresholdMs = 3000;
+    private readonly AudioStallDetector _audioStallDetector = new(AudioStallThresholdMs);
     // TryGetFrame の pull 間隔計測用（ドロップ調査ログ専用）。TickCount64 は既定タイマー分解能が粗く
     // 1フレーム予算（60fps で約16.7ms）を見るには不十分なため Stopwatch を使う
     private long _lastPullTimestamp;
@@ -1702,6 +1749,7 @@ public unsafe class MediaEngine : IMediaEngine
             DiagnosticLog.Write("pos", $"trace hwFrames={hwFrames} writeCursor={_clock.WriteCursor} pos={posSeconds:F3}");
 
         DetectVideoStall();
+        DetectAudioStall();
         CheckPlaybackEnded();
     }
 
@@ -1726,6 +1774,82 @@ public unsafe class MediaEngine : IMediaEngine
         DiagnosticLog.Write("stall",
             $"映像 {VideoStallThresholdMs}ms 以上停止 clock={GetMasterClockSeconds():F3} ring={ring.DescribeSlots()}");
         _lastFrameServedTicks = now; // 停止継続中は 2 秒おきに記録
+    }
+
+    /// <summary>
+    /// 再生中なのにミキサーの <c>Read</c> が呼ばれなくなった状態を検知して記録・通知する。
+    /// 例外を伴う異常停止は <see cref="OnWasapiPlaybackStopped"/> が拾うが、例外を出さずに
+    /// <c>Read</c> が止まる経路（デバイスが応答しなくなる等）はここでしか気づけない。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>Read</c> が止まると音が消えるだけでなく audio-master クロックが進まないため、
+    /// 位置表示と映像まで止まる。音声トラックを持たない動画も同じ（ミキサーは常に作られ、
+    /// 無音を <c>OnAudioWritten</c> に計上してクロックを進めている）ので、トラック数で条件を絞らない。
+    /// </para>
+    /// <para>
+    /// シーク中も <c>Read</c> は続く（<c>HoldOutput</c> は出力を止めるが消費は止めない）ため、
+    /// シークで基準を置き直す必要はない。置き直すのは一時停止から再生へ戻す経路だけ（<see cref="Play"/>）。
+    /// </para>
+    /// <para>
+    /// <b><c>_audioOutputFailed</c> は立てない。</b> あのフィールドは「WASAPI が例外で失敗を申告した」
+    /// という事実を指しており、立てるとファイルを開き直すまで再生・シーク・チャプター移動が UI 側の
+    /// 案内で塞がれる。経過時間による判定はそれより弱い観測なので、同じフラグへ載せると誤検出
+    /// （スリープ復帰・長時間の GC）で正常な再生の操作まで塞ぐことになる
+    /// （<c>ensemble-review.md</c> §7「事実を代理値で置き換えるな」）。
+    /// 代わりに <see cref="IsAudioStalled"/> を公開してある。あちらは出力が戻れば自動で解除されるため、
+    /// 誤検出しても開き直しを強いない。この 1 度きりの通知を見逃した利用者へ、操作のたびに
+    /// 案内を出すのは表示側の役目（<c>MainViewModel.CurrentDegradation</c>）。
+    /// </para>
+    /// </remarks>
+    private void DetectAudioStall()
+    {
+        if (_state != CorePlaybackState.Playing) return;
+        // 例外つきの異常停止は OnWasapiPlaybackStopped が既に記録・通知している。重ねて出さない
+        if (_audioOutputFailed) return;
+
+        long now = Environment.TickCount64;
+        if (!_audioStallDetector.ShouldReport(now)) return;
+
+        // 文面はこのスレッドで組み立てる。エンジンの状態を読む処理を後段へ持ち込むと、
+        // 実行される時点でパイプラインが畳まれている可能性がある
+        // 「以降ずっと止まる」と書かないこと。この滞留は自然に復旧しうるので、事後にこの 1 行だけを
+        // 読んだ人が恒久障害と誤読する（回復した場合の記録は無い。待ち行列の課題）
+        string record = $"音声出力の Read が {_audioStallDetector.ElapsedSinceLastRead(now)}ms 呼ばれていない"
+            + $"（閾値 {AudioStallThresholdMs}ms。この時点で音声・再生位置・映像はいずれも進んでいない。"
+            + $"自動復旧する場合あり）"
+            + $" clock={GetMasterClockSeconds():F3}";
+        // 記録はスレッドプールへ逃がす。WriteFatal は既定運用（デバッグモード無効）だと
+        // fatal.log 側が本経路になり、プロセス間ミューテックスの待ちとファイル I/O を伴う。
+        // このメソッドは 100ms 周期タイマーのコールバックで、TeardownPipeline の StopStatusTimer が
+        // 「実行中のコールバックの完了」を同期的に待つ。ここで直接呼ぶと、滞留に気づいた利用者が
+        // 停止やファイル切替を押した瞬間に UI スレッドがその待ちへ巻き込まれる
+        //（音が止まって最も操作したくなる場面で数百ms 固まる）。
+        // 委譲した記録は最善努力で、失われる窓が 3 つある: ①利用者が通知直後にアプリを閉じる
+        // ②音声デバイスの異常と同時にプロセスが落ちる ③スレッドプールが飽和して実行が遅れる。
+        // それでも呼び出し側を止めない方を選ぶ（coding-style.md「ログ設計」の
+        //「常に残る側はクリティカルセクション・高頻度経路で呼ばない」）。
+        // **利用者への案内はこの下で同期に出すので、窓が開いても失われない**。失うのは診断ログだけ。
+        // 前面スレッドで書けば窓は閉じられるが、アプリ終了がミューテックス待ちの分だけ延びる
+        //（窓の無いプロセスが数百ms 残る）ので採らない。
+        // 滞留 1 回につき 1 度だけなので、繰り返し投げてスレッドプールを埋めることはない
+        ThreadPool.QueueUserWorkItem(_ => DiagnosticLog.WriteFatal("audio", record));
+        // 記録を残した後、通知を出す直前にもう一度確かめる。冒頭の判定からここまでの間に
+        // OnWasapiPlaybackStopped が「開き直してください」を出していることがあり、そこへ
+        // こちらの弱い文面を重ねると警報を格下げしてしまう（OSD は上書きで、順序の保証もない）。
+        // **記録の方は止めない。** 例外が届く 3 秒前から Read が死んでいたという事実は、
+        // 事後調査でこそ効く。
+        // これは窓を狭めるだけで閉じてはいない（この判定の直後に発火されれば同じことが起きる）。
+        // 完全に潰すには OSD へ優先度を持たせる必要があり、そこまではしない。上書きされた場合も
+        // 次の操作で表示側が正しい文面（音声出力が停止しています…）を出すため、状態は自己修復する
+        if (_audioOutputFailed) return;
+        // 文面は OnWasapiPlaybackStopped と別にする。あちらは WASAPI が失敗を申告した恒久障害なので
+        // 「開き直してください」と言い切れるが、こちらは自然に回復しうる観測で、開き直しを促すと
+        // 不要な操作をさせる（回復しても訂正の通知は出ない）。
+        // ここでは復旧手段を書かず事実だけ伝える。手段の案内は、利用者が実際に操作して無反応だった
+        // ときに表示側が出す（MainViewModel の DegradationCause.AudioStalled の文面）。
+        // 「気づかせる」と「どうすればよいか伝える」を場面で分ける形にしてある
+        PlaybackFailed?.Invoke(this, "音声出力が応答していません");
     }
 
     /// <summary>
