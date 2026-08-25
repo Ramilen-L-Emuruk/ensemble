@@ -27,7 +27,7 @@
 
 待ち合わせの取りこぼしと同じ「再生が固まる」症状を、**回り続けて抜けない**ループが作ることもある。
 
-`VideoDecodeThread.HandlePacket` の `-EAGAIN` 再送ループがそれだった。脱出条件は「`SendPacket` が
+`VideoDecodeThread.HandlePacket` の `-EAGAIN` 再送ループがそれだった（`564a8d2`）。脱出条件は「`SendPacket` が
 受理する」ことだけで、受理させるための前進（`DrainAvailable` が出力を吸うこと）は別の場所が担う。
 `DrainAvailable` は停止要求中（`while (!_stopRequested && ...)`）は 1 枚も吸わずに戻るのに、
 **呼び出し側がそれを確かめずに再送し続けていた**——これが原因で、ガードがあること自体ではない。
