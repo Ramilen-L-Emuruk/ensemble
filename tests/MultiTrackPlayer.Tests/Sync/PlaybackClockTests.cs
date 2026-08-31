@@ -23,6 +23,60 @@ public sealed class PlaybackClockTests
         Assert.Equal(0.0, clock.PositionAt(clock.WriteCursor), precision: 6);
     }
 
+    // ── IsSeekPending（「今は意図的に定数を返している」ことの公開）──
+    //
+    // MediaEngine.DetectClockStall が「位置が進んでいない」を異常と判断する側で、
+    // 正常な待ち（着地待ち）を異常と呼ばないためにこれを見る。
+
+    [Fact(DisplayName = "初期状態では着地待ちではない")]
+    public void IsSeekPending_IsFalse_Initially()
+    {
+        var clock = new PlaybackClock(SampleRate);
+
+        Assert.False(clock.IsSeekPending);
+    }
+
+    [Fact(DisplayName = "BeginSeek で着地待ちになり、AnchorAt で解ける")]
+    public void IsSeekPending_IsTrue_BetweenBeginSeekAndAnchorAt()
+    {
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, 0.0);
+        clock.OnAudioWritten(SampleRate);
+
+        clock.BeginSeek(30.0);
+        Assert.True(clock.IsSeekPending);
+
+        clock.AnchorAt(clock.WriteCursor, 30.0);
+        Assert.False(clock.IsSeekPending);
+    }
+
+    [Fact(DisplayName = "着地待ちの間は位置が動かない（検出側が除外する根拠）")]
+    public void IsSeekPending_WhileTrue_PositionStaysAtTarget()
+    {
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, 0.0);
+        clock.OnAudioWritten(SampleRate);
+
+        clock.BeginSeek(30.0);
+        clock.OnSilenceWritten(SampleRate);
+
+        // 出力は進んでいるのに位置は目標のまま。これを「異常」と呼ばないために IsSeekPending が要る
+        Assert.True(clock.IsSeekPending);
+        Assert.Equal(30.0, clock.PositionAt(clock.WriteCursor), precision: 6);
+    }
+
+    [Fact(DisplayName = "Reset でも着地待ちは解ける")]
+    public void IsSeekPending_IsFalse_AfterReset()
+    {
+        var clock = new PlaybackClock(SampleRate);
+        clock.BeginSeek(10.0);
+        Assert.True(clock.IsSeekPending);
+
+        clock.Reset();
+
+        Assert.False(clock.IsSeekPending);
+    }
+
     // ── 無音（アンダーラン）から実音声へ戻ったときの再開 ──
     //
     // 回帰: これが無いと、一度アンダーランしただけで以後ずっとメディア時刻が進まなくなる。
