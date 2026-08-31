@@ -83,7 +83,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
         {
             int total = stats.DroppedFrames + stats.DisplayedFrames;
             double dropRate = total > 0 ? stats.DroppedFrames * 100.0 / total : 0.0;
-            StatusText = $"表示 {stats.DisplayedFrames} / ドロップ {stats.DroppedFrames} ({dropRate:F1}%)  映像遅延 {stats.VideoLagSec * 1000:F0}ms";
+            // 滞留中はここに出す。エンジンが検出時に出す OSD は一度きりで見逃されうるため、
+            // 続いている間ずっと見える場所を 1 つ持たせる（デバッグウィンドウの再生統計）
+            string stall = Engine.IsVideoStalled ? "  ※映像が停止しています" : "";
+            StatusText = $"表示 {stats.DisplayedFrames} / ドロップ {stats.DroppedFrames} ({dropRate:F1}%)  映像遅延 {stats.VideoLagSec * 1000:F0}ms{stall}";
         };
 
         // 読み込んだ値はプロパティ経由で入れない。OnIsDebugModeChanged が走って、いま読んだ値を
@@ -163,6 +166,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
     /// 判定で「WASAPI が例外で失敗を申告した」より弱い観測なので、開き直すまで残る形で混ぜると、
     /// 誤検出（スリープ復帰・長時間の GC）のたびに正常な再生を開き直させることになる。
     /// 自動で解ける形なら、誤検出しても出力が戻った時点で案内ごと消える。
+    /// </para>
+    /// <para>
+    /// <b><c>IMediaEngine.IsVideoStalled</c>（映像の滞留）はここに混ぜない。</b> この列挙の消費側は
+    /// 「その操作が効かない」ことを前提に案内するが、映像が止まっていても音量・ミュート・シーク・
+    /// チャプター移動・速度変更はどれも効く。混ぜると効いた操作に「効きません」と言うことになる
+    /// （<c>ensemble-review.md</c> §7——消費側の述語をそのまま使う）。映像の滞留はエンジンが検出時に
+    /// 出す通知と、デバッグウィンドウの再生統計で扱う。
     /// </para>
     /// <para>
     /// これら以外の「一時的に音が出ない状態」を混ぜないこと。シーク中のミキサー出力の保留は

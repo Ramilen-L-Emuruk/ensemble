@@ -37,6 +37,18 @@ public interface IMediaEngine : IDisposable
     bool IsAudioStalled { get; }
 
     /// <summary>
+    /// 映像フレームが一定時間提示されていない状態。<see cref="IsAudioStalled"/> と同じく
+    /// <b>出るようになれば自動で解除される</b>。再生中で、かつ映像を持つファイルでしか真にならない。
+    /// </summary>
+    /// <remarks>
+    /// 原因（デコードスレッドの異常終了・デコーダの停滞・GPU デバイスの喪失）は問わず、
+    /// 「フレームが出ていない」事実だけを表す。音声は進んでいることがあるため、利用者からは
+    /// 「音だけ流れて絵が止まる」形で見える。<see cref="IsAudioStalled"/> と同様、
+    /// <b>開き直しを強いる形の案内にはしないこと</b>。
+    /// </remarks>
+    bool IsVideoStalled { get; }
+
+    /// <summary>
     /// 再生状態が変化したときに発火する。UI スレッド以外からも発火するため、
     /// 購読側でディスパッチャへ移すこと。
     /// </summary>

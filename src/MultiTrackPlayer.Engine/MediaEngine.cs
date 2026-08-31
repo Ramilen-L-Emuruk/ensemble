@@ -192,16 +192,59 @@ public unsafe class MediaEngine : IMediaEngine
     private volatile bool _audioOutputFailed;
 
     /// <summary>
+    /// vout が異常終了した時刻。この直後は滞留検出の<b>通知</b>を控える
+    /// （<see cref="VoutFailureQuietMs"/>）。
+    /// </summary>
+    /// <remarks>
+    /// vout は停止時に「映像デバイスが失われたため…（ファイルを開き直してください）」という
+    /// <b>原因が特定できて行動もはっきりした案内</b>を出す。その直後に滞留検出が
+    /// 「映像が更新されていません」を重ねても、同じ 1 つの事故に対して説明が二重に出るだけで
+    /// 利用者の役には立たない。
+    /// <para>
+    /// <b>時刻で持つ理由。</b> 「vout が落ちた」を固定フラグにすると、停止理由に
+    /// <b>GPU から CPU 経路へのフォールバック</b>（デバイスは生きており、映像は <c>TryGetFrame</c>
+    /// 経由で出続ける）が含まれるため、復帰後に起きた<b>無関係な別の停止</b>の通知まで永久に消える。
+    /// 逆に「1 枚提示できたら解除」にすると、<c>TryLeaseDue</c> は <c>SlotSequencer</c> の状態機械
+    /// だけを見る純ロジックで GPU に触らないため、デバイス喪失後もリング内の既デコード済みフレームを
+    /// リースできてしまい、実際には描画できていないのに解除してしまう。
+    /// <b>どちらの述語も事実からずれる</b>ので、素直に「案内を出した直後か」を時刻で見る
+    /// （<c>ensemble-review.md</c> §7）。
+    /// </para>
+    /// <para>
+    /// <b>記録（<c>WriteFatal</c>）は抑えない。</b>「vout の停止後、実際に映像が止まっていた」という
+    /// 事実は事後調査でこそ効く（音声側の <see cref="_audioOutputFailed"/> と同じ判断）。
+    /// </para>
+    /// </remarks>
+    private long _lastVoutFailureTicks;
+
+    /// <summary>
+    /// vout の異常終了を案内した後、滞留の通知を控える時間。OSD の表示は 1.2 秒で消えるので、
+    /// 同じ事故の説明が続けて出ないだけの長さがあれば足りる。長く取ると、この間に起きた
+    /// 別の停止を取りこぼす。
+    /// </summary>
+    private const int VoutFailureQuietMs = 5000;
+
+    /// <summary>
     /// 音声出力（ミキサーの <c>Read</c>）が閾値を超えて動いていない状態。<see cref="IsAudioOutputFailed"/>
     /// と違い、出力が戻れば自動で解除される（ファイルを開き直す必要はない）。
     /// </summary>
     /// <remarks>
     /// 再生中に限って真になる。一時停止中は <c>Read</c> が止まるのが正常なので、状態を条件に含めないと
     /// 一時停止しているだけで滞留と申告してしまう。判定は <see cref="DetectAudioStall"/> と同じ述語
-    /// （<c>AudioStallDetector</c> が唯一の定義元）を使う。
+    /// （<c>StallDetector</c> が唯一の定義元）を使う。
     /// </remarks>
     public bool IsAudioStalled =>
         _state == CorePlaybackState.Playing && _audioStallDetector.IsStalled(Environment.TickCount64);
+
+    /// <summary>
+    /// 映像フレームが閾値を超えて提示されていない状態。<see cref="IsAudioStalled"/> と同じく、
+    /// フレームが出るようになれば自動で解除される（ファイルを開き直す必要はない）。
+    /// </summary>
+    /// <remarks>
+    /// 判定は <see cref="DetectVideoStall"/> と同じ述語（<see cref="CanObserveVideoStall"/> と
+    /// <c>StallDetector</c>）を使う。映像を持たないファイル・一時停止中は真にならない。
+    /// </remarks>
+    public bool IsVideoStalled => IsVideoStalledNow(_videoRing, Environment.TickCount64);
 
     public double PlaybackSpeed => _playbackSpeed;
 
@@ -541,9 +584,16 @@ public unsafe class MediaEngine : IMediaEngine
         // 「Playing だが基準は一時停止前のまま」を観測して誤報告しうる（Playing へ入る経路が
         // 増えたときはそちらでも同じ順序を守ること。現状 SetState(Playing) はここだけ）
         _audioStallDetector.Prime(playTicks);
+        _videoStallDetector.Prime(playTicks);
+        // 猶予を置くのは「新しいプリロール待ちが始まるとき」だけ。既に待っている最中の再開で
+        // 置き直すと、映像が固まって困った利用者が一時停止→再生を押し直すたびに猶予が延び、
+        // **最も拾いたい障害（プリロールが永久に解けない）が永久に黙る**。
+        // 停止からの再生は下の wasStopped 分岐が Seek を通り、そちらで置き直される
+        if (!_prerollGate.IsWaitingForPreroll)
+            Volatile.Write(ref _prerollGraceUntilTicks, playTicks + PrerollGraceMs);
         SetState(CorePlaybackState.Playing);
         _playbackEndedFired = false;
-        _lastFrameServedTicks = playTicks;
+        _lastVideoStallLogTicks = playTicks;
         _lastPullTimestamp = Stopwatch.GetTimestamp();
         DiagnosticLog.Write("engine", $"Play wasStopped={wasStopped}");
         ReleaseHeldFrame();
@@ -830,7 +880,14 @@ public unsafe class MediaEngine : IMediaEngine
         // リングの Flush 回数に依存する予測だったため、シーク前の残骸フレームを掴んでしまっていた
         SeekEpoch epoch = demuxThread.RequestSeek(target);
         _playbackEndedFired = false;
-        _lastFrameServedTicks = Environment.TickCount64;
+        long seekTicks = Environment.TickCount64;
+        // シーク直後はフレームが来るまで間があく。基準を置き直さないとその間を滞留と数える
+        _videoStallDetector.Prime(seekTicks);
+        _lastVideoStallLogTicks = seekTicks;
+        // プリロール待ちを正常と見なす猶予の起点。シークは（保留が解けていなくても）
+        // BeginSeek で待ちを作り直すので、ここは無条件に置き直してよい。
+        // 一方 Play() は待ち中なら置き直さない（理由はあちらのコメント）
+        Volatile.Write(ref _prerollGraceUntilTicks, seekTicks + PrerollGraceMs);
         _lastPullTimestamp = Stopwatch.GetTimestamp();
 
         // 再生中以外のシークは、着地後の最初のフレームを即座に1枚だけ表示する。
@@ -986,6 +1043,8 @@ public unsafe class MediaEngine : IMediaEngine
 
         if (_state == CorePlaybackState.Playing)
         {
+            // 提示できたかに関わらず、問いかけが来たこと自体をここで記録する
+            Volatile.Write(ref _lastVideoPullTicks, Environment.TickCount64);
             long pullNow = Stopwatch.GetTimestamp();
             double gapSincePrevPullMs = _lastPullTimestamp == 0
                 ? 0.0
@@ -1003,7 +1062,7 @@ public unsafe class MediaEngine : IMediaEngine
 
             _displayedFrames++;
             _lastVideoLagSec = lease.Pts.TotalSeconds - position.TotalSeconds;
-            _lastFrameServedTicks = Environment.TickCount64;
+            _videoStallDetector.NoteActivity(Environment.TickCount64);
             return lease;
         }
 
@@ -1250,7 +1309,7 @@ public unsafe class MediaEngine : IMediaEngine
                 // 見逃す（OnWasapiPlaybackStopped が sender を照合しているのと同じ理由）。
                 // _mixer は volatile 宣言済みなので、ここは素の読みでよい
                 if (ReferenceEquals(_mixer, mixer))
-                    _audioStallDetector.NoteRead(Environment.TickCount64);
+                    _audioStallDetector.NoteActivity(Environment.TickCount64);
                 audioThread.Wake();
             };
         }
@@ -1384,8 +1443,9 @@ public unsafe class MediaEngine : IMediaEngine
                 }
                 // 世代もここで見る。_voutRunning だけを見ると、停止待ちがタイムアウトした旧スレッドが
                 // 新セッションの立て直した true を素通りし、この下の共有統計フィールド
-                //（_lastVoutPull / _droppedFrames / _displayedFrames / _lastFrameServedTicks /
-                //   _lastVideoLagSec。いずれも非ロック）を新 vout と競合しながら書き換えてしまう
+                //（_lastVoutPull / _droppedFrames / _displayedFrames / _lastVideoLagSec。
+                //   いずれも非ロック。滞留検出の基準時刻は _videoStallDetector が Volatile で持つ）を
+                //   新 vout と競合しながら書き換えてしまう
                 if (!_voutRunning || generation != _voutGeneration) break;
 
                 long pullNow = Stopwatch.GetTimestamp();
@@ -1408,6 +1468,9 @@ public unsafe class MediaEngine : IMediaEngine
                         ownedByVout = false;
                     }
 
+                    // 提示できたかに関わらず、このスレッドがリングへ問いかけたこと自体を記録する
+                    // （CPU 経路の TryGetFrame と対称。滞留の観測可否の判断に使う）
+                    Volatile.Write(ref _lastVideoPullTicks, Environment.TickCount64);
                     double clock = GetMasterClockSeconds();
                     if (ring.TryLeaseDue(clock, _videoFrameDuration, out var lease, out int dropped) && lease != null)
                     {
@@ -1420,7 +1483,7 @@ public unsafe class MediaEngine : IMediaEngine
                         currentSlot = lease.SlotIndex;
                         ownedByVout = true;
                         _displayedFrames++;
-                        _lastFrameServedTicks = Environment.TickCount64;
+                        _videoStallDetector.NoteActivity(Environment.TickCount64);
                         _lastVideoLagSec = lease.Pts.TotalSeconds - clock;
                     }
                     // due 無し: currentSlot を維持し、下で前フレームを再提示する。
@@ -1515,6 +1578,8 @@ public unsafe class MediaEngine : IMediaEngine
         if (generation != _voutGeneration) return;
 
         _voutRunning = false;
+        // この直後に滞留検出が「映像が更新されていません」を重ねても二重説明になるだけなので控える
+        Volatile.Write(ref _lastVoutFailureTicks, Environment.TickCount64);
         // 破棄済みの presenter を指したままにすると IsVideoOutputActive が真を返し続け、
         // 「vout が動いていない＝_swapPresenter は null」という StopVideoOutput 側の不変条件が崩れる。
         // 世代一致を確認済みなので、他スレッドの後始末と競合しない
@@ -1709,8 +1774,59 @@ public unsafe class MediaEngine : IMediaEngine
     // ── ステータス通知（100ms 周期。映像フレーム配送は UI 側の CompositionTarget.Rendering がプルする）──
 
     private double _lastVideoLagSec;
-    private long _lastFrameServedTicks;
-    private const int VideoStallThresholdMs = 2000;
+    /// <summary>
+    /// 診断ログに滞留を書く周期。滞留が続く間これだけ間隔をあけて繰り返し記録する
+    /// （リングの状態を時系列で見るための開発用。利用者への通知とは別物）。
+    /// </summary>
+    private const int VideoStallLogIntervalMs = 2000;
+    private long _lastVideoStallLogTicks;
+    /// <summary>
+    /// 映像の滞留と判定する閾値。<see cref="AudioStallThresholdMs"/> と同じ 3 秒にしてある。
+    /// 記録・通知はどちらもこの閾値で始まり、記録だけがその後
+    /// <see cref="VideoStallLogIntervalMs"/> おきに繰り返される。
+    /// <para>
+    /// 3 秒にした理由: 遅いディスク・ネットワーク越しの読み込みで demux が詰まると 2 秒級の停止は
+    /// 起こりうる。またファイル終端では音声のバッファ（充填ゲートの 1 秒ぶん）を吐き切るまで映像が
+    /// 止まるので、そこを誤って掴まないための余裕でもある。
+    /// </para>
+    /// </summary>
+    private const int VideoStallNotifyThresholdMs = 3000;
+    private readonly StallDetector _videoStallDetector = new(VideoStallNotifyThresholdMs);
+    /// <summary>
+    /// 消費側が最後にフレームを要求した時刻。<b>「出せたか」ではなく「聞かれたか」</b>を別に持つ。
+    /// </summary>
+    /// <remarks>
+    /// <b>この値で観測を止めるのは CPU 経路だけ</b>（<see cref="CanObserveVideoStall"/> 参照）。
+    /// CPU 経路の提示は UI の <c>CompositionTarget.Rendering</c> 駆動で、ウィンドウが最小化されると
+    /// 発火が止まりうる。そのとき提示が無いのは異常ではなく、こちらが問われていないだけ。
+    /// <para>
+    /// GPU 経路の vout スレッドは自前の vsync ループなので、最小化しても回り続ける
+    /// （<c>SwapChainVideoPresenter.TryPresent</c> は負の HRESULT だけを失敗扱いにし、
+    /// 最小化中に返る <c>DXGI_STATUS_OCCLUDED</c> は成功コードなので抜けない）。
+    /// <b>あちらでプルが途絶えるのは vout が死んだか無言でハングしたときだけで、それは
+    /// まさに通知したい異常</b>。同じガードを当てると、その異常を「聞かれていない」と誤って
+    /// 解釈して永久に黙ることになる。記録のためにこのフィールドは両経路で更新する。
+    /// </para>
+    /// </remarks>
+    private long _lastVideoPullTicks;
+    /// <summary>
+    /// この時間プルが来ていなければ CPU 経路の消費側が問いかけていないと判断する。
+    /// <c>CompositionTarget.Rendering</c> は約 16ms 周期（60Hz）なので 1 秒は十分に余裕がある。
+    /// </summary>
+    private const int VideoPullAliveWindowMs = 1000;
+    /// <summary>
+    /// シーク後のプリロール待ちを「正常な待ち」として扱う猶予。これを超えて解けない保留は
+    /// 待ち合わせの取りこぼし（<c>ensemble-review.md</c> §1）の疑いがあるため、観測を再開して
+    /// 記録・通知の対象に戻す。
+    /// <para>
+    /// 猶予を設けずに保留中を一律で除外すると、<b>このプロジェクトで最も再発実績のある障害
+    /// （プリロールが永久に解けない）だけが記録に残らない</b>ことになる。しかもその状態では
+    /// ミキサーの <c>Read</c> は続くため <see cref="IsAudioStalled"/> も鳴らず、
+    /// 音も映像も出ないまま痕跡がゼロになる。
+    /// </para>
+    /// </summary>
+    private const int PrerollGraceMs = 5000;
+    private long _prerollGraceUntilTicks;
     // 映像側より緩めてある。理由は 2 つ:
     // ・こちらは記録が WriteFatal（既定運用でも残る）で、利用者への通知も伴うため誤検出の代償が大きい
     // ・Play() は SetState(Playing) の後、最後の _wasapiOut.Play() まで到達するのに時間がかかる経路を
@@ -1718,7 +1834,7 @@ public unsafe class MediaEngine : IMediaEngine
     // WASAPI 共有モード・レイテンシ 100ms なので Read の周期は 50ms 前後。3 秒はその 60 回分で、
     // 正常運用では起こりえない（バッファは 100ms しか無いので、この時点で音は完全に途切れている）
     private const int AudioStallThresholdMs = 3000;
-    private readonly AudioStallDetector _audioStallDetector = new(AudioStallThresholdMs);
+    private readonly StallDetector _audioStallDetector = new(AudioStallThresholdMs);
     // TryGetFrame の pull 間隔計測用（ドロップ調査ログ専用）。TickCount64 は既定タイマー分解能が粗く
     // 1フレーム予算（60fps で約16.7ms）を見るには不十分なため Stopwatch を使う
     private long _lastPullTimestamp;
@@ -1754,27 +1870,126 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     /// <summary>
-    /// 再生中なのに映像フレームが一定時間配送されていない状態を検知して診断ログに残す。
-    /// 「音声だけ流れて映像が止まる」系の不具合が再発した場合、リングの内部状態がここで採取される。
+    /// 再生中なのに映像フレームが提示されなくなった状態を検知して記録・通知する
+    /// （<see cref="DetectAudioStall"/> の映像版）。
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 原因を問わず<b>「フレームが出ていない」という事実だけ</b>を見る。デコードスレッドの異常終了・
+    /// デコーダが前進しなくなる・GPU デバイスの喪失・リングの枯渇はどれも別の機構だが、
+    /// 利用者から見た症状は同じ（映像が固まる）で、いずれもここ 1 箇所で拾える。
+    /// そのため <c>VideoDecodeThread</c> 側に通知のコールバックは足していない。
+    /// </para>
+    /// <para>
+    /// <b>リングが EOF でも抑制しない。</b> 抑制すると <c>AbandonVideoPipeline</c>
+    /// （デコードスレッドの異常終了。あそこは <c>MarkEof</c> を呼ぶ）が黙ってしまう。
+    /// ファイル終端の側は、音声のバッファを吐き切って再生完了に落ちるまでが閾値より短いので
+    /// ここへは来ない。<b>ただし映像ストリームだけが音声より 3 秒以上早く終わるファイルでは
+    /// 誤検知する</b>（実在は稀。尺の比較で判定しようとすると VFR・録画ファイルで外す）。
+    /// </para>
+    /// <para>
+    /// <b><c>IsAudioOutputFailed</c> のような固定フラグは立てない。</b> 映像は復帰しうるので、
+    /// 出るようになれば自動で解ける <see cref="IsVideoStalled"/> として公開する。
+    /// </para>
+    /// </remarks>
     private void DetectVideoStall()
     {
-        if (!DiagnosticLog.Enabled) return;
         // TryHoldNextFrame と同じくローカルへ捕捉してから使う。このメソッドは状態タイマー
         //（ThreadPool）から呼ばれる一方 _videoRing を null にするのは UI スレッドなので、
         // null チェックと実際の参照でフィールドを 2 度読むと、その間に null 化されうる
         //（通常は StopStatusTimer が実行中のコールバックの完了を待つが、その待ちが
         // タイムアウトした縮退経路では待たずに破棄が進む）
         var ring = _videoRing;
-        if (_state != CorePlaybackState.Playing || _videoDecoder == null || ring == null) return;
-
         long now = Environment.TickCount64;
-        if (now - _lastFrameServedTicks < VideoStallThresholdMs) return;
+        if (!IsVideoStalledNow(ring, now)) return;
 
-        DiagnosticLog.Write("stall",
-            $"映像 {VideoStallThresholdMs}ms 以上停止 clock={GetMasterClockSeconds():F3} ring={ring.DescribeSlots()}");
-        _lastFrameServedTicks = now; // 停止継続中は 2 秒おきに記録
+        // 診断ログは滞留が続く間 2 秒おきに繰り返す（リングの状態を時系列で追うため）。
+        // 周期の管理を専用フィールドで持つのが要点で、以前は判定に使う「最後にフレームを出した時刻」
+        // 自体を書き換えて周期を作っていた。事実とログの都合を 1 つのフィールドで兼ねていたため、
+        // ここに「一度だけ通知」を足すと経過時間が記録のたびに 0 へ戻り、状態が点滅する
+        // Enabled を明示的に見るのは、文字列補間が Write の中の判定より先に評価されるため。
+        // DescribeSlots() はリングのロックを取るので、診断ログ無効時に走らせる意味がない
+        if (DiagnosticLog.Enabled && now - _lastVideoStallLogTicks >= VideoStallLogIntervalMs)
+        {
+            _lastVideoStallLogTicks = now;
+            DiagnosticLog.Write("stall",
+                $"映像 {_videoStallDetector.ElapsedSinceLastActivity(now)}ms 停止 "
+                + $"clock={GetMasterClockSeconds():F3} ring={ring!.DescribeSlots()}");
+        }
+
+        if (!_videoStallDetector.ShouldReport(now)) return;
+
+        // 文面はこのスレッドで組み立てる。エンジンの状態を読む処理を後段へ持ち込むと、
+        // 実行される時点でパイプラインが畳まれている可能性がある
+        string record = $"映像フレームが {_videoStallDetector.ElapsedSinceLastActivity(now)}ms 提示されていない"
+            + $"（閾値 {VideoStallNotifyThresholdMs}ms。音声と再生位置は進んでいることがある。"
+            + $"自動復旧する場合あり） clock={GetMasterClockSeconds():F3}"
+            // プリロール待ちのまま猶予を過ぎた場合は、原因の当たりが全く違う（待ち合わせの
+            // 取りこぼしの疑い）。切り分けに要るので状態を添える
+            + $" preroll待ち={_prerollGate.IsWaitingForPreroll} ring={ring!.DescribeSlots()}";
+        // 記録はスレッドプールへ逃がす。理由は DetectAudioStall と同じ（WriteFatal は既定運用で
+        // プロセス間ミューテックスとファイル I/O を伴い、StopStatusTimer の停止待ちを通じて
+        // UI 操作を数百ms 止める）。失う窓と、それでも委譲を選ぶ理由もあちらに書いてある
+        ThreadPool.QueueUserWorkItem(_ => DiagnosticLog.WriteFatal("video", record));
+        // 通知の直前にもう一度確かめる。ここまでの間に音声側の恒久障害（開き直しが必要）が
+        // 通知されていることがあり、そこへ映像の弱い文面を重ねると警報を格下げしてしまう
+        //（OSD は上書きで順序の保証もない）。記録の方は止めない
+        if (_audioOutputFailed || _threadsAbandoned) return;
+        // vout の異常終了を案内した直後は、同じ事故の二重説明になるので通知しない（記録は済んでいる）
+        if (now - Volatile.Read(ref _lastVoutFailureTicks) < VoutFailureQuietMs) return;
+        PlaybackFailed?.Invoke(this, "映像が更新されていません");
     }
+
+    /// <summary>
+    /// 映像の滞留を観測してよい状態か。<see cref="IsVideoStalled"/> と <see cref="DetectVideoStall"/> が
+    /// 同じ述語を使うよう、定義はここ 1 箇所に置く（言い換えた瞬間に両者の範囲がずれる）。
+    /// </summary>
+    /// <remarks>
+    /// 再生中でない場合・リングが未構築の場合も対象外（そもそも提示が起きない）。そのうえで、
+    /// <b>提示が止まっていても異常ではない</b>状態を 3 つ除外している。これを混ぜると健全な再生を
+    /// 「壊れている」と呼ぶことになる。
+    /// <list type="number">
+    /// <item>映像を持たないファイル（<c>_videoDecoder</c> が null）。フレームは永遠に来ない</item>
+    /// <item><b>CPU 経路で</b>消費側が問いかけていない（プルが途絶えた）。ウィンドウの最小化で
+    /// <c>CompositionTarget.Rendering</c> が止まりうる。答えられなかったのではなく聞かれていない。
+    /// GPU 経路に同じ判定を当てないのは <see cref="_lastVideoPullTicks"/> の remarks を参照
+    /// （あちらでプルが途絶えるのは vout の死亡・ハングだけで、それは通知したい異常）</item>
+    /// <item>シーク後のプリロール待ち。着地フレームが出るまで提示は止まるが、それは正常な待ち。
+    /// ネットワーク越し・大容量・ロング GOP では閾値を超えることがある。<b>ただし猶予付き</b>
+    /// （<see cref="PrerollGraceMs"/>）。永久に解けない保留を無条件に除外すると、
+    /// 最も再発実績のある障害だけが記録に残らない</item>
+    /// </list>
+    /// </remarks>
+    private bool CanObserveVideoStall(IVideoFrameRing? ring, long nowTicks)
+    {
+        if (_state != CorePlaybackState.Playing || _videoDecoder == null || ring == null) return false;
+        // CPU 経路だけプルの生存を要求する（GPU 経路は vout が回り続けるのが正常）
+        if (!IsVideoOutputActive
+            && nowTicks - Volatile.Read(ref _lastVideoPullTicks) >= VideoPullAliveWindowMs) return false;
+        return !IsWithinPrerollGrace(nowTicks);
+    }
+
+    /// <summary>
+    /// シーク後のプリロールを待っている、かつその待ちが猶予の内側か。
+    /// 猶予を過ぎた保留は正常な待ちとは見なさない（<see cref="PrerollGraceMs"/> の説明を参照）。
+    /// </summary>
+    private bool IsWithinPrerollGrace(long nowTicks) =>
+        _prerollGate.IsWaitingForPreroll
+        && nowTicks - Volatile.Read(ref _prerollGraceUntilTicks) < 0;
+
+    /// <summary>
+    /// いま映像が滞留しているか。<see cref="IsVideoStalled"/> と <see cref="DetectVideoStall"/> の
+    /// 共通の判定。<paramref name="ring"/> は呼び出し側がローカルへ捕捉した参照を渡すこと。
+    /// </summary>
+    /// <remarks>
+    /// 最後の条件が要点。<b>Ready なフレームがあって、どれもまだ due でないなら健全</b>——次のフレームの
+    /// 時刻を待っているだけ。低フレームレート・VFR の動画ではフレーム間隔が数秒に達することがあり、
+    /// これを見ないと健全な再生を滞留と呼ぶ（<c>ensemble-review.md</c> §7 の代理値）。
+    /// </remarks>
+    private bool IsVideoStalledNow(IVideoFrameRing? ring, long nowTicks) =>
+        CanObserveVideoStall(ring, nowTicks)
+        && _videoStallDetector.IsStalled(nowTicks)
+        && !ring!.IsWaitingForFrameTime(GetMasterClockSeconds(), _videoFrameDuration);
 
     /// <summary>
     /// 再生中なのにミキサーの <c>Read</c> が呼ばれなくなった状態を検知して記録・通知する。
@@ -1815,7 +2030,7 @@ public unsafe class MediaEngine : IMediaEngine
         // 実行される時点でパイプラインが畳まれている可能性がある
         // 「以降ずっと止まる」と書かないこと。この滞留は自然に復旧しうるので、事後にこの 1 行だけを
         // 読んだ人が恒久障害と誤読する（回復した場合の記録は無い。待ち行列の課題）
-        string record = $"音声出力の Read が {_audioStallDetector.ElapsedSinceLastRead(now)}ms 呼ばれていない"
+        string record = $"音声出力の Read が {_audioStallDetector.ElapsedSinceLastActivity(now)}ms 呼ばれていない"
             + $"（閾値 {AudioStallThresholdMs}ms。この時点で音声・再生位置・映像はいずれも進んでいない。"
             + $"自動復旧する場合あり）"
             + $" clock={GetMasterClockSeconds():F3}";

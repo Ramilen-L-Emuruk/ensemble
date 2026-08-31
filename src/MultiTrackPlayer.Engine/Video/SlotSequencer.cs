@@ -185,11 +185,7 @@ public sealed class SlotSequencer
     {
         lock (_lock)
         {
-            var candidates = new List<CandidateFrame>();
-            for (int i = 0; i < _slots.Length; i++)
-                if (_slots[i].State == SlotState.Ready)
-                    candidates.Add(new CandidateFrame(i, _slots[i].PtsSeconds));
-            candidates.Sort((a, b) => a.Pts.CompareTo(b.Pts));
+            var candidates = CollectReadyLocked();
 
             var selection = FrameSelector.SelectDue(candidates, clockPositionSeconds, frameDurationSeconds);
             droppedCount = selection.DroppedCount;
@@ -218,6 +214,53 @@ public sealed class SlotSequencer
             ptsSeconds = _slots[chosen].PtsSeconds;
             return true;
         }
+    }
+
+    /// <summary>
+    /// Ready なフレームを持っているが、どれもまだ due になっていない状態か。
+    /// <b>「提示が止まっている」ことが異常かどうかを判断するために要る。</b>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 低フレームレート・VFR の動画では、フレーム間隔が数秒に達することがある。その間は健全に
+    /// 再生していても提示は起きない。「提示が無い」だけを見て異常と判断すると、そういう動画を
+    /// 壊れていると呼ぶことになる（<c>ensemble-review.md</c> §7 の代理値）。
+    /// </para>
+    /// <para>
+    /// Ready が 1 枚も無い場合は <c>false</c>。それは「時刻を待っている」のではなく
+    /// 「供給が止まっている」状態で、区別しないと本物の異常を取りこぼす。
+    /// </para>
+    /// <para>
+    /// due の判定は <see cref="TryLeaseDue"/> と同じ <see cref="FrameSelector.SelectDue"/> を通す。
+    /// 述語を書き写すと、片方の閾値を変えたときにもう片方がずれる。
+    /// </para>
+    /// <para>
+    /// <b>既知の限界</b>: <paramref name="clockPositionSeconds"/> が進まなくなった場合、Ready が
+    /// いつまでも due にならないため「時刻待ち」と答え続ける。クロック自体の停滞と低フレームレートは
+    /// この関数からは区別できない（渡された時刻しか知らないため）。クロックの異常は
+    /// <c>WasapiPositionSource</c> が単調性を検査して <c>FallbackPositionSource</c> へ切り替える
+    /// 別の仕組みで扱う。
+    /// </para>
+    /// </remarks>
+    public bool IsWaitingForFrameTime(double clockPositionSeconds, double frameDurationSeconds)
+    {
+        lock (_lock)
+        {
+            var candidates = CollectReadyLocked();
+            if (candidates.Count == 0) return false;
+            return FrameSelector.SelectDue(candidates, clockPositionSeconds, frameDurationSeconds).SlotIndex is null;
+        }
+    }
+
+    /// <summary>Ready スロットを Pts 昇順で集める（<see cref="FrameSelector"/> がその順序を前提にする）。</summary>
+    private List<CandidateFrame> CollectReadyLocked()
+    {
+        var candidates = new List<CandidateFrame>();
+        for (int i = 0; i < _slots.Length; i++)
+            if (_slots[i].State == SlotState.Ready)
+                candidates.Add(new CandidateFrame(i, _slots[i].PtsSeconds));
+        candidates.Sort((a, b) => a.Pts.CompareTo(b.Pts));
+        return candidates;
     }
 
     /// <summary>

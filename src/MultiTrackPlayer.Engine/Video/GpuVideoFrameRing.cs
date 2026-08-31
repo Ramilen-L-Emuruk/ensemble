@@ -166,6 +166,10 @@ public sealed class GpuVideoFrameRing : IVideoFrameRing
     /// </summary>
     public bool Flush(SeekEpoch epoch) => _seq.Flush(epoch);
 
+    /// <summary>Ready はあるがどれもまだ due でないか（<see cref="SlotSequencer.IsWaitingForFrameTime"/>）。</summary>
+    public bool IsWaitingForFrameTime(double clockPositionSeconds, double frameDurationSeconds) =>
+        _seq.IsWaitingForFrameTime(clockPositionSeconds, frameDurationSeconds);
+
     /// <summary>診断用: 全スロットの状態スナップショット。</summary>
     public string DescribeSlots() => _seq.DescribeSlots();
 

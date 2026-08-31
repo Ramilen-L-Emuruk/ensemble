@@ -1,17 +1,18 @@
-using MultiTrackPlayer.Engine.Audio;
+using MultiTrackPlayer.Engine.Diagnostics;
 
-namespace MultiTrackPlayer.Tests.Audio;
+namespace MultiTrackPlayer.Tests.Diagnostics;
 
 /// <summary>
-/// 音声出力の滞留検出。時刻は呼び出し側が渡す設計なので、実時間を待たずに検証できる。
+/// 滞留検出（音声出力の <c>Read</c> と映像フレームの提示で共用）。
+/// 時刻は呼び出し側が渡す設計なので、実時間を待たずに検証できる。
 /// </summary>
-public class AudioStallDetectorTests
+public class StallDetectorTests
 {
     private const int ThresholdMs = 3000;
 
-    private static AudioStallDetector CreatePrimed(long primeAtTicks = 1000)
+    private static StallDetector CreatePrimed(long primeAtTicks = 1000)
     {
-        var detector = new AudioStallDetector(ThresholdMs);
+        var detector = new StallDetector(ThresholdMs);
         detector.Prime(primeAtTicks);
         return detector;
     }
@@ -50,13 +51,13 @@ public class AudioStallDetectorTests
     /// 検出器はアプリ寿命の <c>MediaEngine</c> が持つため、抑制が解けないと 2 度目の障害を見逃す
     /// （ensemble-review.md §7 の寿命の食い違い）。
     /// </summary>
-    [Fact(DisplayName = "Read が戻れば抑制が解け、次の滞留で改めて報告する")]
+    [Fact(DisplayName = "活動が戻れば抑制が解け、次の滞留で改めて報告する")]
     public void ShouldReport_AfterRecovery_ReportsAgain()
     {
         var detector = CreatePrimed(1000);
         Assert.True(detector.ShouldReport(1000 + ThresholdMs));
 
-        detector.NoteRead(10000); // 復帰
+        detector.NoteActivity(10000); // 復帰
         Assert.False(detector.ShouldReport(10000));
 
         Assert.True(detector.ShouldReport(10000 + ThresholdMs));
@@ -68,19 +69,19 @@ public class AudioStallDetectorTests
         var detector = CreatePrimed(1000);
         Assert.True(detector.ShouldReport(1000 + ThresholdMs));
 
-        detector.NoteRead(10000);
+        detector.NoteActivity(10000);
         // ShouldReport を挟まずに次の滞留へ入っても、閾値超過は 1 度報告される
         Assert.True(detector.ShouldReport(10000 + ThresholdMs));
     }
 
-    [Fact(DisplayName = "NoteRead が基準時刻を進める")]
-    public void NoteRead_MovesBaseline()
+    [Fact(DisplayName = "NoteActivity が基準時刻を進める")]
+    public void NoteActivity_MovesBaseline()
     {
         var detector = CreatePrimed(1000);
 
-        detector.NoteRead(1000 + ThresholdMs - 1);
+        detector.NoteActivity(1000 + ThresholdMs - 1);
 
-        // 直前の Read から測り直すため、Prime 時刻からは閾値を超えていても報告しない
+        // 直前の活動から測り直すため、Prime 時刻からは閾値を超えていても報告しない
         Assert.False(detector.ShouldReport(1000 + ThresholdMs));
         Assert.True(detector.ShouldReport(1000 + ThresholdMs * 2));
     }
@@ -97,7 +98,7 @@ public class AudioStallDetectorTests
     }
 
     /// <summary>
-    /// 一時停止から再生へ戻すと、Read が止まっていた時間がそのまま経過時間になる。
+    /// 一時停止から再生へ戻すと、活動が止まっていた時間がそのまま経過時間になる。
     /// <c>Prime</c> がこれを吸収しないと、復帰直後に必ず誤検出する。
     /// </summary>
     [Fact(DisplayName = "長く滞留した後の Prime は報告済みの抑制も解除する")]
@@ -112,15 +113,15 @@ public class AudioStallDetectorTests
         Assert.True(detector.ShouldReport(600000 + ThresholdMs));
     }
 
-    [Fact(DisplayName = "ElapsedSinceLastRead は直近の Read からの経過を返す")]
-    public void ElapsedSinceLastRead_MeasuresFromLastRead()
+    [Fact(DisplayName = "ElapsedSinceLastActivity は直近の活動からの経過を返す")]
+    public void ElapsedSinceLastActivity_MeasuresFromLastActivity()
     {
         var detector = CreatePrimed(1000);
 
-        Assert.Equal(500, detector.ElapsedSinceLastRead(1500));
+        Assert.Equal(500, detector.ElapsedSinceLastActivity(1500));
 
-        detector.NoteRead(2000);
-        Assert.Equal(1000, detector.ElapsedSinceLastRead(3000));
+        detector.NoteActivity(2000);
+        Assert.Equal(1000, detector.ElapsedSinceLastActivity(3000));
     }
 
     [Theory(DisplayName = "IsStalled は ShouldReport と同じ閾値で切り替わる")]
@@ -149,13 +150,13 @@ public class AudioStallDetectorTests
         Assert.True(detector.ShouldReport(1000 + ThresholdMs));
     }
 
-    [Fact(DisplayName = "Read が戻れば IsStalled は自動で false へ戻る")]
+    [Fact(DisplayName = "活動が戻れば IsStalled は自動で false へ戻る")]
     public void IsStalled_AfterRead_IsFalse()
     {
         var detector = CreatePrimed(1000);
         Assert.True(detector.IsStalled(1000 + ThresholdMs));
 
-        detector.NoteRead(1000 + ThresholdMs);
+        detector.NoteActivity(1000 + ThresholdMs);
 
         Assert.False(detector.IsStalled(1000 + ThresholdMs));
     }
@@ -165,6 +166,6 @@ public class AudioStallDetectorTests
     [InlineData(-1)]
     public void Constructor_RejectsNonPositiveThreshold(int thresholdMs)
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => new AudioStallDetector(thresholdMs));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new StallDetector(thresholdMs));
     }
 }

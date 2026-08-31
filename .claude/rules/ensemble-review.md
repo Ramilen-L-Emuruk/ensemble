@@ -123,9 +123,9 @@
 | ルート | `SeekEpoch` |
 | `Pipeline/` | `BoundedSerialQueue` |
 | `Sync/` | `PlaybackClock` / `PrerollGate` |
-| `Audio/` | `PrerollCalculator` / `MultiTrackMixer` / `ResampleFailureTracker` / `AudioStallDetector` |
+| `Audio/` | `PrerollCalculator` / `MultiTrackMixer` / `ResampleFailureTracker` |
 | `Video/` | `FrameSelector` / `SlotSequencer` / `VideoFrameRing` |
-| `Diagnostics/` | `DiagnosticLog` |
+| `Diagnostics/` | `DiagnosticLog` / `StallDetector` |
 | `Thumbnails/` | `ThumbnailPlan` |
 | `Core/Models/` | `PlaylistCursor` / `ChapterMarkers` / `PlaybackStartDecision` |
 

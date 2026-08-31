@@ -43,10 +43,10 @@ src/
 │   │                         スワップチェーンの vsync 提示）
 │   ├── Video/                映像フレームリング（GPU/CPU）とスロット状態機械（SlotSequencer）・due フレーム選択
 │   ├── Sync/                 audio-master 再生クロック・シーク後のプリロール待ち合わせ
-│   ├── Audio/                マルチトラックミキサー・トラック状態・音声出力の滞留検出
+│   ├── Audio/                マルチトラックミキサー・トラック状態
 │   ├── Thumbnails/           シークバー用サムネイル生成・キャッシュ
 │   ├── Utilities/            ハードウェアデバイス生成等のユーティリティ
-│   └── Diagnostics/          診断ログ
+│   └── Diagnostics/          診断ログ・滞留検出（音声・映像の停止を経過時間で検出）
 └── MultiTrackPlayer.UI/       WPF アプリ・MVVM ViewModel・XAML ビュー
     ├── Controls/              シークバー等のカスタムコントロール
     ├── Rendering/             D3DImage ブリッジ・映像子ウィンドウ（HwndHost）
