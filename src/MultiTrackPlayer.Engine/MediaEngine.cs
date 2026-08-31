@@ -624,7 +624,8 @@ public unsafe class MediaEngine : IMediaEngine
                 // 着地までに閾値を超えた場合（大容量・ネットワーク越し・ロング GOP）に
                 // 「着地して正常に再開した瞬間」を滞留と誤報告する。着地後も実ハードウェア位置が
                 // 新セグメントへ入るまでは PositionAt が定数を返すため、活動の記録も遅れる
-                PrimeClockStallDetector(Environment.TickCount64);
+                // 理由の文面は fatal.log に出るので、内部の比喩（錨・着地）を使わない
+                PrimeClockStallDetector(Environment.TickCount64, "シーク後の位置確定");
                 DiagnosticLog.Write("clock", $"anchor 確定 cursor={_clock.WriteCursor} pts={_pendingAnchorTarget:F3}");
             }
             _clock.OnAudioWritten(frames);
@@ -643,9 +644,13 @@ public unsafe class MediaEngine : IMediaEngine
         // **SetState より前に置く。** 後ろに置くと、その数命令の間に状態タイマーが割り込んだとき
         // 「Playing だが基準は一時停止前のまま」を観測して誤報告しうる（Playing へ入る経路が
         // 増えたときはそちらでも同じ順序を守ること。現状 SetState(Playing) はここだけ）
-        _audioStallDetector.Prime(playTicks);
-        _videoStallDetector.Prime(playTicks);
-        PrimeClockStallDetector(playTicks);
+        // Prime は報告済みの滞留を捨てるため、戻り値を見て打ち切りを記録する
+        //（捨てた事実を残さないと、記録の「滞留だけがある」状態の意味が定まらない）
+        if (_audioStallDetector.Prime(playTicks) is long audioStalledMs)
+            RecordStallAbandoned("audio", "音声出力の Read", "再生の再開", audioStalledMs);
+        if (_videoStallDetector.Prime(playTicks) is long videoStalledMs)
+            RecordStallAbandoned("video", "映像フレームの提示", "再生の再開", videoStalledMs);
+        PrimeClockStallDetector(playTicks, "再生の再開");
         // 猶予を置くのは「新しい待ちが始まるとき」だけ。既に待っている最中の再開で置き直すと、
         // 固まって困った利用者が一時停止→再生を押し直すたびに猶予が延び、
         // **最も拾いたい障害（待ちが永久に解けない）が永久に黙る**。
@@ -952,8 +957,9 @@ public unsafe class MediaEngine : IMediaEngine
         _playbackEndedFired = false;
         long seekTicks = Environment.TickCount64;
         // シーク直後はフレームが来るまで間があく。基準を置き直さないとその間を滞留と数える
-        _videoStallDetector.Prime(seekTicks);
-        PrimeClockStallDetector(seekTicks);
+        if (_videoStallDetector.Prime(seekTicks) is long videoStalledMs)
+            RecordStallAbandoned("video", "映像フレームの提示", "シーク", videoStalledMs);
+        PrimeClockStallDetector(seekTicks, "シーク");
         _lastVideoStallLogTicks = seekTicks;
         // プリロール待ちを正常と見なす猶予の起点。シークは（保留が解けていなくても）
         // BeginSeek で待ちを作り直すので、ここは無条件に置き直してよい。
@@ -1973,6 +1979,10 @@ public unsafe class MediaEngine : IMediaEngine
     /// <b>凍ったまま飛んだ場合</b>（シーク目標を返し続ける状態）に誤って正常と見なす。
     /// </para>
     /// <para>
+    /// <paramref name="reason"/> は、報告済みの滞留を打ち切った場合に記録へ残す理由。
+    /// <see cref="RecordStallAbandoned"/> の remarks を参照。
+    /// </para>
+    /// <para>
     /// 呼ぶのは 3 箇所——<c>Play</c>・<c>Seek</c>・<b>錨の確定時</b>。最後のものが要点で、
     /// シーク要求時の基準のままにすると着地に閾値以上かかった場合に
     /// 「正常に再開した瞬間」を誤報告する。錨の確定は音声レンダースレッドから呼ばれるため、
@@ -1980,9 +1990,10 @@ public unsafe class MediaEngine : IMediaEngine
     /// （代償はあのフィールドの remarks のとおり）。
     /// </para>
     /// </remarks>
-    private void PrimeClockStallDetector(long nowTicks)
+    private void PrimeClockStallDetector(long nowTicks, string reason)
     {
-        _clockStallDetector.Prime(nowTicks);
+        if (_clockStallDetector.Prime(nowTicks) is long stalledMs)
+            RecordStallAbandoned("clock", "再生位置の進行", reason, stalledMs);
         _lastObservedPositionSeconds = double.NaN;
     }
 
@@ -2004,6 +2015,128 @@ public unsafe class MediaEngine : IMediaEngine
         if (!double.IsNaN(_lastObservedPositionSeconds) && posSeconds != _lastObservedPositionSeconds)
             _clockStallDetector.NoteActivity(Environment.TickCount64);
         _lastObservedPositionSeconds = posSeconds;
+    }
+
+    /// <summary>
+    /// 既定運用に残る記録をスレッドプールへ委譲する。滞留・回復・打ち切りの全経路で共用する。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>委譲する理由（ここが単一の情報源）</b>: <c>WriteFatal</c> は既定運用
+    /// （デバッグモード無効）だとプロセス間ミューテックスの待ちとファイル I/O を伴う。
+    /// 呼び出し元は 100ms 周期タイマーのコールバックと音声レンダースレッドで、前者は
+    /// <c>TeardownPipeline</c> の <c>StopStatusTimer</c> が完了を同期的に待つ。直接呼ぶと、
+    /// 滞留に気づいた利用者が停止やファイル切替を押した瞬間に UI スレッドがその待ちへ
+    /// 巻き込まれる（音が止まって最も操作したくなる場面で数百ms 固まる）。
+    /// <b>原則</b>: 常に残る側の記録は、クリティカルセクション内・高頻度に呼ばれる経路から
+    /// 直接呼ばない。ロックやプロセス間の待ちを抱えた I/O が、そこを通る処理全体の遅さになる。
+    /// </para>
+    /// <para>
+    /// <b>代償</b>: 記録は最善努力になり、失われる窓が 3 つある——①利用者が通知直後にアプリを
+    /// 閉じる ②異常と同時にプロセスが落ちる ③スレッドプールが飽和して実行が遅れる。
+    /// それでも呼び出し側を止めない方を選ぶ。前面スレッドで書けば窓は閉じられるが、
+    /// アプリ終了がミューテックス待ちの分だけ延びる（窓の無いプロセスが数百ms 残る）ので採らない。
+    /// </para>
+    /// <para>
+    /// <b>窓が開いたときに失うものは経路で違う。</b> 滞留の開始を伝える 3 経路
+    /// （<see cref="DetectAudioStall"/> / <see cref="DetectVideoStall"/> /
+    /// <see cref="DetectClockStall"/>）は<b>利用者への案内を呼び出し側が同期に出す</b>ので、
+    /// 失うのは診断ログだけ。<see cref="RecordStallRecovery"/> と
+    /// <see cref="RecordStallAbandoned"/> は<b>記録しかしない</b>ので、窓が開けばその行はそのまま
+    /// 失われる。診断の補助なのでそこは最善努力にとどめる（対になる滞留の行は既に残っている）。
+    /// </para>
+    /// <para>
+    /// <b><c>catch</c> がある理由</b>: スレッドプールのワーカーで未処理例外が出るとプロセスが落ちる。
+    /// <c>WriteFatal</c> は現状すべての経路を自分で受け止めているが、
+    /// <b>診断ログの失敗が再生エンジンを巻き添えにする</b>のは代償が釣り合わないので、
+    /// 呼び出し側でも止めておく。<b>ここで握り潰しても失うものが無い</b>のは、
+    /// この経路が「記録すること自体」を仕事にしているため——記録できないなら他に打つ手が無い。
+    /// </para>
+    /// </remarks>
+    private static void QueueFatalRecord(string category, string record)
+    {
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try { DiagnosticLog.WriteFatal(category, record); }
+            catch { /* 診断ログの失敗でプロセスを落とさない（remarks 参照） */ }
+        });
+    }
+
+    /// <summary>
+    /// 報告済みの滞留を回収できないまま打ち切ったことを記録する。
+    /// </summary>
+    /// <remarks>
+    /// <b>この行が無いと「滞留の開始だけがある」の意味が定まらない。</b> 原因が
+    /// ①まだ止まったまま ②利用者操作で追跡を打ち切った、の 2 通りあり、記録の見た目が同じになる。
+    /// しかも<b>固まったときに利用者が最も取る操作</b>（一時停止→再生、シークし直す）がそのまま
+    /// ②を踏むため、この機能が一番要る場面で記録が読めなくなる。
+    /// <para>
+    /// 「回復した」とは書かないこと。<c>Prime</c> は基準を置き直すだけで、
+    /// <b>活動が戻ったことを何も意味しない</b>（<c>ensemble-review.md</c> §7 の代理値）。
+    /// </para>
+    /// <para>
+    /// <b>ただし「回復しなかった」とも読めてはいけない。</b> この行が言えるのは
+    /// <b>事実の不在</b>——復帰を追跡できなくなった——であって、止まったままだという否定ではない。
+    /// 実際には既に直っていることの方が多い（利用者が操作したのは、たいてい直したくて操作した
+    /// のだから）。<b>その配慮は文面そのものに入れること</b>——doc に書いても
+    /// <c>fatal.log</c> を読む人には届かない。「未解決という意味ではない」を行に含めているのがそれ。
+    /// </para>
+    /// <para>
+    /// <paramref name="sinceStallBeganMs"/> を載せるのは、<b>この行が「いつの滞留の後始末か」を
+    /// 自力で示せるようにする</b>ため。検出器はエンジンと同じ寿命なので、打ち切りは滞留の何時間も
+    /// 後・別のファイルを開いた後に現れうる。値が無いと、読み手は直前の操作が原因だと誤認する。
+    /// </para>
+    /// </remarks>
+    private static void RecordStallAbandoned(string category, string what, string reason, long sinceStallBeganMs)
+        => QueueFatalRecord(category,
+            $"{what}の滞留を追跡できなくなった（{reason}のため）。"
+            + $"滞留の開始から {sinceStallBeganMs}ms 経過。"
+            + $"復帰したかは記録できていない（未解決という意味ではない）");
+
+    /// <summary>
+    /// 滞留から回復したことを記録する。3 つの検出器で共用する。
+    /// </summary>
+    /// <remarks>
+    /// <b>記録だけで、利用者へは通知しない。</b> 利用者は目の前で直ったのを見ているので OSD は
+    /// ノイズになる。事後の切り分けと閾値の調整には記録があれば足りる。
+    /// <para>
+    /// <b>滞留の行が <c>WriteFatal</c> なので回復もそちらへ書く。</b> 片方だけ既定運用に残ると、
+    /// 「3012ms 活動が無い（自動復旧する場合あり）」の 1 行を読んだ人が、
+    /// <b>3 秒で戻ったのか永久に止まったのか判断できない</b>。
+    /// </para>
+    /// <para>
+    /// <b>取りこぼす場合がある。</b> 観測のガードで <c>Poll</c> に到達しないまま <c>Prime</c> で
+    /// 基準が置き直されると、回復の行は残らない。ただし<b>その場合は
+    /// <see cref="RecordStallAbandoned"/> が打ち切りの行を残す</b>ので、記録が黙って欠けることはない。
+    /// 打ち切りの行がその場で出ないのは、<c>Prime</c> を通らずガードが閉じたままになる経路が
+    /// 2 つあるため。<b>この 2 つは非対称で、記録から辿れるのは片方だけ。</b>
+    /// </para>
+    /// <list type="bullet">
+    /// <item><b>音声出力が異常停止した場合</b>（<c>_audioOutputFailed</c> が
+    /// <c>DetectAudioStall</c> の入口で止め、開き直しまでそのまま）。こちらは
+    /// <c>OnWasapiPlaybackStopped</c> が <c>WriteFatal</c> を残すので、記録から辿れる</item>
+    /// <item><b>停止・ファイル切替でパイプラインを畳んだ場合</b>。こちらは<b>正常終了だと
+    /// 既定運用の記録に何も残らない</b>——<c>Stop</c> が <c>WriteFatal</c> を呼ぶのは音声出力の
+    /// 停止が失敗したときだけで、状態遷移の行は <c>Write</c> 側（デバッグモード限定）。
+    /// 遡る手掛かりは、遅れて出る打ち切りの行に載る経過 ms しかない。
+    /// <b>そのまま終了すればその行も出ない</b>（<c>Play</c> を通らないと打ち切りは申告されない）</item>
+    /// </list>
+    /// <para>
+    /// <b>ただし「二度と出ない」ではない。</b> 検出器はエンジンと同じ寿命を持つので、報告済みの
+    /// 滞留を抱えたまま上の経路へ入った場合、<b>次に <c>Play</c> が押された時点で遅れて
+    /// 打ち切りの行が出る</b>——しかも理由は「再生の再開」になる。別のファイルを開いた後でも
+    /// 同じ。前触れなく現れたように見えたら、対になる滞留の行を<b>時刻で遡って</b>探すこと。
+    /// </para>
+    /// <para>
+    /// <b>滞留の行との前後関係はファイル上で保証されない。</b> どちらもスレッドプールへ委譲され、
+    /// <c>WriteFatal</c> はプロセス間ミューテックスを待つため、閾値をわずかに超えて即座に回復した
+    /// 場合は回復の行が先に並びうる。突き合わせは各行のタイムスタンプで行うこと
+    /// （直列化はしない。既定運用の記録経路すべてが同じ性質で、ここだけ揃えても意味がない）。
+    /// </para>
+    /// </remarks>
+    private static void RecordStallRecovery(string category, string what, long stalledForMs)
+    {
+        QueueFatalRecord(category, $"{what}が回復した（{stalledForMs}ms 途切れていた）");
     }
 
     /// <summary>
@@ -2042,7 +2175,10 @@ public unsafe class MediaEngine : IMediaEngine
     /// （<see cref="IsWithinSeekGrace"/>）——理由は下の段落</item>
     /// <item>再生完了後（<c>_playbackEndedFired</c>）。終端で止まるのが正常</item>
     /// <item><c>PausedOverride</c> 設定中。固定値を返す仕様（現状どこからも設定していないが、
-    /// 将来配線したときに漏れないよう先に置いてある）</item>
+    /// 将来配線したときに漏れないよう先に置いてある。<b>配線するときは、解除時に
+    /// <see cref="PrimeClockStallDetector"/> を呼ぶ必要があるかを判断すること</b>——
+    /// 一時停止と同じく「止まっていて当然の期間」を挟むため、置き直さないと復帰直後に
+    /// 誤検出する。置き直すなら打ち切りの記録も付いて回る）</item>
     /// </list>
     /// <para>
     /// <b>シーク着地待ちを無条件に除外してはいけない。</b> <c>_seekPending</c> を解除できるのは
@@ -2066,19 +2202,25 @@ public unsafe class MediaEngine : IMediaEngine
         long now = Environment.TickCount64;
         if (_clock.IsSeekPending && IsWithinSeekGrace(now)) return;
         if (_clock.PausedOverride is not null) return;
-        if (!_clockStallDetector.ShouldReport(now)) return;
+
+        var poll = _clockStallDetector.Poll(now);
+        if (poll.Phase == StallPhase.Recovered)
+        {
+            RecordStallRecovery("clock", "再生位置の進行", poll.StalledForMs);
+            return;
+        }
+        if (poll.Phase != StallPhase.Started) return;
 
         // 文面はこのスレッドで組み立てる（DetectAudioStall と同じ理由。実行時点では
         // パイプラインが畳まれている可能性がある）
-        string record = $"再生位置が {_clockStallDetector.ElapsedSinceLastActivity(now)}ms 進んでいない"
+        string record = $"再生位置が {poll.StalledForMs}ms 進んでいない"
             + $"（閾値 {ClockStallThresholdMs}ms。位置={_lastObservedPositionSeconds:F3} "
             + $"writeCursor={_clock.WriteCursor}。音声・映像の出力は続いていることがある。"
             + $"自動復旧する場合あり）"
             // 着地待ちのまま猶予を過ぎた場合は原因の当たりが全く違う（錨の要求漏れの疑い）。
             // 切り分けに要るので状態を添える
             + $" seek着地待ち={_clock.IsSeekPending}";
-        // 委譲の理由と失う窓は DetectAudioStall に書いてある
-        ThreadPool.QueueUserWorkItem(_ => DiagnosticLog.WriteFatal("clock", record));
+        QueueFatalRecord("clock", record);
 
         // 音声・映像のどちらかが既に異常なら、そちらの検出器が原因に近い文面で通知している。
         // ここで重ねると 1 つの事故に説明が 3 通出るだけなので、記録だけにとどめる
@@ -2125,7 +2267,15 @@ public unsafe class MediaEngine : IMediaEngine
         // タイムアウトした縮退経路では待たずに破棄が進む）
         var ring = _videoRing;
         long now = Environment.TickCount64;
-        if (!IsVideoStalledNow(ring, now)) return;
+        if (!CanObserveVideoStall(ring, now)) return;
+        // 「時刻待ち（低フレームレート・VFR）で抑制中」は滞留でも回復でもないので Poll に触らせない。
+        // 述語は IsVideoStalledNow に集約したまま使う（プロパティと同じ定義を保つ）ため、
+        // 「閾値は超えているのに滞留ではない」という差から時刻待ちを導いている。
+        // **意図は名前に持たせること。** 条件だけ見て「滞留していなければ抑制」と読み替えると、
+        // 正常時（閾値未満）にも早期 return を足して回復の記録を殺す
+        bool stalledNow = IsVideoStalledNow(ring, now);
+        bool suppressedByFrameTimeWait = !stalledNow && _videoStallDetector.IsStalled(now);
+        if (suppressedByFrameTimeWait) return;
 
         // 診断ログは滞留が続く間 2 秒おきに繰り返す（リングの状態を時系列で追うため）。
         // 周期の管理を専用フィールドで持つのが要点で、以前は判定に使う「最後にフレームを出した時刻」
@@ -2133,7 +2283,7 @@ public unsafe class MediaEngine : IMediaEngine
         // ここに「一度だけ通知」を足すと経過時間が記録のたびに 0 へ戻り、状態が点滅する
         // Enabled を明示的に見るのは、文字列補間が Write の中の判定より先に評価されるため。
         // DescribeSlots() はリングのロックを取るので、診断ログ無効時に走らせる意味がない
-        if (DiagnosticLog.Enabled && now - _lastVideoStallLogTicks >= VideoStallLogIntervalMs)
+        if (stalledNow && DiagnosticLog.Enabled && now - _lastVideoStallLogTicks >= VideoStallLogIntervalMs)
         {
             _lastVideoStallLogTicks = now;
             DiagnosticLog.Write("stall",
@@ -2141,20 +2291,23 @@ public unsafe class MediaEngine : IMediaEngine
                 + $"clock={GetMasterClockSeconds():F3} ring={ring!.DescribeSlots()}");
         }
 
-        if (!_videoStallDetector.ShouldReport(now)) return;
+        var poll = _videoStallDetector.Poll(now);
+        if (poll.Phase == StallPhase.Recovered)
+        {
+            RecordStallRecovery("video", "映像フレームの提示", poll.StalledForMs);
+            return;
+        }
+        if (poll.Phase != StallPhase.Started) return;
 
         // 文面はこのスレッドで組み立てる。エンジンの状態を読む処理を後段へ持ち込むと、
         // 実行される時点でパイプラインが畳まれている可能性がある
-        string record = $"映像フレームが {_videoStallDetector.ElapsedSinceLastActivity(now)}ms 提示されていない"
+        string record = $"映像フレームが {poll.StalledForMs}ms 提示されていない"
             + $"（閾値 {VideoStallNotifyThresholdMs}ms。音声と再生位置は進んでいることがある。"
             + $"自動復旧する場合あり） clock={GetMasterClockSeconds():F3}"
             // プリロール待ちのまま猶予を過ぎた場合は、原因の当たりが全く違う（待ち合わせの
             // 取りこぼしの疑い）。切り分けに要るので状態を添える
             + $" preroll待ち={_prerollGate.IsWaitingForPreroll} ring={ring!.DescribeSlots()}";
-        // 記録はスレッドプールへ逃がす。理由は DetectAudioStall と同じ（WriteFatal は既定運用で
-        // プロセス間ミューテックスとファイル I/O を伴い、StopStatusTimer の停止待ちを通じて
-        // UI 操作を数百ms 止める）。失う窓と、それでも委譲を選ぶ理由もあちらに書いてある
-        ThreadPool.QueueUserWorkItem(_ => DiagnosticLog.WriteFatal("video", record));
+        QueueFatalRecord("video", record);
         // 通知の直前にもう一度確かめる。ここまでの間に音声側の恒久障害（開き直しが必要）が
         // 通知されていることがあり、そこへ映像の弱い文面を重ねると警報を格下げしてしまう
         //（OSD は上書きで順序の保証もない）。記録の方は止めない
@@ -2263,31 +2416,29 @@ public unsafe class MediaEngine : IMediaEngine
         if (_audioOutputFailed) return;
 
         long now = Environment.TickCount64;
-        if (!_audioStallDetector.ShouldReport(now)) return;
+
+        var poll = _audioStallDetector.Poll(now);
+        if (poll.Phase == StallPhase.Recovered)
+        {
+            RecordStallRecovery("audio", "音声出力の Read", poll.StalledForMs);
+            return;
+        }
+        if (poll.Phase != StallPhase.Started) return;
 
         // 文面はこのスレッドで組み立てる。エンジンの状態を読む処理を後段へ持ち込むと、
-        // 実行される時点でパイプラインが畳まれている可能性がある
-        // 「以降ずっと止まる」と書かないこと。この滞留は自然に復旧しうるので、事後にこの 1 行だけを
-        // 読んだ人が恒久障害と誤読する（回復した場合の記録は無い。待ち行列の課題）
-        string record = $"音声出力の Read が {_audioStallDetector.ElapsedSinceLastActivity(now)}ms 呼ばれていない"
+        // 実行される時点でパイプラインが畳まれている可能性がある。
+        // 「以降ずっと止まる」と書かないこと。この滞留は自然に復旧しうる。
+        // 復旧した場合は RecordStallRecovery が対になる行を残すので、事後にどちらだったか判る
+        string record = $"音声出力の Read が {poll.StalledForMs}ms 呼ばれていない"
             + $"（閾値 {AudioStallThresholdMs}ms。この時点で音声・再生位置・映像はいずれも進んでいない。"
             + $"自動復旧する場合あり）"
             + $" clock={GetMasterClockSeconds():F3}";
-        // 記録はスレッドプールへ逃がす。WriteFatal は既定運用（デバッグモード無効）だと
-        // fatal.log 側が本経路になり、プロセス間ミューテックスの待ちとファイル I/O を伴う。
-        // このメソッドは 100ms 周期タイマーのコールバックで、TeardownPipeline の StopStatusTimer が
-        // 「実行中のコールバックの完了」を同期的に待つ。ここで直接呼ぶと、滞留に気づいた利用者が
-        // 停止やファイル切替を押した瞬間に UI スレッドがその待ちへ巻き込まれる
-        //（音が止まって最も操作したくなる場面で数百ms 固まる）。
-        // 委譲した記録は最善努力で、失われる窓が 3 つある: ①利用者が通知直後にアプリを閉じる
-        // ②音声デバイスの異常と同時にプロセスが落ちる ③スレッドプールが飽和して実行が遅れる。
-        // それでも呼び出し側を止めない方を選ぶ（coding-style.md「ログ設計」の
-        //「常に残る側はクリティカルセクション・高頻度経路で呼ばない」）。
-        // **利用者への案内はこの下で同期に出すので、窓が開いても失われない**。失うのは診断ログだけ。
-        // 前面スレッドで書けば窓は閉じられるが、アプリ終了がミューテックス待ちの分だけ延びる
-        //（窓の無いプロセスが数百ms 残る）ので採らない。
-        // 滞留 1 回につき 1 度だけなので、繰り返し投げてスレッドプールを埋めることはない
-        ThreadPool.QueueUserWorkItem(_ => DiagnosticLog.WriteFatal("audio", record));
+        // 記録をスレッドプールへ逃がす理由と代償は QueueFatalRecord の doc が単一の情報源
+        //（二重に書くと、片方だけ直したときに食い違う）。
+        // **この経路が「窓が開いても失われるのは診断ログだけ」と言える根拠がここ**——
+        // 利用者への案内はこの下で同期に出す。滞留 1 回につき 1 度だけなので、
+        // 繰り返し投げてスレッドプールを埋めることもない
+        QueueFatalRecord("audio", record);
         // 記録を残した後、通知を出す直前にもう一度確かめる。冒頭の判定からここまでの間に
         // OnWasapiPlaybackStopped が「開き直してください」を出していることがあり、そこへ
         // こちらの弱い文面を重ねると警報を格下げしてしまう（OSD は上書きで、順序の保証もない）。

@@ -1,5 +1,30 @@
 namespace MultiTrackPlayer.Engine.Diagnostics;
 
+/// <summary>滞留の局面。<see cref="StallDetector.Poll"/> が返す。</summary>
+public enum StallPhase
+{
+    /// <summary>活動が来ている（報告するものは無い）。</summary>
+    Running,
+
+    /// <summary>閾値を超えた。<b>この局面を返すのは 1 つの滞留につき 1 度だけ。</b></summary>
+    Started,
+
+    /// <summary>滞留が続いている（既に報告済み）。</summary>
+    Continuing,
+
+    /// <summary>
+    /// 報告済みの滞留から活動が戻った。<b>この局面を返すのも 1 度だけ。</b>
+    /// </summary>
+    Recovered
+}
+
+/// <param name="Phase">局面。</param>
+/// <param name="StalledForMs">
+/// <see cref="StallPhase.Started"/> なら「活動が来ていない時間」、
+/// <see cref="StallPhase.Recovered"/> なら「活動が途切れていた実測時間」。他の局面では 0。
+/// </param>
+public readonly record struct StallPollResult(StallPhase Phase, long StalledForMs);
+
 /// <summary>
 /// 「動いているはずのものが動いていない」ことを、最後に活動があった時刻からの経過で検出する。
 /// </summary>
@@ -20,11 +45,17 @@ namespace MultiTrackPlayer.Engine.Diagnostics;
 /// </para>
 /// <para>
 /// <b>スレッド</b>: <see cref="NoteActivity"/> は活動を起こしている側のスレッド（音声レンダー
-/// スレッド・vout スレッド・UI スレッド）から高頻度で呼ばれるためロックを取らない。
-/// <see cref="Prime"/> と <see cref="ShouldReport"/> はそれぞれ UI スレッド・状態タイマーから
-/// 呼ばれる。<b>可視性はフィールド 2 つとも <c>Volatile</c> で揃えてある</b>ので、
-/// 残る競合は「どちらの書き込みが先か」だけ。同時に走ると報告が 1 度余分に出る／1 度落ちる
-/// 可能性があるが、どちらも記録と案内の重複・欠落にとどまるため許容する。
+/// スレッド・vout スレッド・UI スレッド）から高頻度で呼ばれるため<b>ロックを取らない</b>。
+/// 単一フィールドへの <c>Volatile</c> 書き込みで、古い値を読まれても代償は
+/// 「報告が 1 度余分に出る／1 度落ちる」にとどまる。
+/// <para>
+/// <b><see cref="Prime"/> と <see cref="Poll"/> はロックを取る。</b> あの 2 つはフィールド 2 つを
+/// <b>対として</b>読み書きするため、別々の <c>Volatile</c> では守れない。実際に起きる綻び:
+/// <c>Prime</c> が「最後の活動」を新しくした直後（報告済みの基準はまだ古い）に <c>Poll</c> が
+/// 割り込むと、<b>起きていない回復を「もっともらしい滞留時間つきで」報告する</b>。
+/// 書き込み順を入れ替えても、こんどは偽の「滞留開始」が出るだけで解決しない。
+/// 呼ぶのは UI スレッド・状態タイマー・錨の確定（音声レンダースレッド）で、いずれも低頻度
+/// （100ms 周期・操作のたび）なので競合の代償より正しさを採る。
 /// </para>
 /// </remarks>
 public sealed class StallDetector
@@ -32,13 +63,19 @@ public sealed class StallDetector
     /// <summary>まだ報告していないことを表す番兵。実際の時刻と衝突しない値を使う。</summary>
     private const long NotReported = long.MinValue;
 
+    /// <summary>
+    /// <see cref="Prime"/> と <see cref="Poll"/> がフィールド 2 つを対として扱うためのロック。
+    /// <see cref="NoteActivity"/> は取らない（クラスの remarks 参照）。
+    /// </summary>
+    private readonly object _pairLock = new();
+
     private readonly int _thresholdMs;
     private long _lastActivityTicks;
 
     /// <summary>
     /// 報告済みの基準時刻。抑制を「最後の活動の時刻」に紐づけることで、活動が 1 度でも来れば
-    /// （基準が動けば）抑制は自動的に解ける。ポーリング側が復帰の瞬間を目撃する必要がなく、
-    /// 活動側のスレッドから書くフィールドも増えない。
+    /// （基準が動けば）抑制は自動的に解ける。活動側のスレッドから書くフィールドを増やさずに、
+    /// <b>回復の検出と滞留時間の実測</b>もこの 1 つの値でできる（<see cref="Poll"/> の remarks）。
     /// </summary>
     private long _reportedForActivityTicks = NotReported;
 
@@ -55,7 +92,7 @@ public sealed class StallDetector
 
     /// <summary>
     /// 基準時刻を置き直し、報告済みの抑制も解除する。活動が来ることを期待し始める時点で呼ぶ
-    /// （再生開始・シーク）。
+    /// （再生開始・シーク）。<b>報告済みの滞留は回収されずに捨てられる</b>（戻り値を参照）。
     /// </summary>
     /// <remarks>
     /// <para>
@@ -73,35 +110,86 @@ public sealed class StallDetector
     /// 危険が上がるため、単純な置き直しを選んでいる。
     /// </para>
     /// </remarks>
-    public void Prime(long nowTicks)
+    /// <returns>
+    /// <b>報告済みの滞留を回収しないまま捨てた場合、その滞留が始まってからの経過 ms。</b>
+    /// 捨てるものが無ければ <c>null</c>。捨てると <see cref="StallPhase.Recovered"/> は二度と
+    /// 返らないため、記録には滞留の開始だけが残り、<b>回復したのか止まったままなのかが事後に
+    /// 判別できない</b>。呼び出し側はこれを見て「打ち切った」ことを記録する責任がある。
+    /// <b>戻り値を捨てないこと。</b>
+    /// <para>
+    /// 経過 ms を返すのは、<b>打ち切りの行が「いつの滞留の後始末か」を自力で示せるようにする</b>ため。
+    /// この検出器はエンジンと同じ寿命を持つので、打ち切りは滞留の何時間も後・別のファイルを
+    /// 開いた後に起こりうる。値が数秒なら直前の出来事、何時間なら古い滞留の後始末と読める。
+    /// </para>
+    /// </returns>
+    public long? Prime(long nowTicks)
     {
-        Volatile.Write(ref _lastActivityTicks, nowTicks);
-        Volatile.Write(ref _reportedForActivityTicks, NotReported);
+        // 2 つを対として書く。片方だけ見えた状態を Poll に読まれると、起きていない回復を
+        // 報告してしまう（クラスの remarks 参照）
+        lock (_pairLock)
+        {
+            long reportedFor = Volatile.Read(ref _reportedForActivityTicks);
+            Volatile.Write(ref _lastActivityTicks, nowTicks);
+            Volatile.Write(ref _reportedForActivityTicks, NotReported);
+            // reportedFor は「滞留の直前に活動があった時刻」なので、差がそのまま滞留の長さになる
+            //（滞留の開始を報告した行の ms と同じ尺度で読める）
+            return reportedFor == NotReported ? null : nowTicks - reportedFor;
+        }
     }
 
     /// <summary>
-    /// 閾値を超えて活動が来ていない状態か。<see cref="ShouldReport"/> と違い、何度呼んでも
+    /// 閾値を超えて活動が来ていない状態か。<see cref="Poll"/> と違い、何度呼んでも
     /// 内部状態を変えない（表示側からの問い合わせ用）。活動が戻れば自動的に <c>false</c> へ戻る。
     /// </summary>
     public bool IsStalled(long nowTicks) => IsStalledAt(nowTicks, Volatile.Read(ref _lastActivityTicks));
 
     /// <summary>
-    /// 滞留の判定式。<see cref="IsStalled"/> と <see cref="ShouldReport"/> が同じ述語を使うよう、
+    /// 滞留の判定式。<see cref="IsStalled"/> と <see cref="Poll"/> が同じ述語を使うよう、
     /// 定義はここ 1 箇所に置く（言い換えた瞬間に両者の範囲がずれる）。
     /// </summary>
     private bool IsStalledAt(long nowTicks, long lastActivityTicks) => nowTicks - lastActivityTicks >= _thresholdMs;
 
     /// <summary>
-    /// 滞留を報告すべきか。閾値を超えている間に <c>true</c> を返すのは 1 度だけで、
-    /// 活動が再開すれば次の滞留で改めて <c>true</c> を返す。
+    /// 滞留の局面を進める。<b>状態を変えるのでポーリング側から 1 周に 1 度だけ呼ぶこと。</b>
     /// </summary>
-    public bool ShouldReport(long nowTicks)
+    /// <remarks>
+    /// <para>
+    /// <b>回復も局面として返すのが要点。</b> 滞留の開始しか報告できないと、記録に
+    /// 「3012ms 活動が無い」の 1 行だけが残り、<b>3 秒で戻ったのか永久に止まったのかが事後に
+    /// 分からない</b>。閾値を実地で調整する材料にもならない。
+    /// </para>
+    /// <para>
+    /// <see cref="StallPhase.Recovered"/> の <c>StalledForMs</c> は<b>実測値</b>。
+    /// 報告時の基準（<c>_reportedForActivityTicks</c>）と回復後の最初の活動
+    /// （<c>_lastActivityTicks</c>）の差がそのまま「活動が途切れていた時間」になるので、
+    /// 時刻を新しく持つ必要はない。
+    /// </para>
+    /// </remarks>
+    public StallPollResult Poll(long nowTicks)
     {
-        long lastActivity = Volatile.Read(ref _lastActivityTicks);
-        if (!IsStalledAt(nowTicks, lastActivity)) return false;
-        if (Volatile.Read(ref _reportedForActivityTicks) == lastActivity) return false;
-        Volatile.Write(ref _reportedForActivityTicks, lastActivity);
-        return true;
+        // 2 つを対として読む。Prime と食い合うと、起きていない回復を報告してしまう
+        //（クラスの remarks 参照）。NoteActivity との競合はロック外のままで無害
+        lock (_pairLock)
+        {
+            long lastActivity = Volatile.Read(ref _lastActivityTicks);
+            long reportedFor = Volatile.Read(ref _reportedForActivityTicks);
+
+            if (IsStalledAt(nowTicks, lastActivity))
+            {
+                // 同じ基準で既に報告済みなら継続。基準が動いていれば新しい滞留
+                if (reportedFor == lastActivity) return new StallPollResult(StallPhase.Continuing, 0);
+                Volatile.Write(ref _reportedForActivityTicks, lastActivity);
+                return new StallPollResult(StallPhase.Started, nowTicks - lastActivity);
+            }
+
+            // 閾値内。報告済みの滞留があったなら、その基準より後の活動が来ている＝回復
+            if (reportedFor != NotReported && reportedFor != lastActivity)
+            {
+                Volatile.Write(ref _reportedForActivityTicks, NotReported);
+                return new StallPollResult(StallPhase.Recovered, lastActivity - reportedFor);
+            }
+            return new StallPollResult(StallPhase.Running, 0);
+        }
     }
 
     /// <summary>直近の活動からの経過ミリ秒。記録へ添えるための値。</summary>

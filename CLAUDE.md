@@ -211,7 +211,9 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
     クロック（再生位置が進むこと）。例外を伴う異常停止は `WasapiOut.PlaybackStopped` や各スレッドの
     例外記録が拾うが、例外を出さずに黙って止まる経路はここでしか気づけない。判定は
     `MediaEngine.StatusTick` の `DetectAudioStall` / `DetectVideoStall` / `DetectClockStall` で、
-    いずれも `WriteFatal` で記録する。状態は出力が戻れば自動で解ける
+    いずれも `WriteFatal` で記録する。記録するのは**開始・回復・打ち切りの 3 種**
+    （`StallDetector` の `Poll` が局面を返し、`Prime` が打ち切りを申告する。なぜ 3 種必要かは
+    両メソッドの doc コメント）。状態は出力が戻れば自動で解ける
     （`IsAudioStalled` / `IsVideoStalled`。開き直しを要する `IsAudioOutputFailed` とは別物）。
     音声・映像が動き続けたままクロックだけが凍る経路があるため 3 つ目が要る。通知は他の検出器と
     重複しないよう選別する。詳細は `DetectClockStall` の doc コメント、レビュー時の観点は
