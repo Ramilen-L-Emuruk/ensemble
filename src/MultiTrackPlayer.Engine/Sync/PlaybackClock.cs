@@ -33,6 +33,18 @@ public sealed class PlaybackClock
         set { lock (_lock) _pausedOverride = value; }
     }
 
+    /// <summary>
+    /// シークの着地待ち（<see cref="BeginSeek"/> 済みで <see cref="AnchorAt"/> 前）か。
+    /// この間 <see cref="PositionAt"/> は<b>意図的に</b>シーク目標を返し続ける。
+    /// </summary>
+    /// <remarks>
+    /// 「位置が進んでいない」ことを異常と判断する側（<c>MediaEngine.DetectClockStall</c>）が、
+    /// 正常な待ちを異常と呼ばないために使う。<b>この判定はクロック自身が持つのが正しい</b>——
+    /// 定数を返しているのはこのクラスの都合なので、外から別の値で言い換えると必ずずれる
+    /// （<c>ensemble-review.md</c> §7）。
+    /// </remarks>
+    public bool IsSeekPending { get { lock (_lock) return _seekPending; } }
+
     /// <summary>Stop 時などに原点へ戻す。書込カーソルとセグメント履歴を全て破棄する。</summary>
     public void Reset()
     {

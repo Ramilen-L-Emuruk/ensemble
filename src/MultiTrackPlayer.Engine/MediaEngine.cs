@@ -620,6 +620,11 @@ public unsafe class MediaEngine : IMediaEngine
             if (Interlocked.Exchange(ref _awaitingAnchor, 0) == 1)
             {
                 _clock.AnchorAt(_clock.WriteCursor, _pendingAnchorTarget);
+                // **位置が進み始めるのを期待し始めるのはここ。** シーク要求時に置いた基準のままにすると、
+                // 着地までに閾値を超えた場合（大容量・ネットワーク越し・ロング GOP）に
+                // 「着地して正常に再開した瞬間」を滞留と誤報告する。着地後も実ハードウェア位置が
+                // 新セグメントへ入るまでは PositionAt が定数を返すため、活動の記録も遅れる
+                PrimeClockStallDetector(Environment.TickCount64);
                 DiagnosticLog.Write("clock", $"anchor 確定 cursor={_clock.WriteCursor} pts={_pendingAnchorTarget:F3}");
             }
             _clock.OnAudioWritten(frames);
@@ -640,11 +645,21 @@ public unsafe class MediaEngine : IMediaEngine
         // 増えたときはそちらでも同じ順序を守ること。現状 SetState(Playing) はここだけ）
         _audioStallDetector.Prime(playTicks);
         _videoStallDetector.Prime(playTicks);
-        // 猶予を置くのは「新しいプリロール待ちが始まるとき」だけ。既に待っている最中の再開で
-        // 置き直すと、映像が固まって困った利用者が一時停止→再生を押し直すたびに猶予が延び、
-        // **最も拾いたい障害（プリロールが永久に解けない）が永久に黙る**。
-        // 停止からの再生は下の wasStopped 分岐が Seek を通り、そちらで置き直される
-        if (!_prerollGate.IsWaitingForPreroll)
+        PrimeClockStallDetector(playTicks);
+        // 猶予を置くのは「新しい待ちが始まるとき」だけ。既に待っている最中の再開で置き直すと、
+        // 固まって困った利用者が一時停止→再生を押し直すたびに猶予が延び、
+        // **最も拾いたい障害（待ちが永久に解けない）が永久に黙る**。
+        // 停止からの再生は下の wasStopped 分岐が Seek を通り、そちらで置き直される。
+        //
+        // **この締切の消費者は 2 つあるので、両方の待ちを見る**（IsWithinSeekGrace の remarks 参照）。
+        // プリロールゲートだけを見ると穴が開く。**2 つの待ちは同時に解けない**——
+        // OnAudioPrerollReady は NotifyAudioReady（ゲートの解決）と RequestAnchor（錨の要求）を
+        // 同じ呼び出しで行うが、錨が実際に確定するのは次のミキサー Pull（WASAPI の Read）を
+        // 待ってから。一時停止中は Read が来ないので、ゲートが解決済みでもクロックの着地待ちは残る。
+        // その隙間で再生を押されると猶予が延び続ける。
+        // 音声トラックを持たないファイルではこの差が開きやすい（BeginSeek(hasAudio: false) が
+        // 音声待ちを即座に済ませるため）が、**音声ありでも起きる。特殊対応ではない**
+        if (!_prerollGate.IsWaitingForPreroll && !_clock.IsSeekPending)
             Volatile.Write(ref _prerollGraceUntilTicks, playTicks + PrerollGraceMs);
         SetState(CorePlaybackState.Playing);
         _playbackEndedFired = false;
@@ -938,6 +953,7 @@ public unsafe class MediaEngine : IMediaEngine
         long seekTicks = Environment.TickCount64;
         // シーク直後はフレームが来るまで間があく。基準を置き直さないとその間を滞留と数える
         _videoStallDetector.Prime(seekTicks);
+        PrimeClockStallDetector(seekTicks);
         _lastVideoStallLogTicks = seekTicks;
         // プリロール待ちを正常と見なす猶予の起点。シークは（保留が解けていなくても）
         // BeginSeek で待ちを作り直すので、ここは無条件に置き直してよい。
@@ -1870,9 +1886,11 @@ public unsafe class MediaEngine : IMediaEngine
     /// </summary>
     private const int VideoPullAliveWindowMs = 1000;
     /// <summary>
-    /// シーク後のプリロール待ちを「正常な待ち」として扱う猶予。これを超えて解けない保留は
+    /// シーク後の待ちを「正常」として扱う猶予。これを超えて解けない待ちは
     /// 待ち合わせの取りこぼし（<c>ensemble-review.md</c> §1）の疑いがあるため、観測を再開して
     /// 記録・通知の対象に戻す。
+    /// <b>プリロール待ち（映像の滞留検出）とシーク着地待ち（クロックの滞留検出）が共用する</b>——
+    /// 詳細は <see cref="IsWithinSeekGrace"/>。
     /// <para>
     /// 猶予を設けずに保留中を一律で除外すると、<b>このプロジェクトで最も再発実績のある障害
     /// （プリロールが永久に解けない）だけが記録に残らない</b>ことになる。しかもその状態では
@@ -1890,6 +1908,26 @@ public unsafe class MediaEngine : IMediaEngine
     // 正常運用では起こりえない（バッファは 100ms しか無いので、この時点で音は完全に途切れている）
     private const int AudioStallThresholdMs = 3000;
     private readonly StallDetector _audioStallDetector = new(AudioStallThresholdMs);
+
+    /// <summary>
+    /// 再生位置（audio-master クロック）が進んでいないと判定する閾値。音声・映像と同じ 3 秒。
+    /// </summary>
+    private const int ClockStallThresholdMs = 3000;
+    private readonly StallDetector _clockStallDetector = new(ClockStallThresholdMs);
+    /// <summary>
+    /// 前回の <c>StatusTick</c> で観測した位置（秒）。値が変われば「進んだ」と見なす。
+    /// <c>NaN</c> は「まだ観測していない」。
+    /// </summary>
+    /// <remarks>
+    /// 書くのは状態タイマー（<c>StatusTick</c>）・UI スレッド（<c>Play</c> / <c>Seek</c>）・
+    /// 音声レンダースレッド（錨の確定）の 3 つで、いずれも <see cref="PrimeClockStallDetector"/>
+    /// 経由。<b><c>StallDetector</c> と違って <c>Volatile</c> は使っていない</b>——あちらは
+    /// 判定そのものを担うフィールドなので明示的にバリアを置いているが、こちらは
+    /// 「値が変わったか」を見るだけの補助で、古い値を読んだ代償は「進んだ記録が 1 度余分に出る／
+    /// 1 度落ちる」にとどまる。閾値 3 秒に対して 100ms 周期の観測が続くため、判定は次の tick で
+    /// 正される。保証のレベルを意図的に下げてある。
+    /// </remarks>
+    private double _lastObservedPositionSeconds = double.NaN;
     // TryGetFrame の pull 間隔計測用（ドロップ調査ログ専用）。TickCount64 は既定タイマー分解能が粗く
     // 1フレーム予算（60fps で約16.7ms）を見るには不十分なため Stopwatch を使う
     private long _lastPullTimestamp;
@@ -1901,6 +1939,7 @@ public unsafe class MediaEngine : IMediaEngine
         long hwFrames = _positionSource?.GetPositionFrames() ?? 0;
         double posSeconds = _positionSource == null ? 0.0 : _clock.PositionAt(hwFrames);
         var pos = TimeSpan.FromSeconds(posSeconds);
+        NoteClockProgress(posSeconds);
 
         if (_state == CorePlaybackState.Playing || _state == CorePlaybackState.Paused)
         {
@@ -1921,7 +1960,137 @@ public unsafe class MediaEngine : IMediaEngine
 
         DetectVideoStall();
         DetectAudioStall();
+        DetectClockStall();
         CheckPlaybackEnded();
+    }
+
+    /// <summary>
+    /// クロック滞留の基準を置き直す。再生開始・シークのように「位置が進み始めるのを待つ」時点で呼ぶ。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 前回観測した位置も忘れる。忘れないと、シークで位置が飛んだ瞬間を「進んだ」と数えてしまい、
+    /// <b>凍ったまま飛んだ場合</b>（シーク目標を返し続ける状態）に誤って正常と見なす。
+    /// </para>
+    /// <para>
+    /// 呼ぶのは 3 箇所——<c>Play</c>・<c>Seek</c>・<b>錨の確定時</b>。最後のものが要点で、
+    /// シーク要求時の基準のままにすると着地に閾値以上かかった場合に
+    /// 「正常に再開した瞬間」を誤報告する。錨の確定は音声レンダースレッドから呼ばれるため、
+    /// <see cref="_lastObservedPositionSeconds"/> は 3 スレッドから書かれることになる
+    /// （代償はあのフィールドの remarks のとおり）。
+    /// </para>
+    /// </remarks>
+    private void PrimeClockStallDetector(long nowTicks)
+    {
+        _clockStallDetector.Prime(nowTicks);
+        _lastObservedPositionSeconds = double.NaN;
+    }
+
+    /// <summary>
+    /// 位置が前回の観測から変わっていれば、クロックが進んだものとして記録する。
+    /// </summary>
+    /// <remarks>
+    /// 見るのは<b>位置そのもの</b>で、代理値を使わない。ハードウェア位置（<c>hwFrames</c>）や
+    /// 書込カーソルは<b>クロックが凍っていても伸びる</b>ので、あれらでは代用できない
+    /// （実際にそういう不具合を出した。<c>ensemble-review.md</c> §7）。
+    /// <para>
+    /// 変化の判定に許容幅を置かないのは、凍結時の値が<b>完全に一定</b>になるため。
+    /// レート 0 の区間では <c>PositionAtFrameLocked</c> が <c>SrcPtsSeconds</c> をそのまま返す。
+    /// 最低速（0.1 倍）でも 100ms 周期あたり 10ms は動くので、進んでいれば必ず値が変わる。
+    /// </para>
+    /// </remarks>
+    private void NoteClockProgress(double posSeconds)
+    {
+        if (!double.IsNaN(_lastObservedPositionSeconds) && posSeconds != _lastObservedPositionSeconds)
+            _clockStallDetector.NoteActivity(Environment.TickCount64);
+        _lastObservedPositionSeconds = posSeconds;
+    }
+
+    /// <summary>
+    /// 再生中なのに再生位置が進まなくなった状態を検知して記録する
+    /// （<see cref="DetectAudioStall"/> / <see cref="DetectVideoStall"/> の 3 つ目）。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>なぜ要るか。</b> 音声・映像の検出器はどちらもクロックを見ていない。あちらは
+    /// 「ミキサーの <c>Read</c> が呼ばれているか」「フレームが提示されているか」で、
+    /// <b>どちらも動き続けたままクロックだけが凍る</b>ことがある（v1.7.9 で直した 2 件がそれ。
+    /// 無音区間からレートが戻らない／無音動画のシークで錨が要求されない）。
+    /// しかも映像側は、クロックが凍ると Ready フレームが due にならないため
+    /// <c>SlotSequencer.IsWaitingForFrameTime</c> が「時刻待ち＝健全」と答えて自ら抑制する。
+    /// つまりこの検出器が無いと、この種の凍結は<b>診断ログを有効にしていない限り痕跡が残らない</b>。
+    /// </para>
+    /// <para>
+    /// <b>通知は選別する（2 段）。</b> ひとつは他の検出器との重複——音声出力の死亡のように、
+    /// 3 つの検出器が同時に鳴る事故がある
+    /// （<c>Read</c> が止まる → フレームが出ない → 位置が進まない）。OSD は上書きなので、
+    /// 1 つの事故に説明が 3 通出ると利用者を混乱させるだけ。<b>記録は常に残し、通知は
+    /// 「音声も映像も正常に見えるのにクロックだけ凍っている」ときに限る</b>——それがこの検出器に
+    /// しか見えない形であり、v1.7.9 で直した 2 件のうち 1 件目（アンダーラン後の凍結）の形でもある。
+    /// もうひとつは<b>着地待ちのまま猶予を過ぎた場合</b>——遅い媒体と錨の要求漏れを区別できないので
+    /// 記録だけにする。映像ありなら上の重複判定で吸収されるが、音声のみのファイルは何も
+    /// マスクしないためこちらが要る。
+    /// </para>
+    /// <para>
+    /// <b>除外している 4 つ</b>は、いずれも位置が進まないのが正常な状態。混ぜると健全な再生を
+    /// 「壊れている」と呼ぶことになる（v1.7.8 の映像側で 3 つの誤検知を潰した経緯と同じ話）。
+    /// </para>
+    /// <list type="number">
+    /// <item>再生中でない（一時停止・停止）。<c>Read</c> が止まるのが正常</item>
+    /// <item>シークの着地待ち（<c>PlaybackClock.IsSeekPending</c>）。あの間 <c>PositionAt</c> は
+    /// <b>意図的に</b>目標値を返し続ける。判定はクロック自身に持たせてある。<b>ただし猶予付き</b>
+    /// （<see cref="IsWithinSeekGrace"/>）——理由は下の段落</item>
+    /// <item>再生完了後（<c>_playbackEndedFired</c>）。終端で止まるのが正常</item>
+    /// <item><c>PausedOverride</c> 設定中。固定値を返す仕様（現状どこからも設定していないが、
+    /// 将来配線したときに漏れないよう先に置いてある）</item>
+    /// </list>
+    /// <para>
+    /// <b>シーク着地待ちを無条件に除外してはいけない。</b> <c>_seekPending</c> を解除できるのは
+    /// 錨（<c>AnchorAt</c>）だけで、その要求経路は v1.7.9 で<b>実際に 2 回壊れた</b>場所。
+    /// 壊れると <c>_seekPending</c> が立ったまま戻らないが、そのとき
+    /// <c>IsAudioStalled</c> は <c>Read</c> が続くので false、<c>IsVideoStalled</c> は
+    /// クロックが凍って Ready フレームが due にならないため「時刻待ち＝健全」と判定されて false。
+    /// <b>ここも無条件に除外すると 3 つの検出器が揃って沈黙し、この検出器を足した意味が無くなる。</b>
+    /// 猶予（映像側と同じ締切を共有）を過ぎた着地待ちは、正常な待ちとは見なさない。
+    /// </para>
+    /// <para>
+    /// <b>アンダーラン（無音）は除外しない。</b> 3 秒進まないなら、利用者から見れば
+    /// 「音が途切れて何も動かない」実害。原因が正常な範囲かどうかは利用者には関係ない。
+    /// </para>
+    /// </remarks>
+    private void DetectClockStall()
+    {
+        if (_state != CorePlaybackState.Playing) return;
+        if (_playbackEndedFired) return;
+
+        long now = Environment.TickCount64;
+        if (_clock.IsSeekPending && IsWithinSeekGrace(now)) return;
+        if (_clock.PausedOverride is not null) return;
+        if (!_clockStallDetector.ShouldReport(now)) return;
+
+        // 文面はこのスレッドで組み立てる（DetectAudioStall と同じ理由。実行時点では
+        // パイプラインが畳まれている可能性がある）
+        string record = $"再生位置が {_clockStallDetector.ElapsedSinceLastActivity(now)}ms 進んでいない"
+            + $"（閾値 {ClockStallThresholdMs}ms。位置={_lastObservedPositionSeconds:F3} "
+            + $"writeCursor={_clock.WriteCursor}。音声・映像の出力は続いていることがある。"
+            + $"自動復旧する場合あり）"
+            // 着地待ちのまま猶予を過ぎた場合は原因の当たりが全く違う（錨の要求漏れの疑い）。
+            // 切り分けに要るので状態を添える
+            + $" seek着地待ち={_clock.IsSeekPending}";
+        // 委譲の理由と失う窓は DetectAudioStall に書いてある
+        ThreadPool.QueueUserWorkItem(_ => DiagnosticLog.WriteFatal("clock", record));
+
+        // 音声・映像のどちらかが既に異常なら、そちらの検出器が原因に近い文面で通知している。
+        // ここで重ねると 1 つの事故に説明が 3 通出るだけなので、記録だけにとどめる
+        if (_audioOutputFailed || IsAudioStalled || IsVideoStalled) return;
+        // 着地待ちのまま猶予を過ぎた場合も通知しない。ここまで来た時点では
+        // 「遅い媒体で着地に時間がかかっているだけ」と「錨の要求が漏れている」を区別できず、
+        // **正常な再生を壊れていると告げるのが最悪の失敗**だから記録側に任せる。
+        // 映像ありのファイルでは IsVideoStalled が真になって上の行で吸収されるが、
+        // 音声のみのファイルは何もマスクしないためここが要る（実際に踏んだ Ring05.wav が音声のみ）。
+        // 記録には seek着地待ち= が入るので、事後の切り分けは落ちない
+        if (_clock.IsSeekPending) return;
+        PlaybackFailed?.Invoke(this, "再生位置が進んでいません");
     }
 
     /// <summary>
@@ -2025,12 +2194,27 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     /// <summary>
+    /// シーク直後の「待っていて当然」の猶予の内側か。<see cref="PrerollGraceMs"/> の説明を参照。
+    /// </summary>
+    /// <remarks>
+    /// 締切は 1 つだけ持ち、プリロール待ち（映像の滞留検出）とシーク着地待ち
+    /// （クロックの滞留検出）の両方がこれを見る。**同じ「シーク後の猶予」を 2 つの値で持つと、
+    /// 片方だけを直したときに範囲がずれる**（<c>ensemble-review.md</c> §7）。
+    /// <para>
+    /// <b>共有するなら、締切を置き直す条件も両方の待ちを見なければならない。</b>
+    /// 片方だけで判断すると、もう片方が待っている隙間で置き直されて猶予が延び続ける
+    /// （<c>Play</c> の該当箇所のコメント参照）。消費者を増やすときはそこも直すこと。
+    /// </para>
+    /// </remarks>
+    private bool IsWithinSeekGrace(long nowTicks) =>
+        nowTicks - Volatile.Read(ref _prerollGraceUntilTicks) < 0;
+
+    /// <summary>
     /// シーク後のプリロールを待っている、かつその待ちが猶予の内側か。
     /// 猶予を過ぎた保留は正常な待ちとは見なさない（<see cref="PrerollGraceMs"/> の説明を参照）。
     /// </summary>
     private bool IsWithinPrerollGrace(long nowTicks) =>
-        _prerollGate.IsWaitingForPreroll
-        && nowTicks - Volatile.Read(ref _prerollGraceUntilTicks) < 0;
+        _prerollGate.IsWaitingForPreroll && IsWithinSeekGrace(nowTicks);
 
     /// <summary>
     /// いま映像が滞留しているか。<see cref="IsVideoStalled"/> と <see cref="DetectVideoStall"/> の
