@@ -5,8 +5,14 @@ namespace MultiTrackPlayer.Engine.Sync;
 /// <summary>
 /// WasapiPositionSource の異常時フォールバック。write cursor からレイテンシを差し引いた値を基準に、
 /// write cursor が変化しない間は経過時間ぶん Stopwatch で外挿し、滑らかな値を返す。
-/// 音声トラックが0本のファイルでも最初からこのソースを使う。
 /// </summary>
+/// <remarks>
+/// <b>このクラスは自分では同期しない。</b> 到達経路は <see cref="WasapiPositionSource"/> の
+/// ロック内だけで（外から直に構築している箇所は無い）、状態
+/// （<see cref="_baseCursor"/> / <see cref="_baseFrames"/> / <see cref="_stopwatch"/>）は
+/// そこで守られている。<b><c>Stopwatch</c> はスレッドセーフではない</b>ので、
+/// 直接使う経路を作るならこちらにも同じ守りが必要。
+/// </remarks>
 public sealed class FallbackPositionSource : IPlaybackPositionSource
 {
     private readonly Func<long> _getWriteCursorFrames;

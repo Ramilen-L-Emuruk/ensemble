@@ -1395,7 +1395,13 @@ public unsafe class MediaEngine : IMediaEngine
         if (_videoDecodeThread != null)
             _videoDecodeThreadHandle = StartBackgroundThread(_videoDecodeThread.Run);
         _audioDecodeThreadHandle = StartBackgroundThread(_audioDecodeThread.Run);
-        _statusTimer ??= new Timer(_ => StatusTick(), null, 100, 100);
+        if (_statusTimer == null)
+        {
+            // **周回ガードはタイマーと対で作る。** エンジンのフィールドに持たせると寿命がずれて
+            // 2 方向に壊れる（TickGate の remarks に機構を書いてある）
+            var gate = new TickGate(StatusTickSustainedSkipThreshold, StatusTickIntermittentSkipThreshold);
+            _statusTimer = new Timer(_ => StatusTick(gate), null, StatusTickIntervalMs, StatusTickIntervalMs);
+        }
 
         StartVideoOutputIfPossible();
     }
@@ -1925,9 +1931,10 @@ public unsafe class MediaEngine : IMediaEngine
     /// <c>NaN</c> は「まだ観測していない」。
     /// </summary>
     /// <remarks>
-    /// 書くのは状態タイマー（<c>StatusTick</c>）・UI スレッド（<c>Play</c> / <c>Seek</c>）・
-    /// 音声レンダースレッド（錨の確定）の 3 つで、いずれも <see cref="PrimeClockStallDetector"/>
-    /// 経由。<b><c>StallDetector</c> と違って <c>Volatile</c> は使っていない</b>——あちらは
+    /// 書くのは 3 スレッド。状態タイマーは <see cref="NoteClockProgress"/> から<b>直接</b>
+    /// （観測した位置をそのまま入れる）、UI スレッド（<see cref="Play"/> / <see cref="Seek"/>）と
+    /// 音声レンダースレッド（錨の確定）は <see cref="PrimeClockStallDetector"/> 経由で
+    /// <c>NaN</c> へ戻す。<b><c>StallDetector</c> と違って <c>Volatile</c> は使っていない</b>——あちらは
     /// 判定そのものを担うフィールドなので明示的にバリアを置いているが、こちらは
     /// 「値が変わったか」を見るだけの補助で、古い値を読んだ代償は「進んだ記録が 1 度余分に出る／
     /// 1 度落ちる」にとどまる。閾値 3 秒に対して 100ms 周期の観測が続くため、判定は次の tick で
@@ -1938,10 +1945,101 @@ public unsafe class MediaEngine : IMediaEngine
     // 1フレーム予算（60fps で約16.7ms）を見るには不十分なため Stopwatch を使う
     private long _lastPullTimestamp;
 
-    private void StatusTick()
+    /// <summary>状態タイマーの周期（ms）。</summary>
+    private const int StatusTickIntervalMs = 100;
+
+    /// <summary>
+    /// 重複起動が何回<b>連続</b>したら既定運用の記録へ回すか。
+    /// 10 回＝1 周が 1 秒以上終わっていないので、単発の GC 一時停止とは区別できる。
+    /// </summary>
+    private const int StatusTickSustainedSkipThreshold = 10;
+
+    /// <summary>
+    /// 重複起動が<b>累計</b>で何回に達したら既定運用の記録へ回すか。
+    /// 50 回＝断続的に 5 秒ぶん本体が間引かれている。連続の閾値だけだと、
+    /// 手前で回復し続けるパターン（連続 9 回 → 1 回成功 → …）が一切記録に現れない。
+    /// </summary>
+    private const int StatusTickIntermittentSkipThreshold = 50;
+
+    /// <summary>
+    /// 状態タイマーのコールバック。<b>重複起動を弾いてから本体を呼ぶ。</b>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>System.Threading.Timer</c> は<b>コールバックの完了を待たずに次回発火を予約する</b>ので、
+    /// 1 周が周期（100ms）を超えると別のスレッドプールスレッドで重複起動される。
+    /// <see cref="StatusTickCore"/> は単一呼び出しを前提に書かれており、重複すると
+    /// <see cref="CheckPlaybackEnded"/> の <c>_playbackEndedFired</c> の check-then-act が通り抜けて
+    /// 終了処理（音声出力の停止・状態遷移・最終位置の通知）が二重に走る。滞留検出の
+    /// <c>StallDetector.Poll</c> も「1 周に 1 度だけ呼ぶ」規約があり、破ると記録が重複する。
+    /// </para>
+    /// <para>
+    /// <b>飛ばした周は取り戻さない。</b> 次の発火（100ms 後）で改めて観測されるので、
+    /// 失うのは 1 周ぶんの位置通知だけ。取り戻す仕組みを入れると、遅れた周が
+    /// 溜まった分だけ連続実行されて同じ重複を別の形で作る。
+    /// </para>
+    /// <para>
+    /// <b><see cref="StopStatusTimer"/> とは干渉しない。</b> 飛ばした周も「コールバックとして
+    /// 起動し即座に完了した」ことに変わりはないので、<c>Timer.Dispose(WaitHandle)</c> は
+    /// 走行中の長い周が終わった時点で正常に解ける。
+    /// </para>
+    /// <para>
+    /// <b>これが守るのは <see cref="StatusTickCore"/> 自身の直列性だけ。</b> 位置ソース
+    /// （<c>WasapiPositionSource</c>）は vout スレッド・UI スレッドからも叩かれるため、
+    /// あちらの検査状態はあちら自身のロックで守っている。
+    /// </para>
+    /// </remarks>
+    private void StatusTick(TickGate gate)
+    {
+        if (!gate.TryEnter())
+        {
+            // **飛ばし続ける状態は既定運用にも残す。** 1 周が周期を超えているなら何かが本当に遅く、
+            // しかもその間は位置表示も 3 つの滞留検出も再生終了の判定も止まっている。
+            // 委譲するので周期タイマーの経路から呼んでも待たされない
+            var report = gate.NoteSkip(out int consecutive, out int total);
+            switch (report)
+            {
+                case TickSkipReport.Sustained:
+                    DiagnosticLog.WriteFatalDeferred("engine",
+                        $"状態タイマーの周回が {consecutive} 回連続で重複起動された"
+                        + $"（1 周が {StatusTickIntervalMs}ms を超えたまま終わっていない）。"
+                        + $"その間は再生位置の通知・滞留検出・再生終了の判定が止まる");
+                    break;
+                case TickSkipReport.Intermittent:
+                    // **「連続では閾値に届いていない」と書かないこと。** 回復を挟んだ後なら、
+                    // 過去の詰まりで届いていることがある。事実だけを述べる
+                    DiagnosticLog.WriteFatalDeferred("engine",
+                        $"状態タイマーの周回が繰り返し重複起動されている"
+                        + $"（このタイマーで累計 {total} 回、直近は連続 {consecutive} 回目）。"
+                        + $"1 周が {StatusTickIntervalMs}ms を超えることが頻発している。"
+                        + $"その分だけ再生位置の通知・滞留検出・再生終了の判定が間引かれている");
+                    break;
+                default:
+                    // こちらも委譲する。閾値未満のスキップは詰まっている間ずっと毎周回発生するので、
+                    // デバッグモード有効時に同期で書くと**このガードが検出したい詰まりを自分で悪化させる**
+                    DiagnosticLog.WriteDeferred("engine",
+                        $"StatusTick の重複起動を飛ばした（連続 {consecutive} 回 / 累計 {total} 回）");
+                    break;
+            }
+            return;
+        }
+        try
+        {
+            StatusTickCore();
+        }
+        finally
+        {
+            // **必ず解放する。** 立てたまま抜けると、以降のすべての周が黙って飛ばされ、
+            // 位置通知も 3 つの滞留検出も止まる
+            gate.Exit();
+        }
+    }
+
+    private void StatusTickCore()
     {
         // GetPositionFrames() は呼ぶたびに内部の単調性チェック状態を更新するため、
         // 1tick につき1回だけ呼び、PositionChanged 通知とデバッグログの両方で使い回す
+        //（この「1 回だけ」は StatusTick の重複起動ガードが保証している）
         long hwFrames = _positionSource?.GetPositionFrames() ?? 0;
         double posSeconds = _positionSource == null ? 0.0 : _clock.PositionAt(hwFrames);
         var pos = TimeSpan.FromSeconds(posSeconds);
@@ -2022,20 +2120,19 @@ public unsafe class MediaEngine : IMediaEngine
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>委譲する理由（ここが単一の情報源）</b>: <c>WriteFatal</c> は既定運用
-    /// （デバッグモード無効）だとプロセス間ミューテックスの待ちとファイル I/O を伴う。
-    /// 呼び出し元は 100ms 周期タイマーのコールバックと音声レンダースレッドで、前者は
-    /// <c>TeardownPipeline</c> の <c>StopStatusTimer</c> が完了を同期的に待つ。直接呼ぶと、
-    /// 滞留に気づいた利用者が停止やファイル切替を押した瞬間に UI スレッドがその待ちへ
-    /// 巻き込まれる（音が止まって最も操作したくなる場面で数百ms 固まる）。
-    /// <b>原則</b>: 常に残る側の記録は、クリティカルセクション内・高頻度に呼ばれる経路から
-    /// 直接呼ばない。ロックやプロセス間の待ちを抱えた I/O が、そこを通る処理全体の遅さになる。
+    /// <b>委譲する仕組みと、その理由・代償は
+    /// <see cref="DiagnosticLog.WriteFatalDeferred"/> の doc が単一の情報源。</b>
+    /// ここには<b>このエンジンに固有のことだけ</b>を書く（同じ論旨を 2 箇所に置くと、
+    /// 片方だけ直したときに食い違う）。
     /// </para>
     /// <para>
-    /// <b>代償</b>: 記録は最善努力になり、失われる窓が 3 つある——①利用者が通知直後にアプリを
-    /// 閉じる ②異常と同時にプロセスが落ちる ③スレッドプールが飽和して実行が遅れる。
-    /// それでも呼び出し側を止めない方を選ぶ。前面スレッドで書けば窓は閉じられるが、
-    /// アプリ終了がミューテックス待ちの分だけ延びる（窓の無いプロセスが数百ms 残る）ので採らない。
+    /// <b>このエンジンで直接呼んだ場合に何が起きるか</b>: 呼び出し元は状態タイマーの
+    /// コールバック（滞留の開始・回復）・音声レンダースレッド（錨の確定に伴う打ち切り）・
+    /// UI スレッド（<see cref="Play"/> / <see cref="Seek"/> に伴う打ち切り）。
+    /// このうち状態タイマーは <c>TeardownPipeline</c> の <see cref="StopStatusTimer"/> が
+    /// 完了を同期的に待つため、直接呼ぶと<b>滞留に気づいた利用者が停止やファイル切替を押した
+    /// 瞬間に UI スレッドがその待ちへ巻き込まれる</b>（音が止まって最も操作したくなる場面で
+    /// 数百ms 固まる）。UI スレッドから呼ぶ経路は、そのまま操作の反応が遅れる。
     /// </para>
     /// <para>
     /// <b>窓が開いたときに失うものは経路で違う。</b> 滞留の開始を伝える 3 経路
@@ -2054,13 +2151,7 @@ public unsafe class MediaEngine : IMediaEngine
     /// </para>
     /// </remarks>
     private static void QueueFatalRecord(string category, string record)
-    {
-        ThreadPool.QueueUserWorkItem(_ =>
-        {
-            try { DiagnosticLog.WriteFatal(category, record); }
-            catch { /* 診断ログの失敗でプロセスを落とさない（remarks 参照） */ }
-        });
-    }
+        => DiagnosticLog.WriteFatalDeferred(category, record);
 
     /// <summary>
     /// 報告済みの滞留を回収できないまま打ち切ったことを記録する。
