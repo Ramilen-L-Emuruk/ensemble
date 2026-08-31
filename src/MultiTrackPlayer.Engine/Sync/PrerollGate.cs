@@ -83,6 +83,17 @@ public sealed class PrerollGate
     public SeekEpoch? AwaitedEpoch { get { lock (_lock) return _awaited; } }
 
     /// <summary>
+    /// シーク後のプリロールをまだ待っている（＝どちらかの側が着地後の最初のデータを出せていない）か。
+    /// </summary>
+    /// <remarks>
+    /// 「映像が止まっている」ことが異常かどうかの判断に使う（<c>MediaEngine.DetectVideoStall</c>）。
+    /// シークの着地フレームが出るまで提示は止まるが、それは正常な待ちであって異常ではない。
+    /// 保留の有無そのものを見るので、<see cref="BeginSeek"/> が「待つ相手がいない」と判断した場合
+    /// （映像も音声も無い）は false になる。
+    /// </remarks>
+    public bool IsWaitingForPreroll { get { lock (_lock) return !(_videoReady && _audioReady); } }
+
+    /// <summary>
     /// 待つものが何も無い状態へ戻す。停止・パイプライン再構築時に呼ぶ。
     /// シーク中断のまま停止した場合に、保留状態を次の再生へ持ち越さないため。
     /// <para>

@@ -333,8 +333,9 @@ public sealed unsafe class VideoDecodeThread
     /// 契約を変えないと捕まえられない（デバイス喪失からの復旧と同じ領域なので切り離してある）。
     /// </para>
     /// <para>
-    /// なお映像側には利用者へ知らせる経路が無い（<see cref="AbandonVideoPipeline"/> も同様）ため、
-    /// 恒久的に前進しなくなった場合は「音だけ進んで映像が固まる」形で現れる。
+    /// このスレッド自身は利用者へ知らせる経路を持たない（<see cref="AbandonVideoPipeline"/> も同様）が、
+    /// 恒久的に前進しなくなれば提示が止まるので <c>MediaEngine.DetectVideoStall</c> が経過時間で拾い、
+    /// 記録して通知する。原因ごとに通知を足さないのはそのため。
     /// </para>
     /// </summary>
     /// <param name="reason">ログに残す理由。</param>

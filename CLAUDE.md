@@ -206,11 +206,12 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
   - `Sync/PrerollGate.cs`: シーク後、音声・映像の**両方**のプリロールが終わるまでミキサーの実出力を
     保留する門番。完了通知はシーク世代で等値照合する（採番前は「待つ世代なし」として全て捨てる）。
     待つ世代を確定する順序に制約があり、誤ると保留が永久に解けない。詳細はクラスの doc コメント
-  - `Audio/AudioStallDetector.cs`: ミキサーの `Read` が呼ばれなくなったこと（＝音声出力が動いて
-    いないこと）を経過時間で検出する。`Read` が止まると audio-master クロックが進まないため
-    音・位置表示・映像がまとめて止まる。例外を伴う異常停止は `WasapiOut.PlaybackStopped` が
-    申告するが、例外を出さない経路はここでしか気づけない。判定は `MediaEngine.StatusTick` の
-    `DetectAudioStall`（`DetectVideoStall` の対称版）
+  - `Diagnostics/StallDetector.cs`: 「動いているはずのものが動いていない」ことを経過時間で検出する。
+    音声（ミキサーの `Read`）と映像（フレームの提示）で 2 インスタンスを使う。例外を伴う異常停止は
+    `WasapiOut.PlaybackStopped` や各スレッドの例外記録が拾うが、例外を出さずに黙って止まる経路は
+    ここでしか気づけない。判定は `MediaEngine.StatusTick` の `DetectAudioStall` / `DetectVideoStall` で、
+    どちらも `WriteFatal` で記録して利用者へ通知する。状態は出力が戻れば自動で解ける
+    （`IsAudioStalled` / `IsVideoStalled`。開き直しを要する `IsAudioOutputFailed` とは別物）
   - 映像提示は経路で二系統: GPU デコード時は専用 vout スレッドが `SwapChainVideoPresenter` で vsync 直接提示
     する（`IsVideoOutputActive`）。CPU デコード時は従来どおり pull 型で、UI 側の `CompositionTarget.Rendering`
     が毎フレーム `TryGetFrame`/`ReturnFrame` を呼ぶ

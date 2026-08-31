@@ -119,6 +119,10 @@ public sealed class VideoFrameRing : IVideoFrameRing
     /// </summary>
     public bool Flush(SeekEpoch epoch) => _seq.Flush(epoch);
 
+    /// <summary>Ready はあるがどれもまだ due でないか（<see cref="SlotSequencer.IsWaitingForFrameTime"/>）。</summary>
+    public bool IsWaitingForFrameTime(double clockPositionSeconds, double frameDurationSeconds) =>
+        _seq.IsWaitingForFrameTime(clockPositionSeconds, frameDurationSeconds);
+
     /// <summary>診断用: 全スロットの状態スナップショット（停止検知時のログ出力に使う）。</summary>
     public string DescribeSlots() => _seq.DescribeSlots();
 

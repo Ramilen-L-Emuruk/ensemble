@@ -370,7 +370,7 @@ public sealed unsafe class AudioDecodeThread
                 // 記録だけで抜けてはいけない。ミキサーは「EOF かつ残量ゼロ」のトラックしか
                 // 共通利用可能量の計算から除外しないため、残量ゼロのまま居座らせると common が
                 // 0 に固定され、健全な他トラックまで無音になる（AbandonTrack の doc コメント参照）。
-                // しかもその無音は AudioStallDetector に引っかからない（Read は呼ばれ続ける）。
+                // しかもその無音は滞留検出に引っかからない（StallDetector が見る Read は呼ばれ続ける）。
                 //
                 // ただし単発では畳まない。TryReceiveFrame は -EAGAIN・AVERROR_EOF・本物のデコード
                 // エラーをまとめて false にするため、破損パケット由来の単発エラーもここへ来る。
@@ -527,7 +527,7 @@ public sealed unsafe class AudioDecodeThread
     // ここで長く滞留するのは「ミキサーの Read そのものが呼ばれていない」ときだけで、
     // その原因は一時停止（正常）と音声出力の死亡（異常）の両方がありうる。**この 2 つを
     // 区別できないのは、ここが再生状態を知らないからで、経過時間の測り方の問題ではない。**
-    // 生死の判定は再生状態を持つ MediaEngine.DetectAudioStall（AudioStallDetector）が担い、
+    // 生死の判定は再生状態を持つ MediaEngine.DetectAudioStall（StallDetector）が担い、
     // ここでの滞留ログはその裏付けに使う診断情報にとどめる（WriteFatal へは上げない）。
     // なお HoldOutput 中は消費が続く（MultiTrackMixer.Read 参照）ので滞留の原因にはならない
     private static readonly TimeSpan GateStallLogThreshold = TimeSpan.FromSeconds(2.0);

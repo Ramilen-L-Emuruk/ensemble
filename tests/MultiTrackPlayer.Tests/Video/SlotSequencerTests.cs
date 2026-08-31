@@ -348,4 +348,93 @@ public sealed class SlotSequencerTests
 
         Assert.Equal(1, freed.Count(i => i == writing));
     }
+
+    // ── IsWaitingForFrameTime（提示が止まっているのが正常かどうかの判断に使う）──
+    //
+    // 「Ready はあるが、どれもまだ due でない」＝次のフレームの時刻を待っているだけで健全。
+    // 低フレームレート・VFR の動画では数秒それが続くため、これを見ないと健全な再生を
+    // 滞留と誤判定する。フレーム間隔は 1 秒（due 判定の許容は ±0.5 秒）として書いてある。
+
+    private const double FrameDuration = 1.0;
+
+    [Fact(DisplayName = "Ready が無ければ時刻待ちではない（供給が止まっている）")]
+    public void IsWaitingForFrameTime_IsFalse_WhenNoReadyFrame()
+    {
+        var seq = new SlotSequencer(4, _ => { });
+
+        Assert.False(seq.IsWaitingForFrameTime(clockPositionSeconds: 0.0, FrameDuration));
+    }
+
+    [Fact(DisplayName = "Ready がまだ先の時刻なら時刻待ちと見なす")]
+    public void IsWaitingForFrameTime_IsTrue_WhenReadyFrameIsNotDueYet()
+    {
+        var seq = new SlotSequencer(4, _ => { });
+        int slot = Acquire(seq);
+        seq.CommitWrite(slot, 10.0);
+
+        Assert.True(seq.IsWaitingForFrameTime(clockPositionSeconds: 0.0, FrameDuration));
+    }
+
+    [Fact(DisplayName = "Ready が due なら時刻待ちではない（出せるのに出ていない）")]
+    public void IsWaitingForFrameTime_IsFalse_WhenReadyFrameIsDue()
+    {
+        var seq = new SlotSequencer(4, _ => { });
+        int slot = Acquire(seq);
+        seq.CommitWrite(slot, 1.0);
+
+        Assert.False(seq.IsWaitingForFrameTime(clockPositionSeconds: 5.0, FrameDuration));
+    }
+
+    [Fact(DisplayName = "due と未 due が混在していれば時刻待ちではない")]
+    public void IsWaitingForFrameTime_IsFalse_WhenAnyFrameIsDue()
+    {
+        var seq = new SlotSequencer(4, _ => { });
+        int due = Acquire(seq);
+        seq.CommitWrite(due, 1.0);
+        int future = Acquire(seq);
+        seq.CommitWrite(future, 10.0);
+
+        Assert.False(seq.IsWaitingForFrameTime(clockPositionSeconds: 2.0, FrameDuration));
+    }
+
+    [Fact(DisplayName = "due の判定は TryLeaseDue と同じ境界で行われる")]
+    public void IsWaitingForFrameTime_UsesSameDueBoundaryAsTryLeaseDue()
+    {
+        var seq = new SlotSequencer(4, _ => { });
+        int slot = Acquire(seq);
+        seq.CommitWrite(slot, 10.0);
+        // due 判定は pts <= clock + frameDuration/2。clock=9.5 で境界にちょうど乗る
+        const double clockAtBoundary = 9.5;
+
+        bool waiting = seq.IsWaitingForFrameTime(clockAtBoundary, FrameDuration);
+        bool leased = seq.TryLeaseDue(clockAtBoundary, FrameDuration, out _, out _, out _);
+
+        Assert.False(waiting);
+        Assert.True(leased);
+    }
+
+    [Fact(DisplayName = "リースしたフレームは時刻待ちの判定に数えない")]
+    public void IsWaitingForFrameTime_IgnoresLeasedFrame()
+    {
+        var seq = new SlotSequencer(4, _ => { });
+        int slot = Acquire(seq);
+        seq.CommitWrite(slot, 1.0);
+        Assert.True(seq.TryLeaseDue(2.0, FrameDuration, out _, out _, out _));
+
+        // 提示中のフレームは「これから出すもの」ではないので、時刻待ちの根拠にはならない
+        Assert.False(seq.IsWaitingForFrameTime(clockPositionSeconds: 2.0, FrameDuration));
+    }
+
+    [Fact(DisplayName = "Flush で Ready が捨てられれば時刻待ちではなくなる")]
+    public void IsWaitingForFrameTime_IsFalse_AfterFlushDiscardsReady()
+    {
+        var seq = new SlotSequencer(4, _ => { });
+        int slot = Acquire(seq);
+        seq.CommitWrite(slot, 10.0);
+        Assert.True(seq.IsWaitingForFrameTime(0.0, FrameDuration));
+
+        FlushToNextEpoch(seq);
+
+        Assert.False(seq.IsWaitingForFrameTime(0.0, FrameDuration));
+    }
 }

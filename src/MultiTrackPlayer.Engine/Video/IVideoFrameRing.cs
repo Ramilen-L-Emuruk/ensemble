@@ -40,6 +40,13 @@ public interface IVideoFrameRing : IDisposable
     /// </returns>
     bool Flush(SeekEpoch epoch);
 
+    /// <summary>
+    /// Ready なフレームを持っているが、どれもまだ due になっていない（＝次のフレームの時刻を
+    /// 待っているだけで健全な）状態か。Ready が無い場合は false。
+    /// 提示が止まっていることが異常かどうかの判断に使う（<c>MediaEngine.DetectVideoStall</c>）。
+    /// </summary>
+    bool IsWaitingForFrameTime(double clockPositionSeconds, double frameDurationSeconds);
+
     /// <summary>診断用: 全スロットの状態スナップショット。</summary>
     string DescribeSlots();
 
