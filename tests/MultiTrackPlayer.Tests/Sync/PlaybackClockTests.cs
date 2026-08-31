@@ -23,6 +23,71 @@ public sealed class PlaybackClockTests
         Assert.Equal(0.0, clock.PositionAt(clock.WriteCursor), precision: 6);
     }
 
+    // ── 無音（アンダーラン）から実音声へ戻ったときの再開 ──
+    //
+    // 回帰: これが無いと、一度アンダーランしただけで以後ずっとメディア時刻が進まなくなる。
+    // 音は鳴り writeCursor も hwFrames も伸びるのに、再生位置とシークバーだけが凍る
+    // （実機では「短い音声ファイルを D&D するとシークバーが動かないことがある」として現れた）。
+
+    [Fact(DisplayName = "無音の後に実音声が来れば位置が再開する")]
+    public void OnAudioWritten_AfterSilence_ResumesPositionAdvance()
+    {
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(atFrame: 0, srcPtsSeconds: 0.0);
+        clock.OnAudioWritten(SampleRate / 2);   // 0.5 秒ぶん再生
+        clock.OnSilenceWritten(SampleRate);     // 1 秒ぶんアンダーラン（時間は進まない）
+        double frozen = clock.PositionAt(clock.WriteCursor);
+
+        clock.OnAudioWritten(SampleRate);       // 実音声が戻る
+
+        Assert.Equal(0.5, frozen, precision: 6);
+        Assert.Equal(1.5, clock.PositionAt(clock.WriteCursor), precision: 6);
+    }
+
+    [Fact(DisplayName = "無音が錨より前に来た場合も位置は正しく進む")]
+    public void OnAudioWritten_WhenSilencePrecedesAnchor_AdvancesFromAnchor()
+    {
+        // 不具合が「出るとき」と「出ないとき」を分けていた条件。こちらは AnchorAt が
+        // 区間を立て直すため元から動いていた（同じ入力で結果が変わらないことを固定する）
+        var clock = new PlaybackClock(SampleRate);
+        clock.OnSilenceWritten(SampleRate);     // 錨より前の無音
+        clock.AnchorAt(atFrame: clock.WriteCursor, srcPtsSeconds: 0.0);
+        clock.OnAudioWritten(SampleRate);
+
+        Assert.Equal(1.0, clock.PositionAt(clock.WriteCursor), precision: 6);
+    }
+
+    [Fact(DisplayName = "無音と実音声を繰り返しても、実音声のぶんだけ位置が進む")]
+    public void OnAudioWritten_WithRepeatedUnderruns_AccumulatesOnlyAudio()
+    {
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, 0.0);
+
+        for (int i = 0; i < 3; i++)
+        {
+            clock.OnAudioWritten(SampleRate);   // 1 秒ぶん再生
+            clock.OnSilenceWritten(SampleRate); // 1 秒ぶん無音（進まない）
+        }
+
+        // 出力は 6 秒ぶん書かれたが、メディア時刻は実音声の 3 秒ぶんだけ進む
+        Assert.Equal(6 * SampleRate, clock.WriteCursor);
+        Assert.Equal(3.0, clock.PositionAt(clock.WriteCursor), precision: 6);
+    }
+
+    [Fact(DisplayName = "無音から戻るとき、再開するレートは再生速度に従う")]
+    public void OnAudioWritten_AfterSilence_ResumesAtCurrentSpeed()
+    {
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, 0.0);
+        clock.OnAudioWritten(SampleRate);        // 1.0 秒（等速）
+        clock.SetSpeedAt(clock.WriteCursor, 2.0);
+        clock.OnSilenceWritten(SampleRate);      // アンダーラン
+        clock.OnAudioWritten(SampleRate);        // 実音声が戻る（2 倍速）
+
+        // 立て直すレートを 1.0 固定にすると、速度変更が無音で失われてここが 2.0 になる
+        Assert.Equal(3.0, clock.PositionAt(clock.WriteCursor), precision: 6);
+    }
+
     [Fact]
     public void AnchorAt_Then_OnAudioWritten_AdvancesPositionAtRate1()
     {

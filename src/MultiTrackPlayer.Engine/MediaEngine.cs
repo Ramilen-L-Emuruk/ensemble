@@ -456,7 +456,7 @@ public unsafe class MediaEngine : IMediaEngine
         chapters = chapters.OrderBy(c => c.StartTime).ToList();
         _chapters = chapters.Select((c, idx) => c with { Index = idx }).ToList();
 
-        double durationSec = _fmtCtx->duration / (double)AV_TIME_BASE;
+        double durationSec = ResolveDurationSeconds();
         var videoStream = _videoDecoder != null ? _fmtCtx->streams[_videoDecoder.StreamIndex] : null;
 
         if (videoStream != null)
@@ -515,6 +515,61 @@ public unsafe class MediaEngine : IMediaEngine
         if (_sharedHwDeviceCtx == null)
             _sharedHwDeviceCtx = HardwareAccel.CreateD3D11VAContextFromDevice(devicePtr);
         return _sharedHwDeviceCtx;
+    }
+
+    /// <summary>
+    /// このメディアの尺（秒）を決める。コンテナが答えなければストリーム側から補完し、
+    /// それでも取れなければ 0（不明）を返す。
+    /// </summary>
+    /// <remarks>
+    /// <b>コンテナ申告をそのまま信じてはいけない。</b> 尺を持たない形式・ヘッダ無しの VBR・
+    /// 生ストリームでは <c>AV_NOPTS_VALUE</c> か 0 が返る。前者を秒へ直すと <c>TimeSpan</c> の
+    /// 範囲外になって<b>ファイルが開けなくなり</b>、後者は<b>シークバーのつまみが動かず、
+    /// シークの目標も常に 0 になる</b>（クランプの上限が尺）。判定は
+    /// <see cref="MediaDurationResolver"/>（純ロジック・テスト済み）に任せ、ここは値の取り出しと
+    /// 記録だけを行う。
+    /// </remarks>
+    private double ResolveDurationSeconds()
+    {
+        // AV_NOPTS_VALUE は long.MinValue。このコードベースでは PTS 側（AudioDecoder.GetPtsSeconds 等）で
+        // 同じ番兵を検査しているが、尺だけ素通りしていた
+        double containerSeconds = _fmtCtx->duration == long.MinValue
+            ? double.NaN
+            : _fmtCtx->duration / (double)AV_TIME_BASE;
+
+        var streamSeconds = new List<double>((int)_fmtCtx->nb_streams);
+        for (int i = 0; i < (int)_fmtCtx->nb_streams; i++)
+        {
+            var stream = _fmtCtx->streams[i];
+            streamSeconds.Add(stream->duration == long.MinValue
+                ? double.NaN
+                : stream->duration * av_q2d(stream->time_base));
+        }
+
+        var resolved = MediaDurationResolver.Resolve(containerSeconds, streamSeconds);
+        switch (resolved.Source)
+        {
+            case DurationSource.Streams:
+                // 補完できたので利用者から見た挙動は正常。診断ログにとどめる
+                DiagnosticLog.Write("engine",
+                    $"コンテナが尺を申告しなかったのでストリームから補完した duration={resolved.Seconds:F3}s");
+                break;
+            case DurationSource.Unknown:
+                // シークバーのつまみが動かず、シークもできない状態になる。利用者には
+                // 「操作しても何も起きない」としか見えないので、既定運用でも記録を残す。
+                //
+                // 記録はスレッドプールへ逃がす。WriteFatal は既定運用だとプロセス間ミューテックス
+                // （最大 500ms 待ち）とファイル I/O を伴い、Open は UI スレッドで同期実行される
+                // （DetectAudioStall と同じ理由・同じ形）。尺が取れないファイルがプレイリストに
+                // 続くと、自動送りのたびに待ち時間が積み上がる。
+                // 記録が失われる窓は、Open が一度きりの同期呼び出しなので「開いた直後に
+                // アプリを閉じた場合」だけ（周期的に呼ばれるあちらより窓は狭い）
+                ThreadPool.QueueUserWorkItem(_ => DiagnosticLog.WriteFatal("engine",
+                    "尺を取得できなかった（コンテナもストリームも申告なし）。"
+                    + "シークバーの表示とシークが機能しない"));
+                break;
+        }
+        return resolved.Seconds;
     }
 
     private void SetupAudio()

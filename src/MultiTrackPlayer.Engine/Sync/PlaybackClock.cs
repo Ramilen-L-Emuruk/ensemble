@@ -92,10 +92,37 @@ public sealed class PlaybackClock
         }
     }
 
-    /// <summary>mixer が実音声を書いた分だけ書込カーソルを進める。</summary>
+    /// <summary>mixer が実音声を書いた分だけ書込カーソルを進める。無音区間から戻ってきた場合は、
+    /// ここで実音声の区間（Rate=再生速度）を立て直す。</summary>
+    /// <remarks>
+    /// <b>立て直しを怠ると、一度アンダーランしただけで以後ずっとメディア時刻が進まなくなる。</b>
+    /// 出力そのものは続くので<b>音は鳴り、書込カーソルもハードウェア位置も伸びるのに、
+    /// 再生位置の表示とシークバーのつまみだけが凍る</b>（audio-master クロックなので、音声トラックを
+    /// 持つファイルなら映像も止まる）。
+    /// <para>
+    /// Rate を 0 以外へ戻す経路は <see cref="AnchorAt"/> と <see cref="SetSpeedAt"/> の 2 つだけで、
+    /// ここには無かった（<b>この修正でここが 3 つ目になった</b>）。
+    /// そのため<b>無音が錨より後に来たときだけ</b>再現していた（前に来た場合は
+    /// 後続の <see cref="AnchorAt"/> が偶然立て直す）。<see cref="BeginSeek"/> は Rate を 0 のままに
+    /// するので復帰経路ではない——あちらで凍結が表に出ないのは、<see cref="PositionAt"/> が
+    /// <c>_seekPending</c> で短絡する<b>別系統の仕組み</b>による。混同しないこと。
+    /// </para>
+    /// <para>
+    /// 「短い音声ファイルを D&amp;D するとシークバーが動かないことがある」として観測された
+    /// （音声トラックを持たないファイルでは起きない。トラックが 0 件のとき
+    /// <c>MultiTrackMixer</c> は無音を <see cref="OnAudioWritten"/> 側へ計上するため）。
+    /// </para>
+    /// </remarks>
     public void OnAudioWritten(long frames)
     {
-        lock (_lock) { _writeCursor += frames; }
+        lock (_lock)
+        {
+            // シークギャップ中（_seekPending）にここへ来ても害はない。PositionAt は錨が確定するまで
+            // _seekTarget を返すため、立て直した区間は表示に現れず、AnchorAt が正しい起点で上書きする
+            if (_segments[^1].Rate == 0.0)
+                ReplaceSegmentsFromLocked(_writeCursor, PositionAtFrameLocked(_writeCursor), _currentRate);
+            _writeCursor += frames;
+        }
     }
 
     /// <summary>mixer が無音（アンダーラン・priming 待ち等）を書いた分。クロックは進めない（Rate=0）。</summary>
