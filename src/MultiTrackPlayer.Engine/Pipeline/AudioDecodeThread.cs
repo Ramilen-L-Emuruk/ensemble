@@ -238,6 +238,20 @@ public sealed unsafe class AudioDecodeThread
         _anchorNotifyPending = _prerollActive;
         _anchorTarget = _prerollTarget;
         Diagnostics.DiagnosticLog.Write("audio", $"flush 処理 epoch={epoch} preroll={(_prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
+
+        // 音声トラックを 1 本も持たないファイル（無音動画・スクリーン録画等）では、サンプルが
+        // 一度も来ないため上の「最初のサンプル投入時」が永久に訪れない。その場合ここで完了扱いにする。
+        //
+        // **怠るとシークのたびに再生位置が永久に凍る。** PlaybackClock.BeginSeek が立てた
+        // _seekPending を解除するのは MediaEngine の錨（AnchorAt）だけで、その要求は
+        // OnAudioPrerollReady——つまりこの通知——からしか出ない。凍ったクロックでは映像の due 判定も
+        // 進まないため、リングが満杯になって demux が Put でブロックし、真の終端にも到達しない
+        // （HandleEof 側の解除にも辿り着けない）。停止か開き直しまで解けない。
+        //
+        // 再生開始時は MediaEngine の AnchorAtStart が同じ役目を果たしていて、シークだけが漏れていた。
+        // 世代の照合は CompletePrerollWithoutSamples が行うので、ここで確かめる必要はない
+        if (_decoders.Count == 0)
+            CompletePrerollWithoutSamples("音声トラックなし");
     }
 
     private void HandleEof(AVFrame* frame)
@@ -282,8 +296,20 @@ public sealed unsafe class AudioDecodeThread
 
     /// <summary>
     /// 音声サンプルを一つも出せないまま、シーク後のプリロールを完了扱いにする。
-    /// これを怠るとミキサーの出力保留（HoldOutput）が解除されず、映像ごと止まる。
     /// </summary>
+    /// <remarks>
+    /// <b>怠ったときに壊れるものは呼び出し元によって違う。</b> どちらも「静かに止まる」ので、
+    /// 片方だけを理由と思い込んでこの呼び出しを削らないこと。
+    /// <list type="bullet">
+    /// <item>音声トラックが<b>ある</b>場合（EOF 到達・全トラック切り離し）: ミキサーの出力保留
+    /// （<c>HoldOutput</c>）が解除されず、映像ごと止まる</item>
+    /// <item>音声トラックが<b>無い</b>場合（<c>HandleFlush</c> からの呼び出し）: <c>HoldOutput</c> の方は
+    /// <c>PrerollGate.BeginSeek(hasAudio: false)</c> が音声待ちを即座に済ませるので映像側だけで解ける。
+    /// 代わりに<b>この通知が <c>PlaybackClock._seekPending</c> を解除する唯一の経路</b>になる
+    /// （錨の要求が <c>MediaEngine.OnAudioPrerollReady</c> からしか出ないため）。
+    /// 出ないとシークのたびに再生位置が永久に凍る。詳細は <see cref="HandleFlush"/> のコメント</item>
+    /// </list>
+    /// </remarks>
     /// <param name="reason">ログに残す理由（「EOF 到達」等）。</param>
     private void CompletePrerollWithoutSamples(string reason)
     {
