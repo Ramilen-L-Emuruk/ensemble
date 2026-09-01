@@ -224,6 +224,46 @@ public class TickGateTests
         Assert.Single(reports.Skip(reportsAfterRecovery), r => r == TickSkipReport.Intermittent);
     }
 
+    /// <summary>
+    /// <b>同じ詰まりで 2 行出る経路を固定する。</b> 抑制は <c>Sustained</c> → <c>Intermittent</c> の
+    /// 一方向だけで、逆向きは見ていない。2 つの数えが独立で累計が <c>Exit</c> で戻らないため、
+    /// 「累計が閾値の手前まで積み上がった状態で新しい詰まりが始まる」と
+    /// <c>Intermittent</c> → <c>Sustained</c> の順で両方が発火する。
+    /// </summary>
+    /// <remarks>
+    /// <b>競合ではなく決定的に起きる</b>ので、このテストは単一スレッドで再現できる。
+    /// 仕様として受け入れている挙動（実装側の remarks に理由がある）なので、
+    /// <b>ここで固定するのは「2 行出ること」そのもの</b>——将来これを競合と誤解して
+    /// 逆向きの抑制を足すと、より重い <c>Sustained</c> を落とすことになる。
+    /// </remarks>
+    [Fact(DisplayName = "累計が先に閾値へ達すると、同じ詰まりで Intermittent → Sustained の順に返る")]
+    public void NoteSkip_WhenTotalReachesThresholdFirst_ReportsIntermittentThenSustained()
+    {
+        var gate = Create();
+
+        // 連続 9 回で回復する詰まりを 5 周。累計 45 まで積み、連続は一度も 10 に届かせない
+        for (int round = 0; round < 5; round++)
+        {
+            gate.TryEnter();
+            Assert.Equal(TickSkipReport.None, SkipTimes(gate, SustainedThreshold - 1));
+            gate.Exit();
+        }
+
+        // 新しい詰まり。Exit を挟まないので連続が伸び続ける
+        gate.TryEnter();
+
+        // 連続 5 回目で累計が 50 に達する
+        for (int i = 0; i < 4; i++) Assert.Equal(TickSkipReport.None, Skip(gate));
+        Assert.Equal(TickSkipReport.Intermittent, gate.NoteSkip(out int atIntermittent, out int total));
+        Assert.Equal(5, atIntermittent);
+        Assert.Equal(IntermittentThreshold, total);
+
+        // 同じ詰まりのまま連続 10 回目で Sustained
+        for (int i = 0; i < 4; i++) Assert.Equal(TickSkipReport.None, Skip(gate));
+        Assert.Equal(TickSkipReport.Sustained, gate.NoteSkip(out int atSustained, out _));
+        Assert.Equal(SustainedThreshold, atSustained);
+    }
+
     // ── 生成時の検証 ──
 
     [Theory(DisplayName = "閾値が正でなければ生成を拒否する")]
