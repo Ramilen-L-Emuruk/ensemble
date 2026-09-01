@@ -210,7 +210,7 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
     **3 インスタンス**を使う——音声（ミキサーの `Read`）・映像（フレームの提示）・
     クロック（再生位置が進むこと）。例外を伴う異常停止は `WasapiOut.PlaybackStopped` や各スレッドの
     例外記録が拾うが、例外を出さずに黙って止まる経路はここでしか気づけない。判定は
-    `MediaEngine.StatusTick` の `DetectAudioStall` / `DetectVideoStall` / `DetectClockStall` で、
+    `MediaEngine.StatusTickCore` の `DetectAudioStall` / `DetectVideoStall` / `DetectClockStall` で、
     いずれも `WriteFatal` で記録する。記録するのは**開始・回復・打ち切りの 3 種**
     （`StallDetector` の `Poll` が局面を返し、`Prime` が打ち切りを申告する。なぜ 3 種必要かは
     両メソッドの doc コメント）。状態は出力が戻れば自動で解ける

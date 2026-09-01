@@ -120,9 +120,9 @@
 
 | 領域 | 対象クラス |
 |---|---|
-| ルート | `SeekEpoch` |
+| ルート | `SeekEpoch` / `TickGate` |
 | `Pipeline/` | `BoundedSerialQueue` |
-| `Sync/` | `PlaybackClock` / `PrerollGate` |
+| `Sync/` | `PlaybackClock` / `PrerollGate` / `WasapiPositionSource` |
 | `Audio/` | `PrerollCalculator` / `MultiTrackMixer` / `ResampleFailureTracker` |
 | `Video/` | `FrameSelector` / `SlotSequencer` / `VideoFrameRing` |
 | `Diagnostics/` | `DiagnosticLog` / `StallDetector` |

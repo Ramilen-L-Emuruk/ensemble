@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 
@@ -92,7 +93,22 @@ public static class DiagnosticLog
         if (!Enabled) return;
         lock (Lock)
         {
+            // **同期経路の打刻はロック内で行う。** 外へ出すと、複数スレッドが同時に呼んだとき
+            // 「打刻した順」と「ファイルへ書いた順」が入れ替わる。委譲経路とは要求が逆で、
+            // あちらは書き込みがずっと後になるので積む時点で打刻する必要がある
             WriteLineToSessionLog(FormatLine(category, message));
+        }
+    }
+
+    /// <summary>
+    /// 整形済みの 1 行をセッションログへ書く。<b>委譲経路（<see cref="WriteDeferred"/>）専用。</b>
+    /// 打刻は積んだ時点で済んでいるので、ここでは行わない。
+    /// </summary>
+    private static void WriteLine(string line)
+    {
+        lock (Lock)
+        {
+            WriteLineToSessionLog(line);
         }
     }
 
@@ -107,8 +123,11 @@ public static class DiagnosticLog
     /// セッションログが開いていればそちらへ、無ければ <see cref="DefaultDirectory"/> の fatal.log へ追記する。
     /// </summary>
     public static void WriteFatal(string category, string message)
+        => WriteFatalLine(FormatLine(category, message));
+
+    /// <summary>整形済みの 1 行を、セッションログ → fatal.log の二段構えで書く。</summary>
+    private static void WriteFatalLine(string line)
     {
-        string line = FormatLine(category, message);
         bool writtenToSession;
         lock (Lock)
         {
@@ -120,6 +139,86 @@ public static class DiagnosticLog
         // （デバッグモード無効時はこちらが既定経路になるため、Lock を握ったままだと
         //   デバッグモード切替などが最大 500ms ブロックされる）
         if (!writtenToSession) AppendToFatalFile(line);
+    }
+
+    /// <summary>
+    /// <see cref="WriteFatal"/> をスレッドプールへ逃がして即座に戻る。
+    /// <b>クリティカルセクション内・高頻度に呼ばれる経路から記録する場合はこちらを使う。</b>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>逃がす理由</b>: <see cref="WriteFatal"/> は既定運用（デバッグモード無効）だと
+    /// <c>fatal.log</c> 側が本経路になり、プロセス間ミューテックスの待ちとファイル I/O を伴う。
+    /// 音声レンダースレッド・vout スレッド・周期タイマーのコールバックから直接呼ぶと、
+    /// その待ちがそのまま音切れ・コマ落ち・UI の固まりになる。
+    /// <b>フリーズを調べる機能でフリーズを作ることになる。</b>
+    /// </para>
+    /// <para>
+    /// <b>代償</b>: 記録は最善努力になり、失われる窓が 3 つある——①直後に利用者がアプリを閉じる
+    /// ②異常と同時にプロセスが落ちる ③スレッドプールが飽和して実行が遅れる。
+    /// 呼び出し側が利用者へ同期に案内を出すなら、窓が開いても失われるのは診断ログだけ。
+    /// 記録しかしない経路では、窓が開けばその行はそのまま失われる。
+    /// </para>
+    /// <para>
+    /// <b>ファイル上の並び順は保証しないが、打刻は正しい。</b> 時刻は<b>積む時点</b>で採るので、
+    /// 行が入れ替わってもタイムスタンプで発生順に並べ直せる。
+    /// ここを怠るとワーカーの待ちが打刻に混ざり、混雑時——つまり調査したい状況——ほど
+    /// ずれが大きくなる。<b>行頭のスレッド ID も積んだスレッド</b>（＝事象が起きたスレッド）に
+    /// なる。ワーカーの ID が出ても読み手には何の手掛かりにもならないので、これも前倒しが正しい。
+    /// </para>
+    /// <para>
+    /// <b><c>catch</c> がある理由</b>: スレッドプールのワーカーで未処理例外が出るとプロセスが落ちる。
+    /// <see cref="WriteFatal"/> は現状すべての経路を自分で受け止めているが、
+    /// <b>診断ログの失敗が呼び出し元を巻き添えにする</b>のは代償が釣り合わない。
+    /// ここで握り潰しても失うものは無い——この経路は「記録すること自体」が仕事で、
+    /// 記録できないなら他に打つ手が無い。
+    /// </para>
+    /// </remarks>
+    public static void WriteFatalDeferred(string category, string message)
+    {
+        // **時刻は積む時点で採る。** ワーカーで採るとスレッドプールの待ちがそのまま打刻に混ざり、
+        // 「行の前後関係はタイムスタンプで突き合わせる」という前提が崩れる。
+        // しかもずれが大きくなるのは混雑時——**調査したい状況でこそ効かなくなる**
+        string line = FormatLine(category, message);
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try { WriteFatalLine(line); }
+            // 呼び出し元を落とさないことが目的だが、**完全な無音にはしない**。
+            // WriteFatal は現状すべての失敗を自分で受け止めているので、ここへ来るのは
+            // あちらに無防備な経路が足された場合だけ。
+            // **Debug.WriteLine ではなく Trace.WriteLine。** あちらは [Conditional("DEBUG")] なので
+            // Release ビルドでは呼び出しごと IL から消え、配布する exe では旧実装と同じ完全な無音に戻る
+            //（このプロジェクトの Release は TRACE;RELEASE を定義する）。
+            // 残るのは OutputDebugString なのでファイルには出ない——デバッガ接続時か
+            // DebugView 等で見る用。それ以上のことはできない（記録が失敗している最中なので）
+            catch (Exception ex) { Trace.WriteLine($"[DiagnosticLog] WriteFatalDeferred が失敗: {ex}"); }
+        });
+    }
+
+    /// <summary>
+    /// <see cref="Write"/> をスレッドプールへ逃がして即座に戻る。
+    /// <b>ロックを保持したまま診断ログを書く箇所はこちらを使う。</b>
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Write"/> は有効時に <c>AutoFlush</c> つきの書き込みを行うため、
+    /// ロック内から呼ぶとそのロックを待つ他のスレッドまで巻き込んでディスク I/O ぶん止まる。
+    /// <b>デバッグモードを有効にした瞬間だけ現れる遅さ</b>になり、
+    /// まさに調査したい経路を調査行為が乱すことになる。
+    /// <para>
+    /// 無効時は<b>何も積まない</b>ので、既定運用の負荷はゼロ。
+    /// </para>
+    /// </remarks>
+    public static void WriteDeferred(string category, string message)
+    {
+        if (!Enabled) return;
+        // 打刻を前倒しする理由は WriteFatalDeferred の該当箇所を参照
+        string line = FormatLine(category, message);
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try { WriteLine(line); }
+            // Trace である理由は WriteFatalDeferred の該当箇所を参照
+            catch (Exception ex) { Trace.WriteLine($"[DiagnosticLog] WriteDeferred が失敗: {ex}"); }
+        });
     }
 
     private static string FormatLine(string category, string message)
