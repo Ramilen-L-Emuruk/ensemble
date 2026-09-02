@@ -558,15 +558,14 @@ public unsafe class MediaEngine : IMediaEngine
                 // シークバーのつまみが動かず、シークもできない状態になる。利用者には
                 // 「操作しても何も起きない」としか見えないので、既定運用でも記録を残す。
                 //
-                // 記録はスレッドプールへ逃がす。WriteFatal は既定運用だとプロセス間ミューテックス
-                // （最大 500ms 待ち）とファイル I/O を伴い、Open は UI スレッドで同期実行される
-                // （DetectAudioStall と同じ理由・同じ形）。尺が取れないファイルがプレイリストに
-                // 続くと、自動送りのたびに待ち時間が積み上がる。
+                // 記録はスレッドプールへ逃がす。理由と代償は WriteFatalDeferred の doc が
+                // 単一の情報源（Open は UI スレッドで同期実行されるので、尺が取れないファイルが
+                // プレイリストに続くと自動送りのたびに待ち時間が積み上がる）。
                 // 記録が失われる窓は、Open が一度きりの同期呼び出しなので「開いた直後に
-                // アプリを閉じた場合」だけ（周期的に呼ばれるあちらより窓は狭い）
-                ThreadPool.QueueUserWorkItem(_ => DiagnosticLog.WriteFatal("engine",
+                // アプリを閉じた場合」だけ（周期的に呼ばれる経路より窓は狭い）
+                DiagnosticLog.WriteFatalDeferred("engine",
                     "尺を取得できなかった（コンテナもストリームも申告なし）。"
-                    + "シークバーの表示とシークが機能しない"));
+                    + "シークバーの表示とシークが機能しない");
                 break;
         }
         return resolved.Seconds;
@@ -726,8 +725,15 @@ public unsafe class MediaEngine : IMediaEngine
             // ここで巻き戻さないと _state=Playing・_demuxThread が非 null のまま残り、
             // 以後 Play() は先頭の早期 return で、EnsurePipelineStarted は再入ガードで
             // それぞれ素通りしてしまい、アプリを再起動するまで再生できなくなる。
-            // 後始末は Stop() と同じ扱いにする（片方だけ丁寧にすると、読み取り位置が
-            // 不明なまま次の再生に入って表示位置がずれる経路が残る）
+            //
+            // **後始末は Stop() と同じものを通す。** 音声出力の停止・バッファ・クロック・
+            // 位置ソース・巻き戻しは HandleTeardownResult に集約してあり、両方の経路が
+            // そこを通る（以前はここが 4 つ漏らしていた。それらはファイルを開くたびに 1 度だけ
+            // 作られる資源なので、漏らすと次の再生へ汚れたまま持ち越される）。
+            //
+            // **1 つだけ Stop() と逆向きにする**——開始位置の保持。Stop() は捨てるが
+            // （「停止したら次は先頭から」の意味）、こちらは戻す（下記の該当箇所）。
+            // 失敗は利用者の意図を打ち消さない
             SetState(CorePlaybackState.Stopped);
             // 既に検疫済み（＝EnsurePipelineStarted が構築を拒否した）なら畳むものは無い。
             // 再実行しても no-op だが「停止待ちが完了しなかった」ログが二重に出て調査を誤導する
@@ -739,7 +745,7 @@ public unsafe class MediaEngine : IMediaEngine
                 // ここを省くと、取り残されたデコードスレッドが同じ世代の完了通知を後から出して
                 // 保留を解き、停止したはずの旧ファイルの音が漏れる
                 _prerollGate.Reset(hold: !allThreadsStopped);
-                HandleTeardownResult(allThreadsStopped);
+                HandleTeardownResult(allThreadsStopped, "再生開始の失敗");
             }
             // 停止状態へ戻したので、利用者が選んだ開始位置も戻す（消費したままにすると、
             // 再生を押し直したときに黙って先頭から始まる）。Stop() は通っていないので残る
@@ -774,53 +780,79 @@ public unsafe class MediaEngine : IMediaEngine
         // 以降 Seek() までは、遅れて届いたプリロール完了通知は世代違いで捨てられ保留へ触れない
         _prerollGate.Reset(hold: !allThreadsStopped);
 
-        if (allThreadsStopped)
-        {
-            // パイプラインは畳み終わっていて後戻りできない。
-            // 音声デバイス側の停止に失敗しても停止状態として扱い、記録だけ残す
-            try { _wasapiOut?.Stop(); }
-            catch (Exception ex) { DiagnosticLog.WriteFatal("engine", $"音声出力の停止に失敗: {ex}"); }
-            foreach (var s in _audioStates) s.Buffer.ClearBuffer();
-            _clock.Reset();
-            _positionSource?.Reset();
-            // ミキサー出力の保留は上の _prerollGate.Reset() で解除済み。ここで重ねて書かない
-            //（同じ状態を 2 箇所から書くと、片方だけを直したときに食い違う）
-        }
-        else
-        {
-            // 検疫時。取り残されたスレッドが _wasapiOut(WASAPI COM) や各トラックのバッファを
-            // まだ触っている可能性がある。IAudioClient は並行アクセスに耐えないため、ここで
-            // Stop() すると状態タイマーの GetPosition() と競合してプロセスが落ちうる。
-            // 触るのはミキサー出力の保留（マネージドな volatile bool 1 つ）だけにして消音する。
-            // その保留は上の _prerollGate.Reset(hold: !allThreadsStopped) で既に立っている（ここで
-            // 重ねて書かない。false を挟むと、その隙間に旧ファイルの音が漏れる）。
-            // これらの資源は DisposeDecoders が検疫し、解放しないまま次のファイルへ引き継がない
-            DiagnosticLog.WriteFatal("engine",
-                "検疫中のため音声出力・バッファ・クロックの後始末を省略した（ミキサー出力の保留で消音）");
-        }
-        HandleTeardownResult(allThreadsStopped);
+        // 音声側の後始末（音声出力の停止・バッファ・クロック・位置ソース）と読み取り位置の
+        // 巻き戻しは HandleTeardownResult に集約してある。**Play() の失敗経路と同じものを通す**
+        HandleTeardownResult(allThreadsStopped, "停止");
     }
 
     /// <summary>
-    /// パイプラインを畳んだ後の共通の後始末。Stop() と Play() の失敗経路の両方から呼ぶこと。
-    /// 片方だけ丁寧に扱うと、読み取り位置が不明なまま次の再生に入って表示位置がずれる経路が残る。
+    /// パイプラインを畳んだ後の共通の後始末。<b><see cref="Stop"/> と <see cref="Play"/> の失敗経路の
+    /// 両方から呼ぶこと。</b>片方だけ丁寧に扱うと、次の再生が汚れた状態から始まる。
     /// </summary>
-    private void HandleTeardownResult(bool allThreadsStopped)
+    /// <remarks>
+    /// <para>
+    /// <b>ここに集約している理由</b>: これらの資源は<b>ファイルを開くたびに 1 度だけ</b>作られる
+    /// （<see cref="SetupAudio"/> は <see cref="Open"/> から呼ばれ、
+    /// <see cref="EnsurePipelineStarted"/> は通らない）。つまり<b>パイプラインを作り直しても
+    /// 初期化されない</b>ので、畳んだ側で戻さないと汚れたまま次の再生へ持ち越される。
+    /// 呼び出し経路ごとに書くと片方が漏れる——実際に <c>Play()</c> の失敗経路が
+    /// 「<c>Stop()</c> と同じ扱いにする」と宣言しながら 4 つを漏らしていた。
+    /// </para>
+    /// <para>
+    /// <b>呼ぶ前に <c>_prerollGate.Reset(hold: !allThreadsStopped)</c> を済ませておくこと。</b>
+    /// ミキサー出力の保留はあちらで確定させる（ここで重ねて書かない。同じ状態を 2 箇所から
+    /// 書くと、片方だけを直したときに食い違う）。
+    /// </para>
+    /// <para>
+    /// <paramref name="caller"/> は記録に載せる呼び出し元の名前。<b>省略できない。</b>
+    /// 同じ文言が 2 つの経路から出るため、無いと <c>fatal.log</c> を読む人が
+    /// 「利用者が停止した」のか「再生の開始に失敗した」のかを行だけでは判別できない。
+    /// </para>
+    /// <para>
+    /// <b>検疫時（<paramref name="allThreadsStopped"/> が偽）は音声側を触らない。</b>
+    /// 取り残されたスレッドが <c>_wasapiOut</c>（WASAPI COM）や各トラックのバッファをまだ
+    /// 触っている可能性があり、<c>IAudioClient</c> は並行アクセスに耐えない——ここで
+    /// <c>Stop()</c> すると状態タイマーの <c>GetPosition()</c> と競合してプロセスが落ちうる。
+    /// 消音は上記の保留（マネージドな <c>volatile bool</c> 1 つ）だけで済ませる。
+    /// これらの資源は <see cref="DisposeDecoders"/> が検疫し、解放しないまま次のファイルへ
+    /// 引き継がない。
+    /// </para>
+    /// </remarks>
+    private void HandleTeardownResult(bool allThreadsStopped, string caller)
     {
         // demux スレッドがまだ生きている可能性がある間に AVFormatContext を触ると、
         // av_read_frame と競合してネイティブヒープを壊す。その場合は巻き戻しを諦めるが、
         // 読み取り位置が不明なまま次の再生に入ると表示位置がずれるため覚えておく
         if (allThreadsStopped)
         {
+            // パイプラインは畳み終わっていて後戻りできない。音声デバイス側の停止に失敗しても
+            // 停止状態として扱い、記録だけ残す。**呼び出し元を載せる**——「利用者が停止した」のと
+            // 「再生の開始に失敗した直後」では、デバイスの前提が違う（後者は一度も正常に
+            // 開始していない可能性がある）。切り分けの手掛かりになる
+            try { _wasapiOut?.Stop(); }
+            catch (Exception ex)
+            {
+                DiagnosticLog.WriteFatal("engine", $"{caller}の後始末（音声出力の停止に失敗）: {ex}");
+            }
+            foreach (var s in _audioStates) s.Buffer.ClearBuffer();
+            // クロックを戻さないと、シークの途中で失敗した場合に _seekPending が立ったまま残り、
+            // PositionAt がシーク目標を返し続ける（位置表示が凍る）
+            _clock.Reset();
+            _positionSource?.Reset();
+
             // 巻き戻しそのものが失敗することもある（シーク不可のストリーム・壊れたインデックス）。
             // 成否を見ずに false を立てると、読み取り位置は動いていないのに「先頭にある」と
             // 記録され、次の再生が錨だけ張って「表示は 0:00 なのに停止位置の続きが流れる」になる
-            _rewindSkipped = !RewindToStart();
+            _rewindSkipped = !RewindToStart(caller);
         }
         else
         {
             _rewindSkipped = true;
-            DiagnosticLog.WriteFatal("engine", "停止待ちが完了しなかったため読み取り位置の巻き戻しを省略した");
+            // **列挙は if 分岐の中身と揃えること。** 省略したものを 1 つ書き落とすと、
+            // 記録を読んだ人が「あれはリセットされたのか」を取り違える
+            DiagnosticLog.WriteFatal("engine",
+                $"{caller}の後始末: 停止待ちが完了しなかったため、音声出力・バッファ・クロック・"
+                + "位置ソースの後始末と読み取り位置の巻き戻しを省略した（ミキサー出力の保留で消音）");
         }
     }
 
@@ -834,14 +866,32 @@ public unsafe class MediaEngine : IMediaEngine
     /// 読み取り位置が先頭にあると言える場合 true。呼び出し元はこれを <c>_rewindSkipped</c> へ
     /// 反映すること。失敗を無視して「戻した」ことにすると、上記の食い違いが痕跡なく起きる。
     /// </returns>
-    private bool RewindToStart()
+    private bool RewindToStart(string caller)
     {
         // ファイルが無ければ戻すものも無い。次に開くファイルは先頭から読み始まる
         if (_fmtCtx == null) return true;
         int ret = avformat_seek_file(_fmtCtx, -1, long.MinValue, 0, 0, (int)AVSEEK_FLAG.Backward);
         if (ret < 0)
         {
-            DiagnosticLog.Write("engine", $"停止時の巻き戻しに失敗 ret={ret} ({FFmpegError.Describe(ret)})");
+            // **既定運用にも残す。** 失敗すると「表示は 0:00 なのに停止位置の続きが流れる」に
+            // 直結する（この doc の説明どおり）。診断ログ側に置くと、デバッグモードを
+            // 有効にしていない環境では症状だけが見えて決定的な証拠が残らない。
+            //
+            // **ただし委譲する。** ここは Stop() から来るが、その Stop() は Close() 経由で
+            // Open() の先頭からも呼ばれる——つまり**ファイルを開くたびに通る**。
+            // 同期で書くと UI スレッドがプロセス間ミューテックス待ち（最大 500ms）を背負う。
+            // **失敗が繰り返されるファイル**（シーク不可のストリーム・壊れたインデックス）では
+            // それが開くたびに乗り、自動送りでは待ち時間が積み上がる。
+            //（avformat_seek_file がその種のストリームで必ず失敗するかは未検証。ここで要るのは
+            //   「繰り返されうる」までで、頻度の上限が利用者の操作でなく再生の進行で決まる点）。
+            // ResolveDurationSeconds の DurationSource.Unknown が同じ理由で同じ逃がし方をしている。
+            //
+            // **代償**: Close() は Dispose() からも呼ばれるので、アプリ終了と重なるとこの行は
+            // 失われうる（スレッドプールの完了をプロセス終了は待たない）。受け入れる——
+            // 旧実装は既定運用でこの失敗を**一度も**記録していなかったので後退ではないし、
+            // 終了時の記録は「次の再生」の調査には使えない
+            DiagnosticLog.WriteFatalDeferred("engine",
+                $"{caller}の後始末: 読み取り位置の巻き戻しに失敗 ret={ret} ({FFmpegError.Describe(ret)})");
             return false;
         }
         return true;
