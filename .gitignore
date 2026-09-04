@@ -24,6 +24,11 @@ Desktop.ini
 # `.claude/*` と書いている。
 .claude/*
 !.claude/rules/
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/release/
+.claude/skills/release/*
+!.claude/skills/release/SKILL.md
 
 # Release output
 publish/
