@@ -122,6 +122,7 @@
 |---|---|
 | ルート | `SeekEpoch` / `TickGate` |
 | `Pipeline/` | `BoundedSerialQueue` |
+| `Decoding/` | `ReceiveOutcomeClassifier` |
 | `Sync/` | `PlaybackClock` / `PrerollGate` / `WasapiPositionSource` |
 | `Audio/` | `PrerollCalculator` / `MultiTrackMixer` / `ResampleFailureTracker` |
 | `Video/` | `FrameSelector` / `SlotSequencer` / `VideoFrameRing` |

@@ -161,15 +161,33 @@ public unsafe class VideoDecoder : IDisposable
     /// <summary>デコーダへパケットを送る（pkt に null を渡すと EOF フラッシュ）。avcodec_send_packet の戻り値をそのまま返す。</summary>
     public int SendPacket(AVPacket* pkt) => avcodec_send_packet(_ctx, pkt);
 
-    /// <summary>1フレーム分だけ受信する。EAGAIN/EOF なら false（呼び出し側はループを抜ける）。
-    /// それ以外の負値（壊れたデータ等の本当のデコードエラー）は診断ログに残す。</summary>
-    public bool TryReceiveFrame(AVFrame* frame)
+    /// <summary>1 フレーム分だけ受信する。</summary>
+    /// <returns>
+    /// <see cref="ReceiveOutcome.Frame"/> なら 1 枚取り出せた。
+    /// <see cref="ReceiveOutcome.Again"/>（入力不足）と
+    /// <see cref="ReceiveOutcome.EndOfStream"/>（ドレイン完了）は<b>正常</b>で、呼び出し側は
+    /// ループを抜ける。<see cref="ReceiveOutcome.Error"/> は本物のデコードエラー。
+    /// </returns>
+    /// <remarks>
+    /// <b>正常な空振りとエラーを呼び出し側が区別できることが要点。</b> 以前は <c>bool</c> に
+    /// 畳んでいたため「送信は成功し続けるのに受信が失敗し続ける」状態を誰も検出できなかった
+    /// （<see cref="ReceiveOutcome"/> の remarks）。<b>この戻り値を <c>bool</c> へ戻さないこと。</b>
+    /// <para>
+    /// エラーは<b>単発でも診断ログに残す</b>が、常に残す側（<c>WriteFatal</c>）は呼び出し側に任せる。
+    /// 破損パケット由来の単発は次のパケットで回復するので、確度が低いうちに <c>fatal.log</c> へ
+    /// 出すと騒がしくなる（記録の強さは確度に合わせる）。
+    /// </para>
+    /// </remarks>
+    public ReceiveOutcome TryReceiveFrame(AVFrame* frame)
     {
         int ret = avcodec_receive_frame(_ctx, frame);
-        if (ret == 0) return true;
-        if (ret != -EAGAIN && ret != AVERROR_EOF)
+        var outcome = ReceiveOutcomeClassifier.Classify(ret);
+        // 単発のエラーは診断ログに留める。**常に残す側は呼び出し側に任せる**——
+        // 破損パケット由来の単発は次のパケットで回復するので、確度が低いうちに
+        // fatal.log へ出すと騒がしくなる（記録の強さは確度に合わせる）
+        if (outcome == ReceiveOutcome.Error)
             DiagnosticLog.Write("error", $"映像デコードエラー ret={ret} ({FFmpegError.Describe(ret)})");
-        return false;
+        return outcome;
     }
 
     /// <summary>

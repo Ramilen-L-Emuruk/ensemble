@@ -62,6 +62,7 @@ public sealed unsafe class AudioDecodeThread
     // EOF ドレインの flush パケット失敗。通常デコード中の失敗（NoteNotProgressing が数える）とは
     // 原因もタイミングも別なので、抑制を分けて片方が他方を隠さないようにする
     private readonly bool[] _eofFlushFailureLogged;
+    private readonly bool[] _eofReceiveErrorLogged;
     // 規約違反（WriteFatal で常に残す）の抑制。診断ログ限りの失敗と分けているのは、
     // 先に起きた軽い失敗が規約違反の記録を永久に打ち消さないようにするため
     private readonly bool[] _dataAfterDrainingLogged;
@@ -104,6 +105,7 @@ public sealed unsafe class AudioDecodeThread
         _onTrackAbandoned = onTrackAbandoned;
         _resampleFailureLogged = new bool[decoders.Count];
         _eofFlushFailureLogged = new bool[decoders.Count];
+        _eofReceiveErrorLogged = new bool[decoders.Count];
         _dataAfterDrainingLogged = new bool[decoders.Count];
         _eofFlushDoubleSendLogged = new bool[decoders.Count];
         _noProgressStreak = new int[decoders.Count];
@@ -278,10 +280,26 @@ public sealed unsafe class AudioDecodeThread
                 LogFatalOnce(_eofFlushDoubleSendLogged, i,
                     $"EOF ドレインの flush パケットが二重送信された track={i}（終端付近の音が欠ける）");
             else if (flushRet < 0)
-                LogOnce(_eofFlushFailureLogged, i,
-                    $"EOF ドレインの SendPacket が失敗 track={i} ret={flushRet}");
-            while (_decoders[i].TryReceiveFrame(frame))
+                // **常に残す。** EOF はその時点で確定した終端で、「次のパケットで回復する」が無い——
+                // 通常デコード中の単発失敗と違って初回がそのまま確定なので、確度に合わせれば
+                // 常に残す側になる。抑制フラグは**このデコードスレッドの寿命**に紐づくので、
+            // 出るのはパイプラインにつき 1 行（シークでは作り直されないが、停止→再生や
+            // ファイル切替では作り直されるので、そのたびに 1 行出うる）
+                LogFatalOnce(_eofFlushFailureLogged, i,
+                    $"EOF ドレインの SendPacket が失敗 track={i} ret={flushRet}（終端付近の音が欠ける）");
+            // 受信エラーは**縮退に乗せない**（直後に IsEof を立てるので、トラックを畳む判断を
+            // 重ねる意味が無い）。ただし結末は上の SendPacket 失敗と同じ「終端付近の音が
+            // 無言で欠ける」なので記録する。抑制フラグを分けているのは、通常デコード中の失敗が
+            // 先に記録されていると EOF 特有の失敗が隠れて残らなくなるため
+            while (true)
             {
+                var outcome = _decoders[i].TryReceiveFrame(frame);
+                if (outcome == Decoding.ReceiveOutcome.Error)
+                    // 上の SendPacket 失敗と同じ理由で常に残す（EOF は確定した終端なので初回が確定）
+                    LogFatalOnce(_eofReceiveErrorLogged, i,
+                        $"EOF ドレイン中の受信が本物のエラーを返した track={i}（終端付近の音が欠ける）");
+                if (outcome != Decoding.ReceiveOutcome.Frame) break;
+
                 var pcm = _decoders[i].ResampleFrame(frame);
                 if (pcm != null) AddWithGate(i, pcm, 0, pcm.Length);
                 else LogOnce(_resampleFailureLogged, i, $"EOF ドレイン中のリサンプルに失敗 track={i}");
@@ -391,18 +409,21 @@ public sealed unsafe class AudioDecodeThread
             // 対称性を求めて DrainInto へ停止要求のガードを足してはいけない。映像側でこのループが
             // 確実にスピンするのは、まさにそのガードで停止要求中に 1 枚も吸わなくなるからで、
             // 足せば同じ危険を音声側にも作ることになる。停止は Run のループ条件で見れば足りる
-            if (!DrainInto(trackIndex, decoder, frame))
+            if (!DrainInto(trackIndex, decoder, frame, out bool sawReceiveError))
             {
                 // 記録だけで抜けてはいけない。ミキサーは「EOF かつ残量ゼロ」のトラックしか
                 // 共通利用可能量の計算から除外しないため、残量ゼロのまま居座らせると common が
                 // 0 に固定され、健全な他トラックまで無音になる（AbandonTrack の doc コメント参照）。
                 // しかもその無音は滞留検出に引っかからない（StallDetector が見る Read は呼ばれ続ける）。
                 //
-                // ただし単発では畳まない。TryReceiveFrame は -EAGAIN・AVERROR_EOF・本物のデコード
-                // エラーをまとめて false にするため、破損パケット由来の単発エラーもここへ来る。
-                // 一度で畳むと、次のパケットで回復できるトラックを残り再生時間ずっと無音にして
-                // しまう（ResampleFailureTracker が閾値方式を採っているのと同じ理由）
-                NoteNotProgressing(trackIndex, "デコーダが入力を受け付けず出力も出せない");
+                // ただし単発では畳まない。破損パケット由来の単発エラーもここへ来るので、
+                // 一度で畳むと次のパケットで回復できるトラックを残り再生時間ずっと無音にして
+                // しまう（ResampleFailureTracker が閾値方式を採っているのと同じ理由）。
+                // **受信がエラーだったかで理由を書き分ける**——原因が違えば調べる場所も違う
+                //（映像側の同じ箇所と揃えること。片方だけ直すと調査の手がかりが非対称になる）
+                NoteNotProgressing(trackIndex, sawReceiveError
+                    ? "デコーダが入力を受け付けず、受信も本物のエラーを返した"
+                    : "デコーダが入力を受け付けず出力も出せない");
                 return;
             }
             ret = decoder.SendPacket(pkt);
@@ -425,14 +446,24 @@ public sealed unsafe class AudioDecodeThread
             // 手がかりが残らないため、記録も NoteNotProgressing に任せる（初回の 1 行に ret を載せている）
             NoteNotProgressing(trackIndex, $"SendPacket が失敗した（ret={ret}）");
         }
-        else
-        {
-            // パケットが受け付けられた＝このトラックは前進した。連続失敗を数え直す。
-            // ここで戻さないと、ファイル全体に散らばった単発の失敗が積み上がって「連続」ではない
-            // 数え方になり、健全なトラックがいつか閾値に達して畳まれる
-            _noProgressStreak[trackIndex] = 0;
-        }
-        DrainInto(trackIndex, decoder, frame);
+        // ここで数え直さない。「パケットが受け付けられた」のは送信の前進で、受信の前進は
+        // 下のドレインを見るまで分からない（詳細はその下のコメント）
+        bool sendAccepted = ret >= 0;
+
+        // **ここの受信エラーを捨てないこと。** 捨てると「送信は成功し続けるのに受信が失敗し続ける」
+        // 状態がどのカウンタにも乗らない。1 枚でも取り出せていれば前進しているので数えない
+        bool drainedTail = DrainInto(trackIndex, decoder, frame, out bool tailReceiveError);
+
+        // **送信の前進と受信の前進を混ぜないこと。** 「パケットが受け付けられた」だけで連続回数を
+        // 数え直すと、その直後の受信エラーで 1 に戻るだけになり**閾値に永久に届かない**。
+        // だから数え直しはドレインの結果を見てから。送信が失敗していた場合は上で既に数えている
+        // ので重ねない。
+        // 数え直し自体が要る理由は変わらない——戻さないと、ファイル全体に散らばった単発の失敗が
+        // 積み上がって「連続」ではない数え方になり、健全なトラックがいつか閾値に達して畳まれる
+        if (sendAccepted && tailReceiveError && !drainedTail)
+            NoteNotProgressing(trackIndex, "送信は通ったが受信が本物のエラーを返した");
+        else if (sendAccepted)
+            _noProgressStreak[trackIndex] = 0; // 送信も受信も前進した
     }
 
     /// <summary>
@@ -449,9 +480,11 @@ public sealed unsafe class AudioDecodeThread
     /// 常に残す <c>WriteFatal</c> は、畳むと確定した時点（<see cref="AbandonTrack"/>）に任せる。
     /// </para>
     /// <para>
-    /// 対象は<b>送信できなかった</b>場合だけで、「送信は通ったのに
-    /// <c>avcodec_receive_frame</c> が本物のエラーを返し続ける」経路は数えていない
-    /// （<c>TryReceiveFrame</c> がエラーと -EAGAIN を <c>false</c> に畳んでいるため区別できない）。
+    /// 対象は<b>送信できなかった</b>場合と、<b>送信は通ったのに受信が本物のエラーを返した</b>場合。
+    /// 後者は <see cref="Decoding.ReceiveOutcome"/> を導入して区別できるようにした——
+    /// 枚数では代用できない（送信成功時にフレームが出ないのはリオーダ遅延で正常に起きる）。
+    /// <b>1 枚でも取り出せた場合は数えない。</b> それは前進しているので。
+    /// EOF ドレイン中の受信エラーもここには乗せない（直後に <c>IsEof</c> を立てるため）。
     /// </para>
     /// </summary>
     /// <param name="trackIndex">対象トラック。</param>
@@ -473,13 +506,24 @@ public sealed unsafe class AudioDecodeThread
     }
 
     /// <summary>デコーダの出力を吸い出してトラックのバッファへ流す。</summary>
-    /// <returns>1 枚以上取り出した場合 true。デコードエラーで 1 枚も取り出せなかった場合 false
-    /// （呼び出し側は「再送しても前進しない」と判断する）。</returns>
-    private bool DrainInto(int trackIndex, AudioDecoder decoder, AVFrame* frame)
+    /// <param name="sawReceiveError">
+    /// <c>avcodec_receive_frame</c> が<b>本物のエラー</b>を返した場合 true。
+    /// <c>-EAGAIN</c>・<c>AVERROR_EOF</c> は正常なので立てない。
+    /// <b>呼び出し側はこれを前進不能の判定へ流すこと</b>——捨てると
+    /// 「送信は成功し続けるのに受信が失敗し続ける」状態を誰も検出できない
+    /// （<see cref="Decoding.ReceiveOutcome"/> の remarks）。
+    /// </param>
+    /// <returns>1 枚以上取り出した場合 true。1 枚も取り出せなかった場合 false。</returns>
+    private bool DrainInto(int trackIndex, AudioDecoder decoder, AVFrame* frame, out bool sawReceiveError)
     {
         bool drainedAny = false;
-        while (decoder.TryReceiveFrame(frame))
+        sawReceiveError = false;
+        while (true)
         {
+            var outcome = decoder.TryReceiveFrame(frame);
+            if (outcome == Decoding.ReceiveOutcome.Error) sawReceiveError = true;
+            if (outcome != Decoding.ReceiveOutcome.Frame) break;
+
             drainedAny = true;
             HandleDecodedFrame(trackIndex, decoder, frame);
             av_frame_unref(frame);
