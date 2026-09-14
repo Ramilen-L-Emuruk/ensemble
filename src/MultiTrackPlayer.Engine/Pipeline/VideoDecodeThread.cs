@@ -72,6 +72,7 @@ public sealed unsafe class VideoDecodeThread
     // 同じフラグで抑制すると、先に起きた軽い失敗が規約違反の記録を永久に打ち消す
     private bool _dataAfterDrainingLogged;
     private bool _eofFlushFailureLogged;
+    private bool _eofReceiveErrorLogged;
     private bool _eofFlushDoubleSendLogged;
     // 「このパケットは送れなかった」を連続で観測した回数（NoteNotProgressing が数える）。
     // 記録の抑制もこの値で行うため、専用フラグは置かない
@@ -222,10 +223,26 @@ public sealed unsafe class VideoDecodeThread
         else if (flushRet < 0 && !_eofFlushFailureLogged)
         {
             _eofFlushFailureLogged = true;
-            Diagnostics.DiagnosticLog.Write("video",
-                $"EOF ドレインの SendPacket が失敗 ret={flushRet}");
+            // **常に残す。** EOF はその時点で確定した終端で、「次のパケットで回復する」が無い——
+            // 通常デコード中の単発失敗と違って初回がそのまま確定なので、確度に合わせれば
+            // 常に残す側になる。抑制フラグは**このデコードスレッドの寿命**に紐づくので、
+            // 出るのはパイプラインにつき 1 行（シークでは作り直されないが、停止→再生や
+            // ファイル切替では作り直されるので、そのたびに 1 行出うる）
+            Diagnostics.DiagnosticLog.WriteFatal("video",
+                $"EOF ドレインの SendPacket が失敗 ret={flushRet}（終端付近の映像が欠ける）");
         }
-        DrainAvailable(frame);
+        // EOF ドレインでの受信エラーは**縮退に乗せない**（直後に MarkEof するので、
+        // プリロールの打ち切りを重ねる意味が無い）。ただし結末は隣の SendPacket 失敗と同じ
+        //「終端付近の映像が無言で欠ける」なので記録する。抑制フラグを分けているのは、
+        // 通常デコード中の失敗が先に記録されていると EOF 特有の失敗が隠れて残らなくなるため
+        DrainAvailable(frame, out bool eofReceiveError);
+        if (eofReceiveError && !_eofReceiveErrorLogged)
+        {
+            _eofReceiveErrorLogged = true;
+            // 上の SendPacket 失敗と同じ理由で常に残す（EOF は確定した終端なので初回が確定）
+            Diagnostics.DiagnosticLog.WriteFatal("video",
+                "EOF ドレイン中の受信が本物のエラーを返した（終端付近の映像が欠ける）");
+        }
         ReleasePendingPreroll("EOF 到達");
         _sink.MarkEof();
     }
@@ -267,16 +284,18 @@ public sealed unsafe class VideoDecodeThread
             // 3 秒で諦め、キュー・リング・変換器が検疫されて「ファイルを開き直すまで再生が
             // 再開しない」状態になる。DrainAvailable は停止要求中は何も吸わないので、
             // 停止操作・ファイル切替のたびにこの窓を踏みうる
-            bool drained = DrainAvailable(frame);
+            bool drained = DrainAvailable(frame, out bool sawReceiveError);
             // 停止要求で吸うのをやめた場合。パイプラインを畳んでいる最中の正常な経路なので記録しない
             if (_stopRequested) return;
             if (!drained)
             {
                 // -EAGAIN on send は「まず receive せよ」の意なので、その直後に 1 枚も受け取れない
-                // のは規約上想定されない状態。ただし TryReceiveFrame は -EAGAIN・AVERROR_EOF・
-                // 本物のデコードエラーをまとめて false にするため、破損パケット由来の単発エラーも
-                // ここへ来る。そのためこのパケットを捨てるだけに留め、次のパケットで回復させる
-                NoteNotProgressing("デコーダが入力を受け付けず出力も出せない");
+                // のは規約上想定されない状態。破損パケット由来の単発エラーもここへ来るので、
+                // このパケットを捨てるだけに留め、次のパケットで回復させる。
+                // **受信がエラーだったかで理由を書き分ける**——原因が違えば調べる場所も違う
+                NoteNotProgressing(sawReceiveError
+                    ? "デコーダが入力を受け付けず、受信も本物のエラーを返した"
+                    : "デコーダが入力を受け付けず出力も出せない");
                 return;
             }
             ret = _decoder.SendPacket(pkt);
@@ -303,12 +322,21 @@ public sealed unsafe class VideoDecodeThread
             // 記録も NoteNotProgressing に任せる（初回の 1 行に ret を載せている）
             NoteNotProgressing($"SendPacket が失敗した（ret={ret}）");
         }
-        else
-        {
-            // パケットが受け付けられた＝前進した。連続回数を数え直す
-            _notProgressingStreak = 0;
-        }
-        DrainAvailable(frame);
+        bool sendAccepted = ret >= 0;
+
+        // **ここの受信エラーを捨てないこと。** 捨てると「送信は成功し続けるのに受信が失敗し続ける」
+        // 状態がどのカウンタにも乗らない（この項目を切り出した当時の穴がこれ）。
+        // 1 枚でも取り出せていれば前進しているので数えない——エラーだけが続く場合を拾う
+        bool drainedTail = DrainAvailable(frame, out bool tailReceiveError);
+
+        // **送信の前進と受信の前進を混ぜないこと。** 「パケットが受け付けられた」だけで連続回数を
+        // 数え直すと、その直後の受信エラーで 1 に戻るだけになり**閾値に永久に届かない**
+        //（数え直しがドレインより前にあると必ずそうなる）。だから数え直しはドレインの結果を見てから。
+        // 送信が失敗していた場合は上で既に数えているので、ここでは重ねない
+        if (sendAccepted && tailReceiveError && !drainedTail)
+            NoteNotProgressing("送信は通ったが受信が本物のエラーを返した");
+        else if (sendAccepted)
+            _notProgressingStreak = 0; // 送信も受信も前進した
     }
 
     /// <summary>
@@ -326,11 +354,10 @@ public sealed unsafe class VideoDecodeThread
     /// 逆にすると fatal.log 上で「1 回コケてすぐ回復した」と「以後ずっと固まった」が区別できない。
     /// </para>
     /// <para>
-    /// 対象は<b>送信できなかった</b>場合だけで、「送信は通ったのに
-    /// <c>avcodec_receive_frame</c> が本物のエラーを返し続ける」経路は数えていない。
-    /// 送信成功時にフレームが出ないのはリオーダ遅延で正常に起きるため、枚数では区別できず、
-    /// <c>TryReceiveFrame</c> が -EAGAIN・AVERROR_EOF・本物のエラーを <c>false</c> に畳んでいる
-    /// 契約を変えないと捕まえられない（デバイス喪失からの復旧と同じ領域なので切り離してある）。
+    /// 対象は<b>送信できなかった</b>場合と、<b>送信は通ったのに受信が本物のエラーを返した</b>場合。
+    /// 後者は <see cref="Decoding.ReceiveOutcome"/> を導入して区別できるようにした——
+    /// 枚数では代用できない（送信成功時にフレームが出ないのはリオーダ遅延で正常に起きる）。
+    /// <b>1 枚でも取り出せた場合は数えない。</b> それは前進しているので。
     /// </para>
     /// <para>
     /// このスレッド自身は利用者へ知らせる経路を持たない（<see cref="AbandonVideoPipeline"/> も同様）が、
@@ -361,14 +388,25 @@ public sealed unsafe class VideoDecodeThread
     }
 
     /// <summary>デコーダの出力を吸い出してリングへ流す。</summary>
-    /// <returns>1 枚以上取り出した場合 true。停止要求中、またはデコードエラーで 1 枚も
-    /// 取り出せなかった場合 false（呼び出し側は「再送しても前進しない」と判断する）。</returns>
-    private bool DrainAvailable(AVFrame* frame)
+    /// <param name="sawReceiveError">
+    /// <c>avcodec_receive_frame</c> が<b>本物のエラー</b>を返した場合 true。
+    /// <c>-EAGAIN</c>・<c>AVERROR_EOF</c> は正常なので立てない。
+    /// <b>呼び出し側はこれを前進不能の判定へ流すこと</b>——捨てると
+    /// 「送信は成功し続けるのに受信が失敗し続ける」状態を誰も検出できない
+    /// （<see cref="Decoding.ReceiveOutcome"/> の remarks）。
+    /// </param>
+    /// <returns>1 枚以上取り出した場合 true。停止要求中、または 1 枚も取り出せなかった場合 false。</returns>
+    private bool DrainAvailable(AVFrame* frame, out bool sawReceiveError)
     {
         // 停止要求後はフレームを取り出して処理しない（EmitFrame → GPU テクスチャ生成に入らせない）。
         bool drainedAny = false;
-        while (!_stopRequested && _decoder.TryReceiveFrame(frame))
+        sawReceiveError = false;
+        while (!_stopRequested)
         {
+            var outcome = _decoder.TryReceiveFrame(frame);
+            if (outcome == Decoding.ReceiveOutcome.Error) sawReceiveError = true;
+            if (outcome != Decoding.ReceiveOutcome.Frame) break;
+
             drainedAny = true;
             EmitFrame(frame);
             av_frame_unref(frame);
