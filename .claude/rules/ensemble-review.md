@@ -114,7 +114,15 @@
 
 ## 5. テスト可能性の設計
 
-テスト対象は **FFmpeg・D3D11 に依存しないロジック**（ここが対象クラス一覧の単一の情報源。`CLAUDE.md` からも参照している）。NAudio やファイル I/O への依存は許容している（`MultiTrackMixer` は NAudio、`DiagnosticLog` は実ファイルに依存する）。デコード・描画パイプライン本体はテストしていない。
+テストは 2 層ある。**単体**は FFmpeg・D3D11 に依存しないロジックが対象（下表がその対象クラス一覧の単一の情報源。`CLAUDE.md` からも参照している）。NAudio やファイル I/O への依存は許容している（`MultiTrackMixer` は NAudio、`DiagnosticLog` は実ファイルに依存する）。
+
+**統合**（`tests/MultiTrackPlayer.Tests/Integration/`）は実パイプラインを丸ごと動かす。FFmpeg のネイティブは `dotnet test` の中で読み込めるため、実ファイルを生成して
+`MediaEngine.Open` から先を通せる。差し替えるのは音声出力（`IAudioOutput`）だけで、
+**読み出しの刻みをテストが握るので滞留検出やクロックの前進を決定的に踏める**。
+足場は `FakeAudioOutput`（偽の出力）と `TestMediaFactory`（メディア生成）。
+
+- **映像を含むファイルは、いま統合テストで開けない。** 共有 D3D11 デバイスの解放が決定的でなく、GC のタイミングでテストホストが落ちる（`.claude/REVIEW-REMEDIATION-STATUS.md` の「GPU デバイスの解放が決定的でない」）。それを直すまで統合テストは音声のみのファイルを使う
+- 描画（`Rendering/`）は HWND を要するため対象外のまま
 
 プレフィックスの無い行は `src/MultiTrackPlayer.Engine/` からの相対パス。他のプロジェクト由来のものはプロジェクトディレクトリ名から書く（`Core/Models/` は `src/MultiTrackPlayer.Core/Models/` を指す）。
 
@@ -129,6 +137,13 @@
 | `Diagnostics/` | `DiagnosticLog` / `StallDetector` |
 | `Thumbnails/` | `ThumbnailPlan` |
 | `Core/Models/` | `PlaylistCursor` / `ChapterMarkers` / `PlaybackStartDecision` / `MediaDurationResolver` |
+
+統合テストが通す範囲（上表とは別枠。クラス単位ではなく経路で数える）:
+
+| 経路 | 通っているもの |
+|---|---|
+| ファイルを開く | `MediaEngine.Open` → `DemuxThread` / `AudioDecoder` / `MultiTrackMixer` / `PlaybackClock` |
+| 再生・一時停止 | `MediaEngine.Play` / `Pause`、`PrerollGate`、`WasapiPositionSource`（偽の出力を包む） |
 
 - [ ] 同期ロジック・状態機械を新規に追加する場合は、**FFmpeg・D3D11 依存から切り離してテスト可能な形で実装し、テストを書く**こと。`SlotSequencer`（状態機械）と `GpuVideoFrameRing`（ペイロード管理）の分離がその手本
 - [ ] **ViewModel に書く状態遷移・位置決めのロジックも同じ扱いにする。** テストプロジェクトは WPF アセンブリ（`net10.0-windows`）を参照していないため、ViewModel に置いたままではテストできない。`Core` 側へ出して ViewModel を薄い包みにする（`PlaylistCursor` と `PlaylistViewModel` の分離がその例）

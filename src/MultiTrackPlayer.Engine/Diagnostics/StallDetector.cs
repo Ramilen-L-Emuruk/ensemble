@@ -32,7 +32,8 @@ public readonly record struct StallPollResult(StallPhase Phase, long StalledForM
 /// <para>
 /// 用途は 2 つある。音声は<b>ミキサーの <c>Read</c> が呼ばれること</b>、映像は<b>フレームが提示される
 /// こと</b>を活動とみなす。どちらも「例外を伴わずに黙って止まる」経路があり、そこは経過時間でしか
-/// 気づけない（音声は <c>WasapiOut.PlaybackStopped</c>、映像は各スレッドの例外記録が拾える範囲の外側）。
+/// 気づけない（音声は <c>IAudioOutput.PlaybackStopped</c>、映像は各スレッドの例外記録が
+/// 拾える範囲の外側）。
 /// </para>
 /// <para>
 /// 判定に使うのは<b>その活動そのものの時刻だけ</b>。似た値で代用しないこと。たとえば音声出力の生死を

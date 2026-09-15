@@ -3,6 +3,9 @@ bin/
 obj/
 *.user
 
+# テスト実行の成果物（dotnet test --blame / --collect が作る）
+TestResults/
+
 # NuGet packages
 *.nupkg
 packages/
