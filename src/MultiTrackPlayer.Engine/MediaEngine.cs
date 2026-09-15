@@ -40,7 +40,34 @@ public unsafe class MediaEngine : IMediaEngine
     // レンダースレッドからこの値を読んで「今のパイプラインのミキサーか」を判定する。
     // 片側だけ Volatile.Read で読んでも書き込み側と対にならないので、フィールドごと揃える
     private volatile MultiTrackMixer? _mixer;
-    private WasapiOut? _wasapiOut;
+    // volatile: 書き換えるのは UI スレッド（ファイル切替・破棄）だが、停止通知のハンドラは
+    // 音声出力の内部スレッドからこの値を読んで「今のパイプラインの出力か」を判定する。
+    // すぐ上の _mixer と同じ形で、片側だけ Volatile.Read で読んでも書き込み側と対にならないため
+    // フィールドごと揃える。**古い値が見えると、本物の異常停止を「旧出力からの通知」と
+    // 誤判定して記録も通知も落とす**（判定の詳細は OnAudioOutputStopped）
+    private volatile IAudioOutput? _audioOutput;
+
+    /// <summary>
+    /// 音声出力を作る手立て。既定は WASAPI で、<b>差し替えるのはテストだけ</b>。
+    /// 実デバイスを持たない出力を挿せば、パイプライン全体を <c>dotnet test</c> の中で動かせる。
+    /// </summary>
+    private readonly Func<int, IAudioOutput> _audioOutputFactory;
+
+    /// <summary>
+    /// <see cref="_audioOutput"/> の停止通知に掛けている購読。解除するために覚えている。
+    /// </summary>
+    /// <remarks>
+    /// <b>ラムダで購読するのは、送り主を実装に委ねないため。</b> イベントの <c>sender</c> は
+    /// 発火する側が決める値で、こちらからは正しさを確かめようがない。代わりに
+    /// <see cref="SetupAudio"/> が作った実体をラムダで捕まえて
+    /// <see cref="OnAudioOutputStopped"/> へ渡せば、<b>比較する相手は常に自分が掴んだ参照</b>に
+    /// なり、実装側の約束に依存しなくなる。
+    /// <para>
+    /// <see cref="_audioOutput"/> と対で設定・破棄する（<see cref="SetupAudio"/> と
+    /// <see cref="DisposeDecoders"/> の 2 箇所だけ）。片方だけ残すと購読が外れない。
+    /// </para>
+    /// </remarks>
+    private EventHandler<StoppedEventArgs>? _audioOutputStoppedHandler;
 
     /// <summary>
     /// UI が設定したマスター音量。ファイルを開くたびに MultiTrackMixer を作り直すため、ここで
@@ -133,8 +160,23 @@ public unsafe class MediaEngine : IMediaEngine
     // demux の I/O を中断するための門。ファイルごとに 1 つ作る
     private IoInterruptGate? _ioGate;
 
-    public MediaEngine()
+    /// <summary>本番用。音声出力は WASAPI 共有モードを使う。</summary>
+    public MediaEngine() : this(static latencyMs => new WasapiAudioOutput(latencyMs))
     {
+    }
+
+    /// <summary>
+    /// 音声出力の生成を差し替えられる形。<b>テスト専用。</b>
+    /// </summary>
+    /// <param name="audioOutputFactory">
+    /// 要求レイテンシ（ミリ秒）を受けて音声出力を作る。<see cref="SetupAudio"/> がファイルを
+    /// 開くたびに呼ぶため、<b>呼ばれるたび新しいインスタンスを返すこと</b>——使い回すと、
+    /// 検疫（スレッドが停止しなかったときに旧一式を解放せず残す経路）を通った後で
+    /// 前のファイルの出力が次のファイルと共有され、破棄済みのものを触りうる。
+    /// </param>
+    internal MediaEngine(Func<int, IAudioOutput> audioOutputFactory)
+    {
+        _audioOutputFactory = audioOutputFactory;
         _prerollGate = new PrerollGate(ApplyMixerHold);
     }
 
@@ -257,7 +299,7 @@ public unsafe class MediaEngine : IMediaEngine
             // ここで返さないと、時間表示が 0 のままつまみだけ動いた状態になり、さらに現在位置を
             // 起点にする操作（JumpToNextChapter・Skip・チャプター追加）が先頭を基準にしてしまう
             if (PendingStartPosition is TimeSpan pending) return pending;
-            if (_wasapiOut == null) return TimeSpan.Zero;
+            if (_audioOutput == null) return TimeSpan.Zero;
             return TimeSpan.FromSeconds(GetMasterClockSeconds());
         }
     }
@@ -582,11 +624,11 @@ public unsafe class MediaEngine : IMediaEngine
             _mixer.AddTrack(state);
         }
 
-        int wasapiLatencyMs = 100;
+        int audioLatencyMs = 100;
         try
         {
-            _wasapiOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, wasapiLatencyMs);
-            _wasapiOut.Init(_mixer);
+            _audioOutput = _audioOutputFactory(audioLatencyMs);
+            _audioOutput.Init(_mixer);
         }
         catch (Exception ex)
         {
@@ -594,15 +636,20 @@ public unsafe class MediaEngine : IMediaEngine
             // といった環境で失敗する。再生位置クロックが音声出力を基準にしている都合上、
             // 音声なしでの再生は現状成立しないため、ここで意味のあるメッセージにして中断する
             DiagnosticLog.Write("error", $"音声出力デバイスの初期化に失敗: {ex}");
-            _wasapiOut?.Dispose();
-            _wasapiOut = null;
+            // **ここで投げさせない。** 破棄が失敗しても、下の「意味のあるメッセージ」を
+            // 呼び出し元へ届けるのが本題。すり替わると利用者に出る理由が変わる
+            DisposeAudioOutputSafely("音声出力の初期化に失敗した後の破棄");
+            _audioOutput = null;
             throw new InvalidOperationException(
                 "音声出力デバイスを初期化できませんでした。既定の再生デバイスが利用可能か確認してください。", ex);
         }
 
         // Read() で例外が起きると WASAPI はそのまま停止する。購読していないと、音が消えて
-        // クロックも進まなくなった（＝映像まで止まった）理由が何ひとつ残らない
-        _wasapiOut.PlaybackStopped += OnWasapiPlaybackStopped;
+        // クロックも進まなくなった（＝映像まで止まった）理由が何ひとつ残らない。
+        // **掴んだ実体をラムダで捕まえる**（理由は _audioOutputStoppedHandler の注記）
+        IAudioOutput output = _audioOutput;
+        _audioOutputStoppedHandler = (_, e) => OnAudioOutputStopped(output, e);
+        output.PlaybackStopped += _audioOutputStoppedHandler;
         // 新しい音声出力を用意できたので、前のファイルで起きた異常停止の状態は解除する
         _audioOutputFailed = false;
 
@@ -611,8 +658,8 @@ public unsafe class MediaEngine : IMediaEngine
 
         _clock.Reset();
         _positionSource = new WasapiPositionSource(
-            _wasapiOut, _wasapiOut.OutputWaveFormat, AudioDecoder.OutSampleRate,
-            () => _clock.WriteCursor, wasapiLatencyMs / 1000.0);
+            _audioOutput, _audioOutput.OutputWaveFormat, AudioDecoder.OutSampleRate,
+            () => _clock.WriteCursor, audioLatencyMs / 1000.0);
 
         _mixer.OnAudioWritten = frames =>
         {
@@ -718,7 +765,7 @@ public unsafe class MediaEngine : IMediaEngine
             }
             // 音声出力の開始に失敗すると audio-master クロックが進まず再生が成立しないため、
             // ここも巻き戻しの対象に含める（呼び出し元は「失敗＝再生していない」と扱うため）
-            _wasapiOut?.Play();
+            _audioOutput?.Play();
         }
         catch
         {
@@ -759,7 +806,7 @@ public unsafe class MediaEngine : IMediaEngine
         if (_state != CorePlaybackState.Playing) return;
         // ネイティブ呼び出しを先に済ませてから状態を確定する。逆順にすると、失敗して例外が出たときに
         // 呼び出し元は「失敗＝状態は変わっていない」と扱うのに、Engine 内部だけ Paused へ進んでしまう
-        _wasapiOut?.Pause();
+        _audioOutput?.Pause();
         SetState(CorePlaybackState.Paused);
         DiagnosticLog.Write("engine", $"Pause pos={Position.TotalSeconds:F3}");
     }
@@ -810,7 +857,8 @@ public unsafe class MediaEngine : IMediaEngine
     /// </para>
     /// <para>
     /// <b>検疫時（<paramref name="allThreadsStopped"/> が偽）は音声側を触らない。</b>
-    /// 取り残されたスレッドが <c>_wasapiOut</c>（WASAPI COM）や各トラックのバッファをまだ
+    /// 取り残されたスレッドが <c>_audioOutput</c>（WASAPI 実装は内部で COM を掴む）や
+    /// 各トラックのバッファをまだ
     /// 触っている可能性があり、<c>IAudioClient</c> は並行アクセスに耐えない——ここで
     /// <c>Stop()</c> すると状態タイマーの <c>GetPosition()</c> と競合してプロセスが落ちうる。
     /// 消音は上記の保留（マネージドな <c>volatile bool</c> 1 つ）だけで済ませる。
@@ -829,7 +877,7 @@ public unsafe class MediaEngine : IMediaEngine
             // 停止状態として扱い、記録だけ残す。**呼び出し元を載せる**——「利用者が停止した」のと
             // 「再生の開始に失敗した直後」では、デバイスの前提が違う（後者は一度も正常に
             // 開始していない可能性がある）。切り分けの手掛かりになる
-            try { _wasapiOut?.Stop(); }
+            try { _audioOutput?.Stop(); }
             catch (Exception ex)
             {
                 DiagnosticLog.WriteFatal("engine", $"{caller}の後始末（音声出力の停止に失敗）: {ex}");
@@ -1288,16 +1336,46 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     /// <summary>
-    /// WASAPI の再生が止まったときに呼ばれる。Stop()/Dispose() による正常停止では Exception が
+    /// 音声出力の再生が止まったときに呼ばれる。Stop()/Dispose() による正常停止では Exception が
     /// null になるため、異常停止だけを記録・通知する。ここで止まると音声が出なくなるだけでなく、
     /// audio-master クロックが進まなくなるので再生位置の表示と映像まで止まる。
     /// </summary>
-    private void OnWasapiPlaybackStopped(object? sender, StoppedEventArgs e)
+    /// <param name="source">
+    /// この通知を出した音声出力。<b>購読時に掴んだ実体をラムダで渡している</b>ので、
+    /// イベントの <c>sender</c>（実装が決める値）とは別物。
+    /// </param>
+    private void OnAudioOutputStopped(IAudioOutput source, StoppedEventArgs e)
     {
-        // NAudio はこのイベントを内部スレッドから非同期に発火する。購読解除と入れ違った旧
-        // WasapiOut（ファイル切替・検疫の直後）からの通知で、新しいファイルの再生中に
-        // 誤った失敗表示を出さないためのガード
-        if (!ReferenceEquals(sender, _wasapiOut)) return;
+        // 出力はこのイベントを内部スレッドから非同期に発火する（WASAPI では NAudio が）。
+        // 購読解除と入れ違った旧出力（ファイル切替・検疫の直後）からの通知で、新しいファイルの
+        // 再生中に誤った失敗表示を出さないためのガード。
+        //
+        // **<paramref name="source"/> は自分が購読したときに掴んだ実体**で、イベントの
+        // sender ではない（購読側がラムダで捕まえている。理由は _audioOutputStoppedHandler の注記）。
+        // したがってここで不一致になるのは**旧出力からの通知が届いた場合だけ**——
+        // 実装が sender に何を載せるかには左右されない。
+        //
+        // 記録がデバッグログ側で足りるのはそのため。ここは異常ではなく、ファイル切替の
+        // たびに起こりうる正常な競合。**この分岐にテストが無いのも同じ理由**
+        //（NAudio がデリゲート一覧を取り込んだ後に購読解除が走る競合でしか起きず、
+        //   同期的に発火させても購読が外れているので届かない）
+        if (!ReferenceEquals(source, _audioOutput))
+        {
+            // **「もう関係ない」と「記録しなくてよい」は別。** 旧出力の停止が例外を伴っていた場合、
+            // その例外の詳細は**どこにも残っていない唯一の一次情報**。新しい出力が同じ原因
+            // （デバイス喪失など）にまだ遭遇していない・そもそも作られなかった（SetupAudio が
+            // 失敗した）場合、これを詳細ログへ流すと既定運用では痕跡が 1 行も残らない。
+            // 記録は常に残す側へ、ただし**失敗状態も利用者への通知もしない**——扱っているのは
+            // 既に捨てた出力で、いま再生しているものの状態ではない
+            if (e.Exception != null)
+                DiagnosticLog.WriteFatal("audio",
+                    "停止通知が購読解除と入れ違った旧い音声出力から届いた"
+                    + $"（いまの再生には反映しない）: {e.Exception}");
+            else
+                DiagnosticLog.Write("audio",
+                    "停止通知が購読解除と入れ違った旧い音声出力から届いたため無視した（例外なし）");
+            return;
+        }
         if (e.Exception == null) return;
         _audioOutputFailed = true;
         DiagnosticLog.WriteFatal("audio",
@@ -1431,9 +1509,9 @@ public unsafe class MediaEngine : IMediaEngine
             var mixer = _mixer;
             _mixer.OnRead = () =>
             {
-                // 検疫で取り残された旧ミキサーは、破棄されない旧 WasapiOut から Read され続けることが
+                // 検疫で取り残された旧ミキサーは、破棄されない旧音声出力から Read され続けることが
                 // ある。その Read を「音声出力は生きている」と数えると、新しいパイプラインの滞留を
-                // 見逃す（OnWasapiPlaybackStopped が sender を照合しているのと同じ理由）。
+                // 見逃す（OnAudioOutputStopped が sender を照合しているのと同じ理由）。
                 // _mixer は volatile 宣言済みなので、ここは素の読みでよい
                 if (ReferenceEquals(_mixer, mixer))
                     _audioStallDetector.NoteActivity(Environment.TickCount64);
@@ -1885,6 +1963,32 @@ public unsafe class MediaEngine : IMediaEngine
     }
 
     /// <summary>ゾンビスレッドが触りうるため解放できないオブジェクトを、参照を保持して隔離する（意図的なリーク）。</summary>
+    /// <summary>
+    /// 音声出力を破棄する。失敗しても<b>呼び出し元へ投げない</b>。
+    /// </summary>
+    /// <remarks>
+    /// <b>破棄の失敗で後始末を止めないため。</b> <see cref="DisposeDecoders"/> はこの後に
+    /// <c>avformat_close_input</c> でネイティブの <c>AVFormatContext</c> を解放し、各フィールドを
+    /// <c>null</c> へ戻す。ここで例外が抜けるとそれらが丸ごと飛び、<b>解放されないまま中途半端な
+    /// 状態が残る</b>——次の <c>Close</c> が同じデコーダを二度破棄しうる
+    /// （<c>ensemble-review.md</c> §3）。
+    /// <para>
+    /// 失敗そのものは常に残す側で記録する。<paramref name="caller"/> を載せるのは、
+    /// 同じ文言が複数の経路から出るため（初期化の失敗直後か、通常の後始末か）。
+    /// </para>
+    /// </remarks>
+    private void DisposeAudioOutputSafely(string caller)
+    {
+        try
+        {
+            _audioOutput?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.WriteFatal("audio", $"{caller}で音声出力の破棄に失敗した: {ex}");
+        }
+    }
+
     private void Quarantine(params object?[] items)
     {
         foreach (var item in items)
@@ -1964,7 +2068,7 @@ public unsafe class MediaEngine : IMediaEngine
     private long _prerollGraceUntilTicks;
     // 映像側より緩めてある。理由は 2 つ:
     // ・こちらは記録が WriteFatal（既定運用でも残る）で、利用者への通知も伴うため誤検出の代償が大きい
-    // ・Play() は SetState(Playing) の後、最後の _wasapiOut.Play() まで到達するのに時間がかかる経路を
+    // ・Play() は SetState(Playing) の後、最後の _audioOutput.Play() まで到達するのに時間がかかる経路を
     //   持つ（停止中シークの着地フレーム待ちで最大 500ms）。その間 Read は来ない
     // WASAPI 共有モード・レイテンシ 100ms なので Read の周期は 50ms 前後。3 秒はその 60 回分で、
     // 正常運用では起こりえない（バッファは 100ms しか無いので、この時点で音は完全に途切れている）
@@ -2255,7 +2359,7 @@ public unsafe class MediaEngine : IMediaEngine
     /// <list type="bullet">
     /// <item><b>音声出力が異常停止した場合</b>（<c>_audioOutputFailed</c> が
     /// <c>DetectAudioStall</c> の入口で止め、開き直しまでそのまま）。こちらは
-    /// <c>OnWasapiPlaybackStopped</c> が <c>WriteFatal</c> を残すので、記録から辿れる</item>
+    /// <c>OnAudioOutputStopped</c> が <c>WriteFatal</c> を残すので、記録から辿れる</item>
     /// <item><b>停止・ファイル切替でパイプラインを畳んだ場合</b>。こちらは<b>正常終了だと
     /// 既定運用の記録に何も残らない</b>——<c>Stop</c> が <c>WriteFatal</c> を呼ぶのは音声出力の
     /// 停止が失敗したときだけで、状態遷移の行は <c>Write</c> 側（デバッグモード限定）。
@@ -2526,7 +2630,7 @@ public unsafe class MediaEngine : IMediaEngine
 
     /// <summary>
     /// 再生中なのにミキサーの <c>Read</c> が呼ばれなくなった状態を検知して記録・通知する。
-    /// 例外を伴う異常停止は <see cref="OnWasapiPlaybackStopped"/> が拾うが、例外を出さずに
+    /// 例外を伴う異常停止は <see cref="OnAudioOutputStopped"/> が拾うが、例外を出さずに
     /// <c>Read</c> が止まる経路（デバイスが応答しなくなる等）はここでしか気づけない。
     /// </summary>
     /// <remarks>
@@ -2553,7 +2657,7 @@ public unsafe class MediaEngine : IMediaEngine
     private void DetectAudioStall()
     {
         if (_state != CorePlaybackState.Playing) return;
-        // 例外つきの異常停止は OnWasapiPlaybackStopped が既に記録・通知している。重ねて出さない
+        // 例外つきの異常停止は OnAudioOutputStopped が既に記録・通知している。重ねて出さない
         if (_audioOutputFailed) return;
 
         long now = Environment.TickCount64;
@@ -2581,7 +2685,7 @@ public unsafe class MediaEngine : IMediaEngine
         // 繰り返し投げてスレッドプールを埋めることもない
         QueueFatalRecord("audio", record);
         // 記録を残した後、通知を出す直前にもう一度確かめる。冒頭の判定からここまでの間に
-        // OnWasapiPlaybackStopped が「開き直してください」を出していることがあり、そこへ
+        // OnAudioOutputStopped が「開き直してください」を出していることがあり、そこへ
         // こちらの弱い文面を重ねると警報を格下げしてしまう（OSD は上書きで、順序の保証もない）。
         // **記録の方は止めない。** 例外が届く 3 秒前から Read が死んでいたという事実は、
         // 事後調査でこそ効く。
@@ -2589,7 +2693,7 @@ public unsafe class MediaEngine : IMediaEngine
         // 完全に潰すには OSD へ優先度を持たせる必要があり、そこまではしない。上書きされた場合も
         // 次の操作で表示側が正しい文面（音声出力が停止しています…）を出すため、状態は自己修復する
         if (_audioOutputFailed) return;
-        // 文面は OnWasapiPlaybackStopped と別にする。あちらは WASAPI が失敗を申告した恒久障害なので
+        // 文面は OnAudioOutputStopped と別にする。あちらは WASAPI が失敗を申告した恒久障害なので
         // 「開き直してください」と言い切れるが、こちらは自然に回復しうる観測で、開き直しを促すと
         // 不要な操作をさせる（回復しても訂正の通知は出ない）。
         // ここでは復旧手段を書かず事実だけ伝える。手段の案内は、利用者が実際に操作して無反応だった
@@ -2634,7 +2738,7 @@ public unsafe class MediaEngine : IMediaEngine
         // 音声出力を止めないと WASAPI が無音を出し続け、クロックも位置表示も終端を越えて
         // 進み続ける（デコードは終わっているのに再生時間だけ伸びていく）。
         // パイプライン自体はここでは畳まない（状態タイマーのコールバックから Join するのは危険なため）
-        try { _wasapiOut?.Pause(); }
+        try { _audioOutput?.Pause(); }
         catch (Exception ex) { DiagnosticLog.WriteFatal("engine", $"再生終了時の音声出力停止に失敗: {ex}"); }
         // 状態を進めないと、次に Play() を呼んでも冒頭の「既に Playing」ガードで弾かれ、
         // UI だけ「再生中」を表示したまま何も起きなくなる
@@ -2648,18 +2752,20 @@ public unsafe class MediaEngine : IMediaEngine
 
     private void DisposeDecoders()
     {
-        // 検疫経路では WasapiOut を解放せず参照だけ手放すため、解除しないと検疫済みの出力が
+        // 検疫経路では音声出力を解放せず参照だけ手放すため、解除しないと検疫済みの出力が
         // 停止イベントを発火し、新しいファイルの再生中に誤った失敗通知が出る
-        if (_wasapiOut != null) _wasapiOut.PlaybackStopped -= OnWasapiPlaybackStopped;
+        if (_audioOutput != null && _audioOutputStoppedHandler != null)
+            _audioOutput.PlaybackStopped -= _audioOutputStoppedHandler;
+        _audioOutputStoppedHandler = null;
         if (_threadsAbandoned)
         {
             // 止まりきらなかったスレッド（デコード系・vout・状態タイマーのコールバック）が、この
             // デコーダ・音声出力・AVFormatContext をまだ触っている可能性がある。解放すると解放済み領域や
             // 破棄済み COM を触らせることになるため、参照だけ手放して検疫する（意図的なリーク。
-            // 次のファイルは新しい一式で動く）。特に _positionSource は _wasapiOut 自身を包んでおり、
+            // 次のファイルは新しい一式で動く）。特に _positionSource は _audioOutput 自身を包んでおり、
             // StatusTick が GetPosition() を呼び続けている可能性がある
             //（StopStatusTimer がタイムアウトした状況とはまさにそれ）
-            Quarantine(_videoDecoder, _wasapiOut, _mixer, _positionSource, _ioGate);
+            Quarantine(_videoDecoder, _audioOutput, _mixer, _positionSource, _ioGate);
             foreach (var d in _audioDecoders) Quarantine(d);
             // これらのコレクションは、取り残されたデコード／demux スレッドがコンストラクタで受け取った
             // 同一インスタンスを保持している。Clear するとそのスレッドのインデックスアクセスと競合するため、
@@ -2678,11 +2784,11 @@ public unsafe class MediaEngine : IMediaEngine
             _audioDecoders.Clear();
             _audioStates.Clear();
             _audioStreamToTrack.Clear();
-            _wasapiOut?.Dispose();
+            DisposeAudioOutputSafely("パイプラインの破棄");
             if (_fmtCtx != null) { fixed (AVFormatContext** p = &_fmtCtx) avformat_close_input(p); }
         }
         _videoDecoder = null;
-        _wasapiOut = null;
+        _audioOutput = null;
         _mixer = null;
         _positionSource = null;
         _fmtCtx = null;

@@ -343,10 +343,11 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
 - `src/MultiTrackPlayer.UI/`: WPF アプリ・MVVM ViewModel・XAML ビュー。GPU 経路は `Rendering/VideoHwndHost`
   （映像子ウィンドウ）へ直接提示し、airspace で隠れる OSD 等は透過の `Windows/AirspaceOverlayWindow` で重ねる。
   CPU 経路は `Rendering/D3DImagePresenter`（D3D9Ex↔D3D11 共有）で `D3DImage` へ表示する
-- `tests/MultiTrackPlayer.Tests/`: xUnit。FFmpeg・D3D11 に依存しないロジックが対象で、
-  デコード・描画パイプライン本体は対象外。対象クラスの一覧は
+- `tests/MultiTrackPlayer.Tests/`: xUnit。**単体**（純ロジック）と**統合**（`Integration/`。
+  実パイプラインを動かす）の 2 層。何を対象とし何を差し替え、何が対象外かは
   [.claude/rules/ensemble-review.md](.claude/rules/ensemble-review.md) の
-  「5. テスト可能性の設計」を単一の情報源とする（二重管理で食い違わせないため）
+  「5. テスト可能性の設計」を単一の情報源とする（**ここに仕組みを書き写さないこと。**
+  二重管理になり、どちらかだけ更新されて食い違う）
 - チャプター永続化: `%APPDATA%\MultiTrackPlayer\chapters\{MD5}.json`
 - キーバインド設定: `%APPDATA%\MultiTrackPlayer\keybindings.json`
 - ファイルオープン（`avformat_open_input`/`avformat_find_stream_info`）は UI スレッドで同期実行される

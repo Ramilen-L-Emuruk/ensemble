@@ -6,6 +6,10 @@
     <Nullable>enable</Nullable>
 
     <IsPackable>false</IsPackable>
+
+    <!-- 統合テスト用のメディア生成（TestMediaFactory）が FFmpeg のフレームバッファへ
+         直接サンプルを書き込むため。本番側の Engine も同じ設定で、こちらだけの都合ではない -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
