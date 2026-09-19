@@ -179,11 +179,39 @@ public unsafe class MediaEngine : IMediaEngine
     /// 検疫（スレッドが停止しなかったときに旧一式を解放せず残す経路）を通った後で
     /// 前のファイルの出力が次のファイルと共有され、破棄済みのものを触りうる。
     /// </param>
-    internal MediaEngine(Func<int, IAudioOutput> audioOutputFactory)
+    /// <param name="timings">
+    /// 滞留検出の閾値と猶予。<c>null</c> なら本番の値（<see cref="DefaultStallTimings"/>）。
+    /// <b>短くするのはテストだけ。</b> 本番の値は実時間で 3〜5 秒あり、そのまま待つと
+    /// テスト全体の所要時間が桁で変わる。
+    /// </param>
+    internal MediaEngine(Func<int, IAudioOutput> audioOutputFactory, StallTimings? timings = null)
     {
         _audioOutputFactory = audioOutputFactory;
         _prerollGate = new PrerollGate(ApplyMixerHold);
+        _timings = timings ?? DefaultStallTimings;
+        _audioStallDetector = new StallDetector(_timings.AudioThresholdMs);
+        _videoStallDetector = new StallDetector(_timings.VideoThresholdMs);
+        _clockStallDetector = new StallDetector(_timings.ClockThresholdMs);
     }
+
+    /// <summary>
+    /// 本番の滞留検出のタイミング。
+    /// </summary>
+    /// <remarks>
+    /// <b>値とその根拠は下の各定数の doc が単一の情報源。</b> ここはそれを束ねるだけ
+    /// （<see cref="StallTimings"/> 側にも書き写さない）。
+    /// </remarks>
+    private static StallTimings DefaultStallTimings => new(
+        AudioThresholdMs: AudioStallThresholdMs,
+        VideoThresholdMs: VideoStallNotifyThresholdMs,
+        ClockThresholdMs: ClockStallThresholdMs,
+        PrerollGraceMs: PrerollGraceMs);
+
+    /// <summary>
+    /// このエンジンが使う滞留検出のタイミング。<b>記録の文面もここから組む</b>——
+    /// 定数を直接埋め込むと、差し替えられたときに<b>実際に使った閾値と食い違う</b>。
+    /// </summary>
+    private readonly StallTimings _timings;
 
     /// <summary>
     /// ミキサーの実音声出力の保留を反映する。<b><see cref="PrerollGate"/> のロック内から呼ばれる</b>ため、
@@ -786,7 +814,7 @@ public unsafe class MediaEngine : IMediaEngine
         // 音声トラックを持たないファイルではこの差が開きやすい（BeginSeek(hasAudio: false) が
         // 音声待ちを即座に済ませるため）が、**音声ありでも起きる。特殊対応ではない**
         if (!_prerollGate.IsWaitingForPreroll && !_clock.IsSeekPending)
-            Volatile.Write(ref _prerollGraceUntilTicks, playTicks + PrerollGraceMs);
+            Volatile.Write(ref _prerollGraceUntilTicks, playTicks + _timings.PrerollGraceMs);
         SetState(CorePlaybackState.Playing);
         _playbackEndedFired = false;
         _lastVideoStallLogTicks = playTicks;
@@ -1137,7 +1165,7 @@ public unsafe class MediaEngine : IMediaEngine
         // プリロール待ちを正常と見なす猶予の起点。シークは（保留が解けていなくても）
         // BeginSeek で待ちを作り直すので、ここは無条件に置き直してよい。
         // 一方 Play() は待ち中なら置き直さない（理由はあちらのコメント）
-        Volatile.Write(ref _prerollGraceUntilTicks, seekTicks + PrerollGraceMs);
+        Volatile.Write(ref _prerollGraceUntilTicks, seekTicks + _timings.PrerollGraceMs);
         _lastPullTimestamp = Stopwatch.GetTimestamp();
 
         // 再生中以外のシークは、着地後の最初のフレームを即座に1枚だけ表示する。
@@ -2101,9 +2129,13 @@ public unsafe class MediaEngine : IMediaEngine
     /// 起こりうる。またファイル終端では音声のバッファ（充填ゲートの 1 秒ぶん）を吐き切るまで映像が
     /// 止まるので、そこを誤って掴まないための余裕でもある。
     /// </para>
+    /// <para>
+    /// <b>これは既定値。</b> 実際に使う値は <see cref="_timings"/> が持つ
+    /// （差し替えるのはテストだけ。<see cref="DefaultStallTimings"/>）。
+    /// </para>
     /// </summary>
     private const int VideoStallNotifyThresholdMs = 3000;
-    private readonly StallDetector _videoStallDetector = new(VideoStallNotifyThresholdMs);
+    private readonly StallDetector _videoStallDetector;
     /// <summary>
     /// 消費側が最後にフレームを要求した時刻。<b>「出せたか」ではなく「聞かれたか」</b>を別に持つ。
     /// </summary>
@@ -2138,6 +2170,10 @@ public unsafe class MediaEngine : IMediaEngine
     /// ミキサーの <c>Read</c> は続くため <see cref="IsAudioStalled"/> も鳴らず、
     /// 音も映像も出ないまま痕跡がゼロになる。
     /// </para>
+    /// <para>
+    /// <b>これは既定値。</b> 実際に使う値は <see cref="_timings"/> が持つ
+    /// （差し替えるのはテストだけ。<see cref="DefaultStallTimings"/>）。
+    /// </para>
     /// </summary>
     private const int PrerollGraceMs = 5000;
     private long _prerollGraceUntilTicks;
@@ -2147,14 +2183,19 @@ public unsafe class MediaEngine : IMediaEngine
     //   持つ（停止中シークの着地フレーム待ちで最大 500ms）。その間 Read は来ない
     // WASAPI 共有モード・レイテンシ 100ms なので Read の周期は 50ms 前後。3 秒はその 60 回分で、
     // 正常運用では起こりえない（バッファは 100ms しか無いので、この時点で音は完全に途切れている）
+    // これは既定値。実際に使う値は _timings が持つ（差し替えるのはテストだけ）
     private const int AudioStallThresholdMs = 3000;
-    private readonly StallDetector _audioStallDetector = new(AudioStallThresholdMs);
+    private readonly StallDetector _audioStallDetector;
 
     /// <summary>
     /// 再生位置（audio-master クロック）が進んでいないと判定する閾値。音声・映像と同じ 3 秒。
+    /// <para>
+    /// <b>これは既定値。</b> 実際に使う値は <see cref="_timings"/> が持つ
+    /// （差し替えるのはテストだけ。<see cref="DefaultStallTimings"/>）。
+    /// </para>
     /// </summary>
     private const int ClockStallThresholdMs = 3000;
-    private readonly StallDetector _clockStallDetector = new(ClockStallThresholdMs);
+    private readonly StallDetector _clockStallDetector;
     /// <summary>
     /// 前回の <c>StatusTick</c> で観測した位置（秒）。値が変われば「進んだ」と見なす。
     /// <c>NaN</c> は「まだ観測していない」。
@@ -2534,7 +2575,7 @@ public unsafe class MediaEngine : IMediaEngine
         // 文面はこのスレッドで組み立てる（DetectAudioStall と同じ理由。実行時点では
         // パイプラインが畳まれている可能性がある）
         string record = $"再生位置が {poll.StalledForMs}ms 進んでいない"
-            + $"（閾値 {ClockStallThresholdMs}ms。位置={_lastObservedPositionSeconds:F3} "
+            + $"（閾値 {_timings.ClockThresholdMs}ms。位置={_lastObservedPositionSeconds:F3} "
             + $"writeCursor={_clock.WriteCursor}。音声・映像の出力は続いていることがある。"
             + $"自動復旧する場合あり）"
             // 着地待ちのまま猶予を過ぎた場合は原因の当たりが全く違う（錨の要求漏れの疑い）。
@@ -2570,8 +2611,11 @@ public unsafe class MediaEngine : IMediaEngine
     /// <b>リングが EOF でも抑制しない。</b> 抑制すると <c>AbandonVideoPipeline</c>
     /// （デコードスレッドの異常終了。あそこは <c>MarkEof</c> を呼ぶ）が黙ってしまう。
     /// ファイル終端の側は、音声のバッファを吐き切って再生完了に落ちるまでが閾値より短いので
-    /// ここへは来ない。<b>ただし映像ストリームだけが音声より 3 秒以上早く終わるファイルでは
+    /// ここへは来ない。<b>ただし映像ストリームだけが音声より閾値以上早く終わるファイルでは
     /// 誤検知する</b>（実在は稀。尺の比較で判定しようとすると VFR・録画ファイルで外す）。
+    /// この経路は <c>StallDetectionTests</c> が意図的に踏んで固定している
+    /// ——抑制を入れる変更をするとあのテストが落ちるので、そのとき見直すのはテストではなく
+    /// 上段に挙げた代償（<c>AbandonVideoPipeline</c> が黙ること）の方。
     /// </para>
     /// <para>
     /// <b><c>IsAudioOutputFailed</c> のような固定フラグは立てない。</b> 映像は復帰しうるので、
@@ -2622,7 +2666,7 @@ public unsafe class MediaEngine : IMediaEngine
         // 文面はこのスレッドで組み立てる。エンジンの状態を読む処理を後段へ持ち込むと、
         // 実行される時点でパイプラインが畳まれている可能性がある
         string record = $"映像フレームが {poll.StalledForMs}ms 提示されていない"
-            + $"（閾値 {VideoStallNotifyThresholdMs}ms。音声と再生位置は進んでいることがある。"
+            + $"（閾値 {_timings.VideoThresholdMs}ms。音声と再生位置は進んでいることがある。"
             + $"自動復旧する場合あり） clock={GetMasterClockSeconds():F3}"
             // プリロール待ちのまま猶予を過ぎた場合は、原因の当たりが全く違う（待ち合わせの
             // 取りこぼしの疑い）。切り分けに要るので状態を添える
@@ -2750,7 +2794,7 @@ public unsafe class MediaEngine : IMediaEngine
         // 「以降ずっと止まる」と書かないこと。この滞留は自然に復旧しうる。
         // 復旧した場合は RecordStallRecovery が対になる行を残すので、事後にどちらだったか判る
         string record = $"音声出力の Read が {poll.StalledForMs}ms 呼ばれていない"
-            + $"（閾値 {AudioStallThresholdMs}ms。この時点で音声・再生位置・映像はいずれも進んでいない。"
+            + $"（閾値 {_timings.AudioThresholdMs}ms。この時点で音声・再生位置・映像はいずれも進んでいない。"
             + $"自動復旧する場合あり）"
             + $" clock={GetMasterClockSeconds():F3}";
         // 記録をスレッドプールへ逃がす理由と代償は QueueFatalRecord の doc が単一の情報源

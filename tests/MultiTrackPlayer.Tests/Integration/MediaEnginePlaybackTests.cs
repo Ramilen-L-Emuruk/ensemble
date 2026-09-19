@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.Engine;
-using MultiTrackPlayer.Engine.Diagnostics;
 
 namespace MultiTrackPlayer.Tests.Integration;
 
@@ -164,7 +163,7 @@ public sealed class MediaEnginePlaybackTests : IClassFixture<TestMediaFixture>
         // **記録が常に残る側へ行くことまで確かめる。** ここを見ないと、`WriteFatal` が `Write`
         // （デバッグモード限定）へ格下げされても緑のまま通り、**既定運用では痕跡が 1 行も
         // 残らない**状態に気づけない
-        Assert.Contains(marker, ReadFatalLog());
+        Assert.Contains(marker, FatalLog.ReadAll());
     }
 
     [Fact(DisplayName = "正常停止の通知は失敗として扱わない")]
@@ -183,31 +182,6 @@ public sealed class MediaEnginePlaybackTests : IClassFixture<TestMediaFixture>
 
         Assert.False(engine.IsAudioOutputFailed);
         Assert.False(notified);
-    }
-
-    /// <summary>
-    /// 常に残る側のログ（<c>fatal.log</c>）を読む。
-    /// </summary>
-    /// <remarks>
-    /// <b>このクラスが <see cref="ProcessWideStateCollection"/> に属しているのが前提。</b>
-    /// <c>WriteFatal</c> はセッションログが開いていればそちらへ書くため、
-    /// <c>DiagnosticLog.Enable</c> を呼ぶクラスと並列に走ると記録がここへ来ない。
-    /// <para>
-    /// ファイル名を直接書いているのは、<c>DiagnosticLog</c> 側が非公開の定数として
-    /// 持っているため。変えるときは両方直すこと。
-    /// </para>
-    /// </remarks>
-    private static string ReadFatalLog()
-    {
-        string path = Path.Combine(DiagnosticLog.DefaultDirectory, "fatal.log");
-        if (!File.Exists(path))
-            Assert.Fail($"常に残る側のログが作られていない path={path}");
-
-        // 実行中のアプリや他プロセスが追記していることがあるので共有して開く
-        using var stream = new FileStream(
-            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
     }
 
     /// <summary>

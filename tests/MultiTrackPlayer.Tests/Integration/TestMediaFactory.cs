@@ -27,6 +27,15 @@ internal static unsafe class TestMediaFactory
     private const int DefaultFps = 25;
 
     /// <summary>
+    /// 既定のキーフレーム間隔（フレーム数）。<b>フレームレートと同じ＝1 秒ごと</b>。
+    /// </summary>
+    /// <remarks>
+    /// 公開しているのは、呼び出し側が「既定のまま」と「明示的に指定する」を
+    /// <b>同じ値の書き写しなしに</b>切り替えられるようにするため。
+    /// </remarks>
+    internal const int DefaultGopSize = DefaultFps;
+
+    /// <summary>
     /// 音声サンプルレート。<b>本番のミキサー軸（48kHz）と揃えてある</b>ので、
     /// リサンプラの都合がテストの期待値に混ざらない。
     /// </summary>
@@ -52,18 +61,27 @@ internal static unsafe class TestMediaFactory
     /// 映像ストリームを含めるか。<c>false</c> にすると音声だけのファイルになる
     /// （音声のみのファイルは実際の利用形態のひとつで、映像側の経路を通らない）。
     /// </param>
+    /// <param name="videoDuration">
+    /// 映像だけを別の尺にする場合に指定する。<c>null</c> なら <paramref name="duration"/> と同じ。
+    /// <b>映像が音声より先に終わるファイルを作るためにある</b>——映像の滞留検出は「提示が
+    /// 来ないこと」を見るので、<b>再生を続けたまま映像だけ枯らす</b>必要がある
+    /// （プルを止めると <c>CanObserveVideoStall</c> が観測自体をやめるため、そちらでは作れない）。
+    /// </param>
     public static void CreateMp4(
         string path,
         TimeSpan duration,
         int audioTrackCount = 1,
-        int gopSize = DefaultFps,
+        int gopSize = DefaultGopSize,
         int width = DefaultWidth,
         int height = DefaultHeight,
         int fps = DefaultFps,
-        bool includeVideo = true)
+        bool includeVideo = true,
+        TimeSpan? videoDuration = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(audioTrackCount, 1);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(duration.TotalSeconds, 0);
+        if (videoDuration is { } vd)
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(vd.TotalSeconds, 0);
 
         // FFmpeg の言い分を添えて投げ直す。ラッパーの例外は「[FFmpeg error -22]: Invalid argument」
         // のように理由を落とすため、これが無いと生成の失敗を追う手掛かりが 1 つも残らない
@@ -71,7 +89,8 @@ internal static unsafe class TestMediaFactory
         BeginCollecting(messages);
         try
         {
-            CreateCore(path, duration, audioTrackCount, gopSize, width, height, fps, includeVideo);
+            CreateCore(path, duration, audioTrackCount, gopSize, width, height, fps,
+                includeVideo, videoDuration ?? duration);
         }
         catch (Exception ex)
         {
@@ -131,7 +150,7 @@ internal static unsafe class TestMediaFactory
 
     private static void CreateCore(
         string path, TimeSpan duration, int audioTrackCount, int gopSize,
-        int width, int height, int fps, bool includeVideo)
+        int width, int height, int fps, bool includeVideo, TimeSpan videoDuration)
     {
         Codec? videoCodec = includeVideo
             ? Codec.FindEncoderByName("libx264")
@@ -140,7 +159,7 @@ internal static unsafe class TestMediaFactory
         Codec audioCodec = Codec.FindEncoderByName("aac")
             ?? throw new InvalidOperationException("aac エンコーダが同梱の FFmpeg に無い");
 
-        int videoFrameCount = (int)Math.Ceiling(duration.TotalSeconds * fps);
+        int videoFrameCount = (int)Math.Ceiling(videoDuration.TotalSeconds * fps);
 
         using FormatContext fc = FormatContext.AllocOutput(fileName: path);
         // mp4 は extradata をファイル先頭のヘッダへ置く。この指定が無いと各パケットに
