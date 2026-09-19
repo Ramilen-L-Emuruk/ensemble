@@ -27,7 +27,16 @@ namespace MultiTrackPlayer.Tests;
 /// <item><c>Diagnostics.DiagnosticLogTests</c> — 理由 1（<c>Enable</c> で書き込み先を差し替える側）</item>
 /// <item><c>Integration.MediaEnginePlaybackTests</c> — 理由 1（<c>fatal.log</c> への記録を検証する側）と理由 2（映像付きファイルを開く）</item>
 /// <item><c>Integration.SharedGpuDeviceLifetimeTests</c> — 理由 2</item>
+/// <item><c>Integration.VideoPipelineTests</c> — 理由 2</item>
+/// <item><c>Integration.SeekTests</c> — 理由 2</item>
+/// <item><c>Integration.StallDetectionTests</c> — 理由 1（滞留の記録を検証する側）と理由 2</item>
 /// </list>
+/// <para>
+/// <b>この一覧は属性の代わりではない。</b> 直列化を成立させているのは各クラスの
+/// <c>[Collection]</c> 属性で、ここは「なぜ直列でなければならないか」を理由つきで残す場所。
+/// <b>付け忘れたときの症状はアサーション失敗ではなく、テストホストの異常終了か
+/// 無関係なテストの不安定化</b>——だから理由の側を読めるようにしてある。
+/// </para>
 /// <para>
 /// <b>理由ごとにコレクションを分けられない。</b> xUnit ではクラスが属せるコレクションは 1 つだけで、
 /// <c>MediaEnginePlaybackTests</c> は両方に該当する。そのため 1 つにまとめ、名前は

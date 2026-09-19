@@ -437,4 +437,62 @@ public sealed class SlotSequencerTests
 
         Assert.False(seq.IsWaitingForFrameTime(0.0, FrameDuration));
     }
+
+    /// <summary>
+    /// 満杯のリングで <c>BeginWrite</c> が待ちに入るのを確かめる時間。
+    /// </summary>
+    /// <remarks>
+    /// <b>「待ちに入った」ことは外から観測できない</b>ので、確保できていないことで代用している。
+    /// ロックを誰も握っていない状態なので、この時間内に確保できていなければ
+    /// <c>Monitor.Wait</c> に入っている。<b>この確認が無いと意味が逆に壊れる</b>——
+    /// まだ待ちに入る前に drop すると、起こされずとも自力で空きを見つけてしまい、
+    /// 起こし忘れがあっても緑になる。
+    /// </remarks>
+    private const int BlockConfirmMs = 200;
+
+    /// <summary>起床を待つ上限。</summary>
+    /// <remarks>
+    /// <b>タイムアウトを置かないとハングになる。</b> 起こし忘れの症状は「待機側が永久に寝る」
+    /// ことなので、待ち合わせに上限が無いとランナーのタイムアウト頼みになり、
+    /// 何が壊れたのか読めない（<c>testing.md</c>「並行処理のテストで待ち合わせを使うなら」）。
+    /// </remarks>
+    private const int WakeTimeoutMs = 5000;
+
+    // **この回帰は `b5bff31`（一時停止→再生で映像が固まる）そのもの。** 状態を Free へ戻す経路は
+    // 5 つあり、TryLeaseDue の drop だけが PulseAll を呼んでいなかった（`ensemble-review.md` §1）。
+    //
+    // **2026-09-19 に実測して分かったこと**: この PulseAll を外しても、そのとき存在した単体・
+    // 統合のどのテストも落ちなかった。実パイプラインを動かす統合テストでも落ちない——あちらは
+    // 提示のたびにリースを返すので、`ReturnLease` 側の PulseAll が writer を起こしてしまう。
+    // **起こし忘れが効くのは「リースを保持したまま writer が寝る」形だけ**なので、
+    // この層で直接踏む必要がある。
+    [Fact(DisplayName = "drop でスロットが空いたら、Free 待ちのデコードスレッドを起こす")]
+    public void TryLeaseDue_WhenDropFreesSlots_WakesWriterWaitingForFreeSlot()
+    {
+        const int capacity = 4;
+        var seq = new SlotSequencer(capacity, _ => { });
+        for (int i = 0; i < capacity; i++) seq.CommitWrite(Acquire(seq), i + 1.0);
+
+        using var acquired = new ManualResetEventSlim(false);
+        int acquiredIndex = -1;
+        var writer = new Thread(() =>
+        {
+            acquiredIndex = seq.BeginWrite(seq.CurrentEpoch, _ => { });
+            acquired.Set();
+        })
+        { IsBackground = true };
+        writer.Start();
+
+        Assert.False(acquired.Wait(BlockConfirmMs), "リングが満杯なのに BeginWrite が通った");
+
+        // 全フレームが due。最新の 1 枚がリースされ、残りは drop で Free へ戻る
+        Assert.True(seq.TryLeaseDue(clockPositionSeconds: 100.0, FrameDuration,
+            out _, out _, out int dropped));
+        Assert.Equal(capacity - 1, dropped);
+
+        Assert.True(acquired.Wait(WakeTimeoutMs),
+            "drop で空いたスロットを待っているデコードスレッドが起きない");
+        Assert.InRange(acquiredIndex, 0, capacity - 1);
+        Assert.True(writer.Join(WakeTimeoutMs), "書き込みスレッドが終わらない");
+    }
 }

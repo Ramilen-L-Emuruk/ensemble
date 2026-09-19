@@ -18,6 +18,7 @@
 
 - [ ] **待機側が前進できる状態へ遷移させる経路は、1 つ残らず `Monitor.PulseAll` を呼んでいること**。`SlotSequencer` では Free へ戻す経路が `CommitWrite`（世代不一致）・`AbortWrite`・`TryLeaseDue`（drop）・`ReturnLease`・`Flush` の 5 つある。1 つでも漏らすとデコードスレッドが寝たまま起きず、映像が止まる
   - ただし**状態を何も変えずに早期 return するガードはこの対象外**。`Flush` のシーク世代ガードがそれで、`PulseAll` を呼ばないのは正しい（このチェック項目だけを機械的に当てて「起こし忘れ」と誤判定した例が実際にある）。理由は §6 を参照
+  - **起こし忘れは統合テストでは捕まらない。** `TryLeaseDue` の drop 経路の `PulseAll` を外して実測したところ、統合テストは 1 本も落ちなかった（2026-09-19）——あちらは提示のたびにリースを返すので `ReturnLease` 側の通知が待機者を起こしてしまう。**効くのは「リースを保持したまま待機者が寝る」形だけ**なので、`SlotSequencerTests` の層で直接踏むこと（実装例: `TryLeaseDue_WhenDropFreesSlots_WakesWriterWaitingForFreeSlot`）
 - [ ] 条件式で「ある状態か」を判定するときは §7 も併せて確認すること（生産側と消費側で述語がずれると、待ち合わせではなく**表示が壊れる**形で事故になる）
 - [ ] `Monitor.Wait` のループ条件に、Close と Flush（シーク世代の変化）の脱出条件が含まれていること。含めないとシーク時に起床できない
 - [ ] 新しく待機を追加したら、**シーク中・一時停止中・EOF 到達時・操作の連打時**の 4 状況で確実に起床するか机上で追うこと
@@ -128,7 +129,16 @@
 **統合**（`tests/MultiTrackPlayer.Tests/Integration/`）は実パイプラインを丸ごと動かす。FFmpeg のネイティブは `dotnet test` の中で読み込めるため、実ファイルを生成して
 `MediaEngine.Open` から先を通せる。差し替えるのは音声出力（`IAudioOutput`）だけで、
 **読み出しの刻みをテストが握るので滞留検出やクロックの前進を決定的に踏める**。
-足場は `FakeAudioOutput`（偽の出力）と `TestMediaFactory`（メディア生成）。
+足場は `FakeAudioOutput`（偽の出力）・`TestMediaFactory`（メディア生成）・
+`EnginePump`（消費側の代わりに引く）・`FatalLog`（常に残る側の記録を読む）。
+
+- **消費側は 2 つあり、両方を回す。** 音声は `FakeAudioOutput`、映像は UI と同じ pull 型
+  （`TryGetFrame` / `ReturnFrame`）。片方だけ回すと本番と違う挙動になる——映像を引かないと
+  `CanObserveVideoStall` が観測自体をやめる
+- **滞留検出の閾値と猶予は `StallTimings` で短くして渡す。** 本番の値は 3〜5 秒で、
+  そのまま待つとテスト全体の所要時間が桁で変わる。既定値は変えていないので本番挙動は同じ
+- **`fatal.log` は追記式で消えない。** 「含まれている」を素で見ると**前回の実行で自分が
+  書いた行**に当たる。位置を覚えてそれ以降だけを見ること（`FatalLog.Bookmark`）
 
 - **映像を含むファイルも開ける。** 以前は共有 D3D11 デバイスを二重解放していて、1 プロセスで 2 つ目の `MediaEngine` が映像付きファイルを開くとプロセスごと落ちた（原因は §3 の「所有権が移るのか借りるだけなのか」）。参照数の釣り合いは `SharedGpuDeviceLifetimeTests` が見ている
 - 描画（`Rendering/`）は HWND を要するため対象外のまま
@@ -156,6 +166,11 @@
 | 再生・一時停止 | `MediaEngine.Play` / `Pause`、`PrerollGate`、`WasapiPositionSource`（偽の出力を包む） |
 | 映像付きファイルを開く | 上記に加えて `GpuDeviceContext` / `HardwareAccel`（D3D11VA の注入）／`VideoDecoder` の HW 経路 |
 | 音声出力の異常停止 | `MediaEngine.OnAudioOutputStopped` → `IsAudioOutputFailed` / `PlaybackFailed` / `fatal.log` |
+| 映像フレームの提示 | `GpuFrameSink` → `GpuVideoFrameRing` → `TryGetFrame` / `ReturnFrame`（リースの返却まで） |
+| シーク（残骸フレーム） | 再生中のシーク後に、シーク前の表示時刻のフレームが提示されないこと（§6 の回帰）。一時停止中のシークでも掴んだ 1 枚の表示時刻を見る |
+| シーク（その他の観点） | 連打＝保留が解けて再生が続くこと・一時停止中＝着地後の 1 枚を渡すこと・停止中＝次の再生の開始位置になること。**残骸フレームの有無はこの 3 つでは見ていない** |
+| 再生開始位置の決定 | `PlaybackStartDecision` の配線（停止中シークの持ち越し・終端からの再開） |
+| 滞留検出 3 つ | `StatusTickCore` → `DetectVideoStall` / `DetectAudioStall` / `DetectClockStall`（実装の呼び出し順）→ `fatal.log`。**回復まで見ているのはクロックだけ**——音声は開始の記録に加えて判定が解けることを、映像は開始のみ（あちらは恒久的に枯れる誤検知経路を固定するテストなので回復が起きない） |
 
 - [ ] 同期ロジック・状態機械を新規に追加する場合は、**FFmpeg・D3D11 依存から切り離してテスト可能な形で実装し、テストを書く**こと。`SlotSequencer`（状態機械）と `GpuVideoFrameRing`（ペイロード管理）の分離がその手本
 - [ ] **ViewModel に書く状態遷移・位置決めのロジックも同じ扱いにする。** テストプロジェクトは WPF アセンブリ（`net10.0-windows`）を参照していないため、ViewModel に置いたままではテストできない。`Core` 側へ出して ViewModel を薄い包みにする（`PlaylistCursor` と `PlaylistViewModel` の分離がその例）

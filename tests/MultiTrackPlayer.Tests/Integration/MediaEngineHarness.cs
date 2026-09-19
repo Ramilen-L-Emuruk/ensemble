@@ -1,4 +1,5 @@
 using MultiTrackPlayer.Engine;
+using MultiTrackPlayer.Engine.Diagnostics;
 
 namespace MultiTrackPlayer.Tests.Integration;
 
@@ -28,7 +29,12 @@ internal sealed class MediaEngineHarness : IDisposable
 {
     private readonly FakeAudioOutputProvider _provider = new();
 
-    public MediaEngineHarness() => Engine = new MediaEngine(_provider.Create);
+    /// <param name="timings">
+    /// 滞留検出の閾値と猶予。<c>null</c> なら本番の値のまま。<b>滞留を試すテストだけが渡す</b>——
+    /// 本番の値は 3〜5 秒あり、そのまま待つとテスト 1 本で 10 秒級になる。
+    /// </param>
+    public MediaEngineHarness(StallTimings? timings = null)
+        => Engine = new MediaEngine(_provider.Create, timings);
 
     /// <summary>試験対象のエンジン。音声出力だけが偽物で、他は本番と同じ構成で動く。</summary>
     public MediaEngine Engine { get; }
