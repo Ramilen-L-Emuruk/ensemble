@@ -289,7 +289,7 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
 | `dotnet build` | ビルド（全プロジェクト） |
 | `dotnet build -c Release` | リリースビルド |
 | `dotnet run --project src/MultiTrackPlayer.UI` | アプリ起動（**ユーザーが実行確認する際に使うコマンド**。Claude はこれを実行しない） |
-| `dotnet test tests/MultiTrackPlayer.Tests/MultiTrackPlayer.Tests.csproj` | テスト実行（xUnit） |
+| `dotnet test tests/MultiTrackPlayer.Tests/MultiTrackPlayer.Tests.csproj` | テスト実行（xUnit）。**D3D11VA デコードできる GPU が要る**（理由は `ensemble-review.md`「5. テスト可能性の設計」） |
 | `dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o publish` | exe 発行（ローカル確認用。GitHub Release は作られない。`publish/` 直下にフラット出力） |
 
 > リリース（main へのマージ・バージョン更新・タグ・push）のコマンドはここに載せない。**`release` スキルの手続きを通すこと**が前提で、単独のコマンドとして書くと手続きを飛ばして実行されうる。内容は上記「リリース（exe 発行）」を参照。

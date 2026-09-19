@@ -2,7 +2,6 @@ using System.Diagnostics;
 using MultiTrackPlayer.Core.Enums;
 using MultiTrackPlayer.Engine;
 using MultiTrackPlayer.Engine.Diagnostics;
-using MultiTrackPlayer.Tests.Diagnostics;
 
 namespace MultiTrackPlayer.Tests.Integration;
 
@@ -14,15 +13,13 @@ namespace MultiTrackPlayer.Tests.Integration;
 /// 同じ構成で走る。差し替えているのは音声出力だけで、<b>時間の進みはテストが握る</b>
 /// （<see cref="FakeAudioOutput.AdvanceMs"/>）。
 /// <para>
-/// <b>映像付きのファイルを開くのは 1 本だけ。</b> 映像を含むファイルを開くと共有 D3D11 デバイスが
-/// 作られ HW デコードが選ばれるが、<b>1 プロセスで 2 つ目の <see cref="MediaEngine"/> が
-/// 映像付きファイルを開くとプロセスが落ちる</b>（`.claude/REVIEW-REMEDIATION-STATUS.md` の
-/// 「GPU デバイスの解放が決定的でない」を参照。本番はエンジンを 1 つしか作らないため
-/// 表に出ていない）。そのため残りは音声のみのファイルを使う——<b>映像を伴う検証は
-/// その欠陥を直してから足す。</b>
+/// 映像を含むファイルを開くと共有 D3D11 デバイスが作られ HW デコードが選ばれる。
+/// <b>以前はここで 2 つ目の <see cref="MediaEngine"/> を作るとプロセスが落ちたため映像を
+/// 避けていたが、原因（FFmpeg へ注入したデバイスの参照を二重に解放していた）を直した</b>
+/// ——参照数の釣り合いは <see cref="SharedGpuDeviceLifetimeTests"/> が見ている。
 /// </para>
 /// </remarks>
-[Collection(DiagnosticLogCollection.Name)]
+[Collection(ProcessWideStateCollection.Name)]
 public sealed class MediaEnginePlaybackTests : IClassFixture<TestMediaFixture>
 {
     /// <summary>
@@ -38,10 +35,7 @@ public sealed class MediaEnginePlaybackTests : IClassFixture<TestMediaFixture>
 
     public MediaEnginePlaybackTests(TestMediaFixture media) => _media = media;
 
-    [Fact(DisplayName = "映像と音声 3 トラックのファイルから尺・トラック数・寸法を読み取る",
-          Skip = "映像付きファイルを開くと共有 D3D11 デバイスが作られ、解放が決定的でないため "
-               + "GC のタイミングでテストホストが落ちる。`.claude/REVIEW-REMEDIATION-STATUS.md` の "
-               + "「GPU デバイスの解放が決定的でない」を直してから外すこと")]
+    [Fact(DisplayName = "映像と音声 3 トラックのファイルから尺・トラック数・寸法を読み取る")]
     public void Open_VideoWithThreeAudioTracks_ReportsDurationAndTracks()
     {
         using var harness = new MediaEngineHarness();
@@ -195,7 +189,7 @@ public sealed class MediaEnginePlaybackTests : IClassFixture<TestMediaFixture>
     /// 常に残る側のログ（<c>fatal.log</c>）を読む。
     /// </summary>
     /// <remarks>
-    /// <b>このクラスが <see cref="DiagnosticLogCollection"/> に属しているのが前提。</b>
+    /// <b>このクラスが <see cref="ProcessWideStateCollection"/> に属しているのが前提。</b>
     /// <c>WriteFatal</c> はセッションログが開いていればそちらへ書くため、
     /// <c>DiagnosticLog.Enable</c> を呼ぶクラスと並列に走ると記録がここへ来ない。
     /// <para>

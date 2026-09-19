@@ -1,6 +1,6 @@
 # MultiTrackPlayer 固有のレビュー観点
 
-汎用的な C#/.NET のチェックリストは `~/.claude/rules/dotnet/code-review.md` を参照。本ファイルは**このプロジェクトで実際に事故が起きた箇所**だけをまとめる。各項目には根拠となる修正コミットを添えてあるので、疑わしいときは `git show <hash>` で当時の変更を確認すること。
+汎用的な C#/.NET のチェックリストは `~/.claude/rules/dotnet/code-review.md` を参照。本ファイルは**このプロジェクトで実際に事故が起きた箇所**だけをまとめる。各項目には根拠となる修正コミット（または、まだコミットが無いものは裏取りしたテスト）を添えてあるので、疑わしいときは `git show <hash>` で当時の変更を確認すること。
 
 ## 1. スレッド待ち合わせの取りこぼし（最頻・最悪）
 
@@ -67,6 +67,15 @@
 - [ ] ファイル切替・連続 D&D では「**パイプラインの完全停止 → 解放 → 新規構築**」の順序を守ること。停止前に解放するとデコードスレッドが解放済み領域を触りネイティブヒープが壊れる（`2d257ea`）
 - [ ] `CancellationTokenSource` を Dispose した後に参照しないこと（`26c03a5`。サムネイル生成で実際にクラッシュした）
 - [ ] 例外が飛ぶ経路でも解放されること。`try`/`finally` か `using` で保証する
+- [ ] **COM オブジェクトをネイティブ API へ渡すときは、所有権が移るのか借りるだけなのかを
+  相手のドキュメントで確かめること。** 「相手が AddRef してくれる」という自前のコメントを
+  当てにしない——`HardwareAccel.CreateD3D11VAContextFromDevice` のコメントが**事実と逆**で、
+  FFmpeg が譲り受ける参照をこちらも解放して二重解放していた
+- [ ] **参照カウントが絡む変更をしたら、症状を再現する前に参照数を数えて確かめること。**
+  `Marshal.AddRef` の戻り値から操作の前後の差を取れば収支が分かる。解放済み COM への `Release` は
+  未定義動作で、**壊れたヒープはずっと後から別の顔で表面化する**ため、症状を待つと何を直したのか
+  分からなくなる。機構と実測値は `HardwareAccel.CreateD3D11VAContextFromDevice` の doc、
+  実装例は `SharedGpuDeviceLifetimeTests`（**ここには書き写さない。二重管理になる**）
 
 ## 4. キー入力の経路が 3 つに分散している
 
@@ -121,8 +130,9 @@
 **読み出しの刻みをテストが握るので滞留検出やクロックの前進を決定的に踏める**。
 足場は `FakeAudioOutput`（偽の出力）と `TestMediaFactory`（メディア生成）。
 
-- **映像を含むファイルは、いま統合テストで開けない。** 共有 D3D11 デバイスの解放が決定的でなく、GC のタイミングでテストホストが落ちる（`.claude/REVIEW-REMEDIATION-STATUS.md` の「GPU デバイスの解放が決定的でない」）。それを直すまで統合テストは音声のみのファイルを使う
+- **映像を含むファイルも開ける。** 以前は共有 D3D11 デバイスを二重解放していて、1 プロセスで 2 つ目の `MediaEngine` が映像付きファイルを開くとプロセスごと落ちた（原因は §3 の「所有権が移るのか借りるだけなのか」）。参照数の釣り合いは `SharedGpuDeviceLifetimeTests` が見ている
 - 描画（`Rendering/`）は HWND を要するため対象外のまま
+- **`dotnet test` には D3D11VA デコードできる GPU が要る。** 無い環境では `SharedGpuDeviceLifetimeTests` の 2 本が**意図的に失敗する**（Skip しないのは、黙って緑になると「検証したつもり」になるため）。CI はテストを走らせないので影響するのは手元だけ
 
 プレフィックスの無い行は `src/MultiTrackPlayer.Engine/` からの相対パス。他のプロジェクト由来のものはプロジェクトディレクトリ名から書く（`Core/Models/` は `src/MultiTrackPlayer.Core/Models/` を指す）。
 
@@ -144,6 +154,8 @@
 |---|---|
 | ファイルを開く | `MediaEngine.Open` → `DemuxThread` / `AudioDecoder` / `MultiTrackMixer` / `PlaybackClock` |
 | 再生・一時停止 | `MediaEngine.Play` / `Pause`、`PrerollGate`、`WasapiPositionSource`（偽の出力を包む） |
+| 映像付きファイルを開く | 上記に加えて `GpuDeviceContext` / `HardwareAccel`（D3D11VA の注入）／`VideoDecoder` の HW 経路 |
+| 音声出力の異常停止 | `MediaEngine.OnAudioOutputStopped` → `IsAudioOutputFailed` / `PlaybackFailed` / `fatal.log` |
 
 - [ ] 同期ロジック・状態機械を新規に追加する場合は、**FFmpeg・D3D11 依存から切り離してテスト可能な形で実装し、テストを書く**こと。`SlotSequencer`（状態機械）と `GpuVideoFrameRing`（ペイロード管理）の分離がその手本
 - [ ] **ViewModel に書く状態遷移・位置決めのロジックも同じ扱いにする。** テストプロジェクトは WPF アセンブリ（`net10.0-windows`）を参照していないため、ViewModel に置いたままではテストできない。`Core` 側へ出して ViewModel を薄い包みにする（`PlaylistCursor` と `PlaylistViewModel` の分離がその例）

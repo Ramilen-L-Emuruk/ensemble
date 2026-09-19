@@ -5,10 +5,10 @@ namespace MultiTrackPlayer.Tests.Diagnostics;
 /// <remarks>
 /// <b><see cref="DiagnosticLog"/> はプロセス全体で 1 つの静的な状態。</b> このクラスは
 /// <see cref="DiagnosticLog.Enable"/> で書き込み先を差し替えるため、同じ状態に依存する
-/// テストクラスと**並列に走らせてはいけない**（テストランナーはクラス単位で並列に走る）。
-/// <c>Collection</c> で同じ名前を付けたクラスは直列化される。
+/// テストクラスと**並列に走らせてはいけない**（理由と対象は
+/// <see cref="ProcessWideStateCollection"/>）。
 /// </remarks>
-[Collection(DiagnosticLogCollection.Name)]
+[Collection(ProcessWideStateCollection.Name)]
 public sealed class DiagnosticLogTests : IDisposable
 {
     private readonly string _directory;
