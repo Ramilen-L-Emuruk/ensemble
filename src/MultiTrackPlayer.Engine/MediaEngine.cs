@@ -25,6 +25,11 @@ public unsafe class MediaEngine : IMediaEngine
     // GPU 無し環境等で生成に失敗した場合は null のままとし、VideoDecoder は従来の FFmpeg 自前生成経路へフォールバックする。
     private GpuDeviceContext? _gpuDevice;
     private bool _gpuDeviceInitAttempted;
+    /// <summary>
+    /// 共有 HW デバイスコンテキストの生成を試したか。<b>成否に関わらず立つ</b>。
+    /// 理由は <see cref="EnsureSharedHwDeviceCtx"/>。
+    /// </summary>
+    private bool _sharedHwDeviceCtxInitAttempted;
     // FFmpeg の HW デバイスコンテキスト（D3D11VA）。共有 D3D11 デバイスと同様に初回 Open 時に一度だけ生成して使い回す。
     // ファイル切替のたびに av_hwdevice_ctx_init/uninit を繰り返すとネイティブヒープを破損させ連続 D&D でクラッシュしたため、
     // 1つを全 VideoDecoder が av_buffer_ref で参照共有する。GPU 無し環境等では null のままとしフォールバックする。
@@ -538,8 +543,10 @@ public unsafe class MediaEngine : IMediaEngine
             catch (Exception ex)
             {
                 _gpuDevice = null;
+                // ex.Message ではなく ex を載せる。**この経路が GPU 縮退の唯一の手掛かり**で、
+                // どの呼び出しで失敗したか・内部の HRESULT が分からないと切り分けられない
                 DiagnosticLog.Write("gpuDevice",
-                    $"自前 D3D11 デバイス生成に失敗（従来の FFmpeg 自前生成経路へフォールバック）: {ex.Message}");
+                    $"自前 D3D11 デバイス生成に失敗（従来の FFmpeg 自前生成経路へフォールバック）: {ex}");
             }
         }
         return _gpuDevice?.NativeDevicePointer ?? IntPtr.Zero;
@@ -550,14 +557,82 @@ public unsafe class MediaEngine : IMediaEngine
     /// ファイル切替のたびに <c>av_hwdevice_ctx_init</c>/<c>uninit</c> を繰り返してネイティブヒープを破損させる問題
     /// （連続 D&amp;D クラッシュ）を防ぐ。GPU 無し環境や生成失敗時は null を返し、VideoDecoder 側が従来の FFmpeg 自前生成経路へフォールバックする。
     /// </summary>
+    /// <remarks>
+    /// <b>失敗も「試した」として覚える。</b> <see cref="_gpuDevice"/> 側の
+    /// <see cref="_gpuDeviceInitAttempted"/> と同じ形。成功したかどうか（<c>null</c> か）だけで
+    /// 判定すると、一度失敗した環境では<b>ファイルを開くたびに生成をやり直す</b>ことになり、
+    /// このメソッドが防ぐはずの「<c>av_hwdevice_ctx_init</c>/<c>uninit</c> の繰り返し」を
+    /// 自分で再現してしまう。
+    /// </remarks>
     private AVBufferRef* EnsureSharedHwDeviceCtx()
     {
+        if (_sharedHwDeviceCtxInitAttempted) return _sharedHwDeviceCtx;
+        _sharedHwDeviceCtxInitAttempted = true;
+
         IntPtr devicePtr = EnsureGpuDevicePointer();
-        if (devicePtr == IntPtr.Zero) return null;
+        if (devicePtr == IntPtr.Zero)
+        {
+            // **こちらは危険ではない。** GPU が無ければ VideoDecoder の後退先
+            // （av_hwdevice_ctx_create）も毎回すぐ失敗し、ネイティブの HW デバイスは
+            // 1 つも作られない。つまり「ファイルごとに作り直す」危険は起きない
+            NoteSharedHwDeviceUnavailable(
+                "共有 D3D11 デバイスを作れなかった。以降このエンジンは SW デコードのみで動作する");
+            return null;
+        }
+
+        _sharedHwDeviceCtx = HardwareAccel.CreateD3D11VAContextFromDevice(devicePtr);
         if (_sharedHwDeviceCtx == null)
-            _sharedHwDeviceCtx = HardwareAccel.CreateD3D11VAContextFromDevice(devicePtr);
+        {
+            // **こちらが危険な方。** GPU はあるので VideoDecoder の後退先が実際に成功し、
+            // ファイルを開くたびにネイティブの HW デバイスが作られては壊される
+            NoteSharedHwDeviceUnavailable(
+                "共有 D3D11 デバイスはあるが D3D11VA コンテキストを作れなかった。"
+                + "以降このエンジンでは HW デコードのデバイスをファイルごとに作り直す"
+                + "（連続したファイル切替でネイティブヒープを壊す既知の経路）");
+        }
         return _sharedHwDeviceCtx;
     }
+
+    /// <summary>
+    /// このエンジンが共有 HW デバイスコンテキストの<b>生成に成功したか</b>。<b>テストの確認用</b>。
+    /// </summary>
+    /// <remarks>
+    /// <b>統合テストが「共有コンテキストが作られたか」を確かめるために要る。</b> これが無いと、
+    /// GPU はあるが <c>av_hwdevice_ctx_init</c> だけ失敗する環境で、テストが静かに
+    /// ファイルごとの自前生成へ落ちたまま緑になる——<b>検証したい箇所を一度も通らずに通過する</b>。
+    /// <para>
+    /// <b>「いま開いているファイルが HW デコードで動いているか」ではない。</b> それが確定するのは
+    /// <see cref="VideoDecoder"/> 側の 3 段（コーデックが D3D11VA に対応しているか・
+    /// <c>av_buffer_ref</c> が成功したか・<c>get_format</c> が実際に HW 形式を選んだか）を
+    /// 経た後で、ここはその<b>手前のエンジン単位の生成成否</b>しか見ていない。
+    /// <b>「HW デコードで再生中」の判定にそのまま転用しないこと</b>——D3D11VA 非対応の
+    /// コーデックでも真のままになる。名前を <c>…Created</c> にしてあるのはそのため。
+    /// </para>
+    /// </remarks>
+    internal bool IsSharedHwDeviceContextCreated => _sharedHwDeviceCtx != null;
+
+    /// <summary>
+    /// 共有 HW デバイスコンテキストを諦めたことを、<b>常に残る側へ</b>記録する。
+    /// </summary>
+    /// <remarks>
+    /// デバッグログ側に書くと既定運用では痕跡が 1 行も残らず、事後に「なぜ共有経路から
+    /// 外れていたのか」を追えない。
+    /// <para>
+    /// <b>文面は呼び出し元が組み立てる。</b> 諦めた理由によって<b>危険度が違う</b>ためで、
+    /// ここで一律の警告を付け足すと、<b>危険が起きない経路にも危険の警告が出る</b>
+    /// （実際に一度そう書いて指摘された。GPU が無い環境では後退先も何も生成しないので、
+    /// 「ファイルごとに作り直す」危険は起きない）。区別は <see cref="EnsureSharedHwDeviceCtx"/>。
+    /// </para>
+    /// <para>
+    /// <b>ここに記録用の抑制フラグは要らない。</b> 呼び出し元が<b>試行そのものを 1 回に
+    /// 絞っている</b>ため、このメソッドはエンジンにつき最大 1 回しか呼ばれない。
+    /// <b>抑えるべきは記録ではなく危険な操作の方</b>——記録だけを絞ると「1 度だけ報告して、
+    /// あとは無言で繰り返す」形になる（これも一度そう書いて指摘された）。
+    /// <b>呼び出し元を増やすなら、この前提が崩れていないか確かめること。</b>
+    /// </para>
+    /// </remarks>
+    private void NoteSharedHwDeviceUnavailable(string message)
+        => DiagnosticLog.WriteFatal("gpuDevice", message);
 
     /// <summary>
     /// このメディアの尺（秒）を決める。コンテナが答えなければストリーム側から補完し、
