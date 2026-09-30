@@ -599,7 +599,9 @@ public sealed unsafe class AudioDecodeThread
     // 区別できないのは、ここが再生状態を知らないからで、経過時間の測り方の問題ではない。**
     // 生死の判定は再生状態を持つ MediaEngine.DetectAudioStall（StallDetector）が担い、
     // ここでの滞留ログはその裏付けに使う診断情報にとどめる（WriteFatal へは上げない）。
-    // なお HoldOutput 中は消費が続く（MultiTrackMixer.Read 参照）ので滞留の原因にはならない
+    // なお HoldOutput 中はミキサーが読み進めないため、保留の間はここで待つ。保留が解けない異常が
+    // あっても、ミキサーが猶予（HoldDiscardGrace）後に読み進めを再開するので恒久的にはならない。
+    // 次のシークが来れば、下の待機ループが世代の変化を見て抜ける
     private static readonly TimeSpan GateStallLogThreshold = TimeSpan.FromSeconds(2.0);
 
     /// <summary>

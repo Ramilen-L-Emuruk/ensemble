@@ -25,19 +25,79 @@ public class MultiTrackMixer : IWaveProvider
     public Action? OnRead;
 
     /// <summary>
-    /// true の間、トラックバッファに実データがあっても Read() は無音を返す。バッファ自体は
-    /// 通常どおり消費し続ける（消費まで止めると、AudioDecodeThread の充填ゲートが
-    /// この Read() の消費待ちで永久に抜けられなくなり、シーク処理自体がデッドロックする）。
+    /// 保留がこれより長く続いたら、読み進め（読んだ分は捨てる）を再開する。
+    /// 実測の映像プリロールは最長 2.4 秒だったので、それを十分に超える値にしてある。
+    /// </summary>
+    /// <remarks>
+    /// <c>MediaEngine.PrerollGraceMs</c>（滞留検出がプリロール待ちを見逃す猶予）と値は同じだが、別の事実を
+    /// 表すので共有しない。あちらは「いつから異常と報告するか」、こちらは「いつ詰まりの逃げ道を開くか」。
+    /// どちらかを変えても、もう片方を追従させる義務はない。
+    /// <para>
+    /// 保留中に読み進めなくても詰まらないのは、音声のパケットキューが充填ゲートの先にさらに数秒ぶん
+    /// （トラック数 × 256 パケット。各トラックが均等に並んでいれば AAC で約 5.5 秒）を受け止められるから。demux はその分だけ先まで
+    /// 読めるので、映像のプリロールが要るパケット（シーク先まで）は先に届いている。この猶予は、
+    /// 音声がファイル内で映像より数秒以上先に置かれているような異常な配置のための保険。
+    /// </para>
+    /// </remarks>
+    public static readonly TimeSpan HoldDiscardGrace = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// true の間、トラックバッファに実データがあっても Read() は無音を返し、バッファも読み進めない。
     /// シーク直後、映像側のプリロール（キーフレーム→目標地点の破棄デコード）が完了するまで音声出力を
     /// 保留するために使う。これが無いと音声だけ先に実時間で進んでクロックが映像を置き去りにし、
     /// 映像が追いつこうとして大量ドロップ（早送りに見える）が発生する。
+    /// <b>true を代入するたびに猶予の計時を始め直す</b>（シークのたびに <c>PrerollGate.BeginSeek</c> が立て直す）。
     /// </summary>
-    public volatile bool HoldOutput;
+    /// <remarks>
+    /// <para>
+    /// <b>保留中に読み進めてはいけない。</b>以前は消費を続けていたため、保留が解けた時点で
+    /// バッファの先頭が保留時間ぶん先へ進んでおり、クロックの錨（シーク先）より先の音声が鳴っていた。
+    /// 次のシークまで音声が映像より先行したまま残る（実測で最大 2.4 秒）。
+    /// </para>
+    /// <para>
+    /// 量ではなく時間で縛る。デコードは実時間よりずっと速く、映像のキューは数秒先まで先読みできるので、
+    /// 「一定量を超えたら捨てる」形にすると保留の直後に上限へ届き、結局毎回捨てることになる（実機で確認）。
+    /// </para>
+    /// <para>
+    /// 猶予を超えたら読み進めを再開するのは、保留が解けない異常（映像側がパケットを受け取れない等）で
+    /// 充填ゲート→demux が止まったままになるのを防ぐため。読み進めた分は捨てることになり、解除後の音声が
+    /// その分先行するので、再開したときは記録を残す。
+    /// </para>
+    /// </remarks>
+    public bool HoldOutput
+    {
+        get => _holdOutput;
+        set
+        {
+            if (value)
+            {
+                Volatile.Write(ref _holdStartedTicks, _tickSource());
+                // 記録済みの印も保留を立てるたびに降ろす。Read 側で降ろすと、解除と次の保留の間に
+                // Read が 1 回も挟まらなかった場合に持ち越され、次の猶予超過が記録されない
+                _holdDiscardReported = false;
+            }
+            _holdOutput = value;
+        }
+    }
+
+    private volatile bool _holdOutput;
+    // 保留を立てた時刻（壁時計）。一時停止中は Read が呼ばれないが、この時刻からの経過は進み続ける。
+    // 一時停止しても映像のプリロールは進んで保留は解けるので、猶予を使い切るのは保留が解けない異常のときだけ
+    private long _holdStartedTicks;
+    private readonly Func<long> _tickSource;
 
     private long _lastHoldOutputLogTicks;
+    // 1 回の保留につき、猶予超過で捨て始めた記録は 1 行だけ残す（Read は 10ms 刻みで呼ばれる）
+    private volatile bool _holdDiscardReported;
 
-    public MultiTrackMixer()
+    public MultiTrackMixer() : this(() => Environment.TickCount64)
     {
+    }
+
+    /// <param name="tickSource">ミリ秒単位の単調な時刻（テストで猶予の経過を踏むために差し替える）。</param>
+    internal MultiTrackMixer(Func<long> tickSource)
+    {
+        _tickSource = tickSource;
         _format = WaveFormat.CreateIeeeFloatWaveFormat(
             Decoding.AudioDecoder.OutSampleRate,
             Decoding.AudioDecoder.OutChannels);
@@ -54,14 +114,20 @@ public class MultiTrackMixer : IWaveProvider
         outFloats.Clear();
 
         bool holding = HoldOutput;
+        if (holding)
+        {
+            DiscardIfHoldOutlastedGrace(count);
+            OnSilenceWritten?.Invoke(count / _blockAlign);
+            OnRead?.Invoke();
+            return count;
+        }
+
         int common = ComputeCommonAvailableBytes(count);
-        if (holding) LogHoldOutputStall(common);
-
         if (common > 0)
-            MixCommonBytes(common, outFloats, holding);
+            MixCommonBytes(common, outFloats);
 
-        long audioFrames = holding ? 0 : common / _blockAlign;
-        long silenceFrames = holding ? count / _blockAlign : (count - common) / _blockAlign;
+        long audioFrames = common / _blockAlign;
+        long silenceFrames = (count - common) / _blockAlign;
 
         // 二度と実データが来ない無音は、アンダーラン/priming待ちの無音とは違う。ここで
         // OnSilenceWritten のままクロックを凍結させ続けると、音声より僅かに長い映像側の
@@ -74,7 +140,7 @@ public class MultiTrackMixer : IWaveProvider
         // ・音声トラックを 1 本も持たない動画（無音動画）。こちらは OnAudioWritten が一度も
         //   発火しないとクロックが 0.0 に固定され、2 枚目以降の映像フレームが永久に
         //   「期限到来」と判定されないため、最初のフレームで再生が固まる（GPU/CPU 両経路）
-        if (!holding && silenceFrames > 0 && _tracks.All(t => t.IsEof))
+        if (silenceFrames > 0 && _tracks.All(t => t.IsEof))
         {
             audioFrames += silenceFrames;
             silenceFrames = 0;
@@ -87,9 +153,44 @@ public class MultiTrackMixer : IWaveProvider
         return count;
     }
 
+    /// <summary>
+    /// 保留中の Read。猶予（<see cref="HoldDiscardGrace"/>）内はバッファに手を付けない。猶予を超えたら
+    /// 通常の再生と同じ歩調（全トラック共通量、最大 <paramref name="count"/> バイト）で読み進めて捨てる
+    /// （理由は <see cref="HoldOutput"/> の remarks）。
+    /// </summary>
+    private void DiscardIfHoldOutlastedGrace(int count)
+    {
+        long heldMs = _tickSource() - Volatile.Read(ref _holdStartedTicks);
+        if (heldMs < (long)HoldDiscardGrace.TotalMilliseconds)
+        {
+            LogHoldOutputStall(0);
+            return;
+        }
+
+        int discard = ComputeCommonAvailableBytes(count);
+        if (discard > 0)
+        {
+            EnsureScratchCapacity(discard);
+            foreach (var track in _tracks)
+                track.Buffer.Read(_scratch, 0, discard);
+
+            if (!_holdDiscardReported)
+            {
+                _holdDiscardReported = true;
+                // 常に残る側へ。捨てた分だけ解除後の音声が映像より先行するので、症状と結び付けられる
+                // ようにしておく。Read は音声出力スレッドなので、ファイル I/O を伴わない遅延書き込みを使う
+                Diagnostics.DiagnosticLog.WriteFatalDeferred("mixer",
+                    $"シーク後の出力保留が {HoldDiscardGrace.TotalSeconds:F0} 秒を超えても解けないため、音声の読み進めを再開した"
+                    + "（映像の準備が終わっていない可能性がある。読み進めた分は捨てるので、保留が解けた後の音声が映像より先行する）");
+            }
+        }
+
+        LogHoldOutputStall(discard);
+    }
+
     /// <summary>回帰検知用診断ログ: HoldOutput が長時間解除されない異常ケースを検出するため、
-    /// HoldOutput 中の消費量とトラックのバッファ残量を一定間隔で記録する。</summary>
-    private void LogHoldOutputStall(int consumedBytes)
+    /// HoldOutput 中に捨てた量とトラックのバッファ残量を一定間隔で記録する。</summary>
+    private void LogHoldOutputStall(int discardedBytes)
     {
         long nowTicks = Environment.TickCount64;
         if (nowTicks - _lastHoldOutputLogTicks < 2000) return;
@@ -97,7 +198,7 @@ public class MultiTrackMixer : IWaveProvider
 
         string bufferedByTrack = string.Join(",", _tracks.Select(t => t.Buffer.BufferedBytes));
         Diagnostics.DiagnosticLog.Write("mixer-hold",
-            $"HoldOutput 中 出力保留（バッファ消費は継続） consumedBytes={consumedBytes} trackBufferedBytes=[{bufferedByTrack}]");
+            $"HoldOutput 中 出力保留 discardedBytes={discardedBytes} trackBufferedBytes=[{bufferedByTrack}]");
     }
 
     /// <summary>
@@ -130,12 +231,8 @@ public class MultiTrackMixer : IWaveProvider
         return Math.Max(0, common);
     }
 
-    /// <summary>
-    /// holding=true の間はトラックバッファの消費（Read）だけ行い、出力には混ぜない。
-    /// HoldOutput 中でも消費自体は止めないことで、AudioDecodeThread の充填ゲートが
-    /// 塞がれ続けるのを防ぐ（HoldOutput のコメント参照）。
-    /// </summary>
-    private void MixCommonBytes(int common, Span<float> outFloats, bool holding)
+    /// <summary>全トラックから <paramref name="common"/> バイトずつ読み、合成して出力へ書く。</summary>
+    private void MixCommonBytes(int common, Span<float> outFloats)
     {
         EnsureScratchCapacity(common);
         var scratchBytes = _scratch;
@@ -143,7 +240,7 @@ public class MultiTrackMixer : IWaveProvider
         foreach (var track in _tracks)
         {
             int read = track.Buffer.Read(scratchBytes, 0, common);
-            if (holding || track.IsMuted) continue;
+            if (track.IsMuted) continue;
 
             float vol = track.Volume * _masterVolume;
             if (vol == 0f) continue;
@@ -152,8 +249,6 @@ public class MultiTrackMixer : IWaveProvider
             for (int i = 0; i < srcFloats.Length; i++)
                 outFloats[i] += srcFloats[i] * vol;
         }
-
-        if (holding) return; // 出力には混ぜない（消費だけ行った）
 
         int floatCount = common / sizeof(float);
         for (int i = 0; i < floatCount; i++)
