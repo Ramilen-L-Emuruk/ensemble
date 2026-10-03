@@ -16,6 +16,9 @@ public sealed class PlaybackClock
     private double _currentRate = 1.0;
     private bool _seekPending;
     private double _seekTarget;
+    // 直近の BeginSeek 時点の書込カーソル。これより手前はシーク前に書いた音声で、
+    // HW がそこを鳴らしている間も PositionAt はシーク先を返す（PositionAt の doc 参照）
+    private long _seekBoundaryFrame;
     private double? _pausedOverride;
     private double _lastReturnedPosition;
 
@@ -42,6 +45,15 @@ public sealed class PlaybackClock
     /// 正常な待ちを異常と呼ばないために使う。<b>この判定はクロック自身が持つのが正しい</b>——
     /// 定数を返しているのはこのクラスの都合なので、外から別の値で言い換えると必ずずれる
     /// （<c>ensemble-review.md</c> §7）。
+    /// <para>
+    /// 錨の確定後も、HW がシーク前の音声を鳴らし切るまでの短い間（出力レイテンシぶん。実測 100ms 前後）は
+    /// <see cref="PositionAt"/> がシーク目標を返し続けるが、この間はここに含めない。HW 位置が進む限り
+    /// 長さは出力バッファで決まり、滞留検出の閾値（秒単位）には届かない。**HW 位置が進まなければ
+    /// この待ちは解けないが、それはクロックの滞留そのもの**なので、除外せず
+    /// <c>MediaEngine.DetectClockStall</c> に拾わせる（ここに含めると、その検出を黙らせることになる）。
+    /// 映像側（<c>SlotSequencer.IsWaitingForFrameTime</c>）がこの間を「時刻待ち」と答えるのは、
+    /// 旧来のシークギャップ区間（Rate=0）と同じ既知の限界で、あちらの remarks が扱っている。
+    /// </para>
     /// </remarks>
     public bool IsSeekPending { get { lock (_lock) return _seekPending; } }
 
@@ -55,6 +67,7 @@ public sealed class PlaybackClock
             _writeCursor = 0;
             _currentRate = 1.0;
             _seekPending = false;
+            _seekBoundaryFrame = 0;
             _pausedOverride = null;
             _lastReturnedPosition = 0.0;
         }
@@ -70,6 +83,7 @@ public sealed class PlaybackClock
         {
             _seekPending = true;
             _seekTarget = targetSeconds;
+            _seekBoundaryFrame = _writeCursor;
             _pausedOverride = null;
             // 単調クランプの基準もシーク先へ折り返す。これを怠ると後方シーク後の
             // PositionAt がシーク前の値に張り付き続け、映像側が全フレームを
@@ -152,6 +166,20 @@ public sealed class PlaybackClock
     /// 指定フレーム位置（通常はハードウェア再生位置）のソース時刻を返す。
     /// PausedOverride 設定中・シーク保留中はそれぞれの固定値を返す。QPC 外挿ジッタ対策で単調非減少にクランプする。
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>シーク後、HW がシーク前に書いた音声を鳴らし切るまで（<c>_seekBoundaryFrame</c> より手前）は
+    /// シーク先を返す。</b>錨が確定して <c>_seekPending</c> が解けた後も、WASAPI のバッファには
+    /// シーク前の音声がレイテンシぶん（実測 100ms 前後）残っている。その区間をシーク前のタイムラインで
+    /// 写像すると、映像側（<c>FrameSelector</c>）はシーク先のフレームを全て期限切れと見なし、
+    /// 捨てながらデコードの速さで先へ進む。クロックが追いついた時点で映像が音声より先走っており、
+    /// 音声が追いつくまで止まって見える（3 秒戻しで中央値 0.75 秒先走っていた）。
+    /// </para>
+    /// <para>
+    /// 速度変更（<see cref="SetSpeedAt"/>）の境界手前はこの扱いにしない。あちらは旧レートの
+    /// 連続した時刻が正しい。
+    /// </para>
+    /// </remarks>
     public double PositionAt(long hwFrames)
     {
         lock (_lock)
@@ -160,12 +188,13 @@ public sealed class PlaybackClock
             if (_seekPending) return _seekTarget;
 
             long clamped = Math.Min(hwFrames, _writeCursor);
+            if (clamped < _seekBoundaryFrame) return _seekTarget;
 
-            // clamped がまだ最新セグメント（直近の AnchorAt/SetSpeedAt）の開始フレームに達していない場合、
-            // HW は前のシークの音声をまだ再生し終えていない過渡期にある。この raw は一時的に
-            // （シーク前の位置に近い）高い値になり得るが、ここで _lastReturnedPosition を更新すると、
-            // 直後に HW が正しい新セグメントへ入った後もこの高い値に頭打ちされ続けてしまい、
-            // クロックが古い位置に固まって進まなくなる（後方シーク連打の実機検証で観測された不具合）
+            // clamped がまだ最新セグメント（直近の AnchorAt/SetSpeedAt 等）の開始フレームに達していない過渡期。
+            // シーク境界より手前は上で処理済みなので、ここに来るのはシーク境界から錨までの無音区間（シーク先を
+            // 返す）か、速度変更の境界手前（旧レートの連続値）。どちらも _lastReturnedPosition を更新しない。
+            // 更新すると、直後に HW が新セグメントへ入った後もこの値に頭打ちされ続け、クロックが
+            // 古い位置に固まって進まなくなる（後方シーク連打の実機検証で観測された不具合）
             if (clamped < _segments[^1].StartFrame)
                 return PositionAtFrameLocked(clamped);
 

@@ -2759,7 +2759,8 @@ public unsafe class MediaEngine : IMediaEngine
     /// 無音を <c>OnAudioWritten</c> に計上してクロックを進めている）ので、トラック数で条件を絞らない。
     /// </para>
     /// <para>
-    /// シーク中も <c>Read</c> は続く（<c>HoldOutput</c> は出力を止めるが消費は止めない）ため、
+    /// シーク中も <c>Read</c> は呼ばれ続ける（<c>HoldOutput</c> は出力と読み進めを止めるが、
+    /// <c>Read</c> 自体は WASAPI が呼ぶ）ため、
     /// シークで基準を置き直す必要はない。置き直すのは一時停止から再生へ戻す経路だけ（<see cref="Play"/>）。
     /// </para>
     /// <para>

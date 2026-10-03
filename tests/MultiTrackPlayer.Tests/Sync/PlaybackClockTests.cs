@@ -326,4 +326,87 @@ public sealed class PlaybackClockTests
         // 映像が「期限切れ」判定され続け、リング満杯で完全停止する回帰バグ）
         Assert.Equal(11.0, clock.PositionAt(clock.WriteCursor), precision: 6);
     }
+
+    [Fact(DisplayName = "後方シーク直後、HW がシーク前の音声を鳴らし切るまではシーク先を返す")]
+    public void PositionAt_BeforeHwReachesSeekBoundary_ReturnsSeekTarget()
+    {
+        // Arrange: 100 秒地点から 1 秒再生（writeCursor=48000）
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, srcPtsSeconds: 100.0);
+        clock.OnAudioWritten(SampleRate);
+
+        // Act: 10 秒地点へ後方シーク → 保留中の無音 → 錨 → 新区間の音声
+        clock.BeginSeek(10.0);
+        long seekBoundary = clock.WriteCursor;           // 48000
+        clock.OnSilenceWritten(SampleRate / 10);          // 保留中の無音 0.1 秒
+        clock.AnchorAt(clock.WriteCursor, 10.0);
+        clock.OnAudioWritten(SampleRate);
+
+        // Assert: HW がまだシーク前の音声（seekBoundary より手前）を鳴らしている間も、
+        // 返すのはシーク先。シーク前の時刻（~101 秒）を返すと、映像側が新しいフレームを
+        // 全て期限切れと見なし、捨てながら先へ早送りしてしまう（音声より先走って固まる）
+        Assert.Equal(10.0, clock.PositionAt(seekBoundary - 1000));
+        Assert.Equal(10.0, clock.PositionAt(seekBoundary - 1));
+        // 保留中の無音区間もシーク先のまま
+        Assert.Equal(10.0, clock.PositionAt(seekBoundary + 1000));
+        // 新区間に入ったらシーク先から進む
+        Assert.Equal(10.5, clock.PositionAt(seekBoundary + SampleRate / 10 + SampleRate / 2), precision: 6);
+    }
+
+    [Fact(DisplayName = "シークを重ねた場合、HW が最後のシーク境界に届くまでは最後のシーク先を返す")]
+    public void PositionAt_BeforeLatestSeekBoundary_ReturnsLatestSeekTarget()
+    {
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, srcPtsSeconds: 100.0);
+        clock.OnAudioWritten(SampleRate);
+
+        clock.BeginSeek(50.0);
+        clock.AnchorAt(clock.WriteCursor, 50.0);
+        clock.OnAudioWritten(SampleRate / 10);   // 50 秒からの音声を少しだけ書いた
+
+        clock.BeginSeek(20.0);
+        long latestBoundary = clock.WriteCursor;
+        clock.AnchorAt(latestBoundary, 20.0);
+        clock.OnAudioWritten(SampleRate);
+
+        // 1 つ目のシーク前の区間・1 つ目のシーク後の区間のどちらを鳴らしていても、見せるのは最後のシーク先
+        Assert.Equal(20.0, clock.PositionAt(SampleRate - 1000));
+        Assert.Equal(20.0, clock.PositionAt(latestBoundary - 1));
+        Assert.Equal(21.0, clock.PositionAt(latestBoundary + SampleRate), precision: 6);
+    }
+
+    [Fact(DisplayName = "速度変更の境界より手前は旧レートの連続した時刻を返す（シークの扱いを持ち込まない）")]
+    public void PositionAt_BeforeSpeedChangeBoundary_AfterEarlierSeek_KeepsContinuousTimeline()
+    {
+        // シーク境界を 0 以外にしておく（0 だと新しい分岐を一度も通らず、検証にならない）
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, 100.0);
+        clock.OnAudioWritten(SampleRate);            // 100.0 → 101.0、cursor=48000
+        clock.BeginSeek(10.0);
+        long seekBoundary = clock.WriteCursor;        // 48000
+        clock.AnchorAt(seekBoundary, 10.0);
+        clock.OnAudioWritten(2 * SampleRate);        // 10.0 → 12.0、cursor=144000
+
+        long speedBoundary = clock.WriteCursor + SampleRate / 2;
+        clock.SetSpeedAt(speedBoundary, newRate: 2.0);
+
+        // シーク境界より後・速度変更の境界より手前では、シーク先の定数ではなく等速の連続値
+        Assert.Equal(11.5, clock.PositionAt(seekBoundary + SampleRate + SampleRate / 2), precision: 6);
+    }
+
+    [Fact(DisplayName = "Reset 後はシーク境界の記憶も消える")]
+    public void Reset_ClearsSeekBoundary()
+    {
+        var clock = new PlaybackClock(SampleRate);
+        clock.AnchorAt(0, 100.0);
+        clock.OnAudioWritten(SampleRate);
+        clock.BeginSeek(10.0);
+        clock.AnchorAt(clock.WriteCursor, 10.0);
+
+        clock.Reset();
+        clock.AnchorAt(0, 0.0);
+        clock.OnAudioWritten(SampleRate);
+
+        Assert.Equal(0.5, clock.PositionAt(SampleRate / 2), precision: 6);
+    }
 }
