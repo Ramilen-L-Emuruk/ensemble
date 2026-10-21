@@ -26,6 +26,7 @@ Desktop.ini
 # `.claude/` とディレクトリごと除外すると配下の否定（!）が効かなくなるため
 # `.claude/*` と書いている。
 .claude/*
+!.claude/writeback/
 !.claude/rules/
 !.claude/skills/
 .claude/skills/*
