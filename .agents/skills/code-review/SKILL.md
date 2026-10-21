@@ -14,3 +14,5 @@ Use this skill when the user requests a review, or before accepting a consequent
 5. Do not turn style preferences into defects or create an unbounded review cycle. If no actionable issue remains, say so and name residual verification limits.
 
 Use `code-reviewer` for the main pass. Add `adversarial-reviewer`, `documentation-reviewer`, or `java-reviewer` only for independent, relevant coverage. Reviewers do not edit or commit.
+
+A reviewer with shell access is not read-only in practice, even when instructed not to edit. Before delegating, save uncommitted work (including new files) outside the worktree. In the prompt, forbid file changes, Git restore operations (`checkout`, `restore`, `stash`, `reset`), and killing processes. Afterwards, read `git status --short` including untracked (`??`) entries, and check that other sessions' servers are still running.
