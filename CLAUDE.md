@@ -1115,3 +1115,9 @@ dotnet publish src/MultiTrackPlayer.UI/MultiTrackPlayer.UI.csproj -c Release -o 
 - キーバインド設定: `%APPDATA%\MultiTrackPlayer\keybindings.json`
 - ファイルオープン（`avformat_open_input`/`avformat_find_stream_info`）は UI スレッドで同期実行される
   （3-4GB ファイルで数百ms かかることがある。非同期化は未対応・既知の TODO）
+- ソースの BOM（ファイル先頭の文字コードの印）は**ファイルごとに違う**。`.cs` と `.xaml` は一部だけが
+  BOM 付き（`MediaEngine.cs`・`MainViewModel.cs`・`MainWindow.xaml` など）で、残りは BOM 無し。
+  `MultiTrackPlayer.sln` と `MultiTrackPlayer.UI.csproj` も BOM 付き。スクリプトで書き換えるときは
+  ファイルごとに先頭 3 バイトを見て、元と同じ形で書き戻す（Python なら BOM 付きは `utf-8-sig`）。
+  改行はリポジトリ内では LF、作業ツリーでは `core.autocrlf` により CRLF になる（照合するときの注意は
+  上記「スクリプトはファイルに書いてから実行する」）
