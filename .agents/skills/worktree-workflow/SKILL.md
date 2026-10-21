@@ -42,4 +42,5 @@ Use this skill when work needs an isolated checkout or when coordinating indepen
      - Directory junctions are found by their ReparsePoint attribute, including dangling ones. Windows PowerShell 5.1 does not descend into junctions while recursing, so no depth limit is needed. File links are left to Git, which removes them safely.
      - `[System.IO.Directory]::Delete(<absolute path>, $false)` removes only the link, not its target. Do not substitute recursive deletion.
      - Afterwards confirm that the main checkout's copy (for example `node_modules/.bin`) still exists.
+   - When cleaning up several orphaned directories (present on disk but absent from `git worktree list`), run `git worktree list` again immediately before deleting and exclude every listed path. Another session may have created a worktree since the list was made. In a nearly empty directory, `git status` reports on the parent repository, so check contents with a directory listing instead. Present the list and get confirmation before deleting, and pass each one through the block above first.
 5. Never use forced removal or branch deletion to bypass uncommitted changes or unmerged commits.
