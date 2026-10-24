@@ -27,6 +27,7 @@ Desktop.ini
 # `.claude/*` と書いている。
 .claude/*
 !.claude/rules/
+!.claude/writeback/
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/release/

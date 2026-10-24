@@ -1330,6 +1330,8 @@ public unsafe class MediaEngine : IMediaEngine
             _lastPullTimestamp = pullNow;
 
             bool got = _videoRing.TryLeaseDue(position.TotalSeconds, _videoFrameDuration, out var lease, out int dropped);
+            // vout 側と同じく、ドロップの記録（同期のファイル書き込み）より前に置いてリセットとの入れ違いの窓を狭める
+            if (got && lease != null) _videoLagMonitor.NotePresented(lease.Pts.TotalSeconds);
             _droppedFrames += dropped;
             if (dropped > 0)
             {
@@ -1644,6 +1646,8 @@ public unsafe class MediaEngine : IMediaEngine
     /// </summary>
     private IVideoFrameSink? BuildVideoRingAndSink()
     {
+        // 前のパイプラインで最後に出したフレームの表示時刻を、新しいクロックと比べさせない
+        _videoLagMonitor.Reset();
         if (_videoDecoder == null)
         {
             _videoRing = null;
@@ -1750,11 +1754,13 @@ public unsafe class MediaEngine : IMediaEngine
         {
             while (_voutRunning && generation == _voutGeneration)
             {
+                long iterStart = Stopwatch.GetTimestamp();
                 if (!presenter.TryWaitForVBlank())
                 {
                     stopReason = VideoOutputFellBackMessage;
                     break;
                 }
+                long waitEnd = Stopwatch.GetTimestamp();
                 // 世代もここで見る。_voutRunning だけを見ると、停止待ちがタイムアウトした旧スレッドが
                 // 新セッションの立て直した true を素通りし、この下の共有統計フィールド
                 //（_lastVoutPull / _droppedFrames / _displayedFrames / _lastVideoLagSec。
@@ -1788,6 +1794,10 @@ public unsafe class MediaEngine : IMediaEngine
                     double clock = GetMasterClockSeconds();
                     if (ring.TryLeaseDue(clock, _videoFrameDuration, out var lease, out int dropped) && lease != null)
                     {
+                        // ドロップの記録（同期のファイル書き込み）より前に置き、リースからここまでの間に
+                        // シークのリセットが割り込む窓を狭める（塞ぎはしない。割り込まれるとシーク前の表示時刻が
+                        // 残るが、次のフレームで上書きされる 1 周だけの偽のずれは VideoLagMonitor が開始の持続条件で落とす）
+                        _videoLagMonitor.NotePresented(lease.Pts.TotalSeconds);
                         _droppedFrames += dropped;
                         if (dropped > 0)
                             DiagnosticLog.Write("videoDrop",
@@ -1828,6 +1838,7 @@ public unsafe class MediaEngine : IMediaEngine
                 //（破棄途中の swapchain や、新しい vout が使っている HWND を触らせない）。
                 if (!_voutRunning || generation != _voutGeneration) break;
 
+                long renderStart = Stopwatch.GetTimestamp();
                 if (currentSlot >= 0)
                 {
                     presenter.Render(ring, currentSlot);
@@ -1841,7 +1852,10 @@ public unsafe class MediaEngine : IMediaEngine
 
                 // frame latency waitable object は「待機と Present が 1:1」でないと枯渇してブロックする。
                 // そのため due が無い vsync でも必ず Present する（前フレームを再提示する）。
+                long presentStart = Stopwatch.GetTimestamp();
                 PresentOutcome outcome = presenter.TryPresent();
+                if (DiagnosticLog.Enabled)
+                    LogSlowVoutIteration(iterStart, waitEnd, renderStart, presentStart, Stopwatch.GetTimestamp(), state);
                 if (outcome != PresentOutcome.Presented)
                 {
                     // TDR・ドライバ更新等でデバイスが失われた場合、このスレッドで復旧はできないので畳む
@@ -1901,6 +1915,42 @@ public unsafe class MediaEngine : IMediaEngine
         PlaybackFailed?.Invoke(this, stopReason);
     }
 
+    /// <summary>
+    /// vout の 1 周がこれより長くかかったら、どこで時間を使ったかを診断ログへ残す。
+    /// 通常の 1 周は vsync 1 回ぶん（60Hz で約 17ms）なので、その数倍を目安にしている。
+    /// </summary>
+    private const double SlowVoutIterationMs = 100.0;
+
+    /// <summary>
+    /// vout の 1 周が長引いたときに、vsync 待ち・フレームの選択・描画・Present の内訳を記録する。
+    /// </summary>
+    /// <remarks>
+    /// 1 周の長さ（videoDrop の <c>gapMs</c>）だけでは、vsync 待ちが上限の 1 秒まで返らなかったのか、
+    /// Present や描画そのものが詰まったのかを区別できない。直す場所が違うので内訳を分けて残す。
+    /// ウィンドウが最小化・非表示の間は vsync 待ちが毎回 1 秒で切れるので、そのときは毎秒 1 行出る
+    /// （state と併せて読めば区別できる）。一時停止中も vsync 待ちが伸びることがあるので抑えずに残す。
+    /// <para>
+    /// 「フレーム選択」はクロックの取得・リース・保持フレームの乗り換えに加えて、ドロップの記録
+    /// （videoDrop の同期書き込み）を含む。ディスクが遅いとそこが伸びる。
+    /// </para>
+    /// <para>
+    /// <b>GPU 経路（vout スレッド）専用。</b> CPU 経路の提示は UI の <c>CompositionTarget.Rendering</c> が
+    /// 駆動するのでここを通らない。CPU 経路では videoDrop の <c>gapSincePrevPullMs</c> と videoLag で見る。
+    /// </para>
+    /// </remarks>
+    private static void LogSlowVoutIteration(
+        long iterStart, long waitEnd, long renderStart, long presentStart, long iterEnd, CorePlaybackState state)
+    {
+        double totalMs = TicksToMs(iterEnd - iterStart);
+        if (totalMs < SlowVoutIterationMs) return;
+        DiagnosticLog.Write("voutSlow",
+            $"1周={totalMs:F1}ms vsync待ち={TicksToMs(waitEnd - iterStart):F1}ms " +
+            $"フレーム選択={TicksToMs(renderStart - waitEnd):F1}ms 描画={TicksToMs(presentStart - renderStart):F1}ms " +
+            $"Present={TicksToMs(iterEnd - presentStart):F1}ms state={state}");
+    }
+
+    private static double TicksToMs(long stopwatchTicks) => stopwatchTicks * 1000.0 / Stopwatch.Frequency;
+
     /// <summary>vout スレッドを停止する（リング破棄より先に呼ぶこと）。スワップチェーンの破棄は vout スレッド自身に委譲する。</summary>
     /// <returns>
     /// 時間内に停止した場合 true。false のとき、vout スレッドはまだ映像リングのスロットを
@@ -1947,6 +1997,9 @@ public unsafe class MediaEngine : IMediaEngine
         // これがリングを Flush する唯一の経路（デコードスレッド側では呼ばない）
         var ring = _videoRing;
         bool ringFlushed = ring == null || ring.Flush(epoch);
+        // シーク前に出していたフレームの表示時刻を、着地後のクロックと比べさせない。新しい世代の
+        // フレームが出るまでの間（クロックの着地からその提示まで）を、映像のずれとして記録してしまう
+        _videoLagMonitor.Reset();
         DiagnosticLog.Write("demux", $"seek 処理 target={normalizedTargetSeconds:F3} epoch={epoch}");
         // 無視されるのは呼び出し規約が破られたときだけ（採番は単調増加なので正当な世代は必ず適用される）。
         // 起きていた場合、シーク前の Ready フレームが残ったまま新世代の再生が始まる
@@ -2114,6 +2167,9 @@ public unsafe class MediaEngine : IMediaEngine
     // ── ステータス通知（100ms 周期。映像フレーム配送は UI 側の CompositionTarget.Rendering がプルする）──
 
     private double _lastVideoLagSec;
+    // 画面の映像がクロックからずれている間を診断ログへ残す。_lastVideoLagSec は新しいフレームを
+    // 出したときにしか更新されず、映像が止まっている間の遅れを表せないため別に持つ（クラスの remarks）
+    private readonly VideoLagMonitor _videoLagMonitor = new();
     /// <summary>
     /// 診断ログに滞留を書く周期。滞留が続く間これだけ間隔をあけて繰り返し記録する
     /// （リングの状態を時系列で見るための開発用。利用者への通知とは別物）。
@@ -2327,6 +2383,10 @@ public unsafe class MediaEngine : IMediaEngine
         }
 
         StatisticsUpdated?.Invoke(this, new PlaybackStatistics(_droppedFrames, _displayedFrames, _lastVideoLagSec));
+
+        // 下の pos trace の書き込みより前に置くのは、書き込みが詰まるとクロックの値だけが古くなり、
+        // 偽のずれとして記録してしまうため
+        RecordVideoLag(posSeconds);
 
         // 短時間の連続シーク直後にクロックが古いセグメントを指し続ける不具合の切り分け用
         if (DiagnosticLog.Enabled && _state == CorePlaybackState.Playing)
@@ -2704,10 +2764,87 @@ public unsafe class MediaEngine : IMediaEngine
     private bool CanObserveVideoStall(IVideoFrameRing? ring, long nowTicks)
     {
         if (_state != CorePlaybackState.Playing || _videoDecoder == null || ring == null) return false;
-        // CPU 経路だけプルの生存を要求する（GPU 経路は vout が回り続けるのが正常）
-        if (!IsVideoOutputActive
-            && nowTicks - Volatile.Read(ref _lastVideoPullTicks) >= VideoPullAliveWindowMs) return false;
+        if (IsCpuPresentationIdle(nowTicks)) return false;
         return !IsWithinPrerollGrace(nowTicks);
+    }
+
+    /// <summary>
+    /// CPU 経路で、消費側（UI の <c>CompositionTarget.Rendering</c>）が問いかけてこなくなっているか。
+    /// 映像の滞留検出（<see cref="CanObserveVideoStall"/>）と映像のずれの計測（<see cref="EvaluateVideoLag"/>）が
+    /// 同じ定義を使う。GPU 経路は vout が回り続けるのが正常なので、常に false。
+    /// </summary>
+    private bool IsCpuPresentationIdle(long nowTicks) =>
+        !IsVideoOutputActive
+        && nowTicks - Volatile.Read(ref _lastVideoPullTicks) >= VideoPullAliveWindowMs;
+
+    /// <summary>
+    /// 映像のずれを評価して診断ログへ残す。<see cref="StatusTickCore"/> から 1 周に 1 回呼ぶ。
+    /// </summary>
+    /// <remarks>
+    /// <b>診断ログが無効の間はリングにも他のロックにも触れない。</b> 既定の運用で状態通知の周回を重くしないため、
+    /// 状態を捨てさせる軽い呼び出しだけを行う（有効にした直後の行が、無効だった期間を含まないように）。
+    /// <b>評価の失敗は記録して握る。</b> この後ろに滞留検出と再生終了の判定が並んでおり、診断の失敗でそれらを
+    /// 飛ばさない（タイマーのコールバックから例外が抜けるとプロセスも落ちる）。
+    /// </remarks>
+    private void RecordVideoLag(double clockSeconds)
+    {
+        if (!DiagnosticLog.Enabled)
+        {
+            _videoLagMonitor.Evaluate(Environment.TickCount64, clockSeconds, _videoFrameDuration,
+                LagObservation.NotMeasurable, "診断ログ無効");
+            return;
+        }
+        try
+        {
+            string? line = EvaluateVideoLag(clockSeconds);
+            if (_videoLagEvalFailures > 0)
+            {
+                DiagnosticLog.Write("videoLag", $"映像のずれの評価が回復した（失敗 {_videoLagEvalFailures} 回）");
+                _videoLagEvalFailures = 0;
+            }
+            if (line != null) DiagnosticLog.Write("videoLag", line);
+        }
+        catch (Exception ex)
+        {
+            // 初回だけスタックごと残し、続く間は数えるだけにする（状態通知は 100ms 周期で、毎回書くとログが埋まる）
+            if (_videoLagEvalFailures++ == 0)
+                DiagnosticLog.Write("videoLag", $"映像のずれの評価に失敗（回復するまで記録を止める）: {ex}");
+            // 評価できなかった間を「ずれが続いていた」と数えないよう、ずれ中なら打ち切りにする。
+            // 回復後は開始からやり直す（この呼び出しはリングに触れない）
+            if (_videoLagMonitor.Evaluate(Environment.TickCount64, clockSeconds, _videoFrameDuration,
+                    LagObservation.NotMeasurable, "評価に失敗") is { } abandoned)
+                DiagnosticLog.Write("videoLag", abandoned);
+        }
+    }
+
+    // 映像のずれの評価が続けて失敗している回数。状態通知のタイマー（重複起動しない）だけが触る
+    private int _videoLagEvalFailures;
+
+    /// <summary>
+    /// 映像のずれを評価し、記録すべき行があれば返す。
+    /// </summary>
+    /// <remarks>
+    /// 測らない状態は、映像の滞留検出が「提示が止まっていても異常ではない」とする状態に揃えてある
+    /// （<see cref="CanObserveVideoStall"/> と <see cref="IsVideoStalledNow"/> の時刻待ち）。言い換えると範囲がずれる
+    /// （<c>ensemble-review.md</c> §7）。ただしシーク後の待ちは猶予なしで除外する。待ちの間はクロックが
+    /// 着地点で止まっていて、ずれとして測る値が無いため。待ちが解けない障害は滞留検出が猶予後に拾う。
+    /// </remarks>
+    private string? EvaluateVideoLag(double clockSeconds)
+    {
+        long now = Environment.TickCount64;
+        var ring = _videoRing;
+        string? reason =
+            _state != CorePlaybackState.Playing ? "再生中でない"
+            : ring == null || _videoDecoder == null ? "映像なし"
+            : ring.IsEofDrained ? "映像の終端"
+            : IsCpuPresentationIdle(now) ? "描画の問いかけが止まっている（映像出力が動いていない。最小化など）"
+            : _prerollGate.IsWaitingForPreroll || _clock.IsSeekPending ? "シーク後の待ち"
+            : null;
+        LagObservation observation =
+            reason != null ? LagObservation.NotMeasurable
+            : ring!.IsWaitingForFrameTime(clockSeconds, _videoFrameDuration) ? LagObservation.NextFrameNotYetDue
+            : LagObservation.Measurable;
+        return _videoLagMonitor.Evaluate(now, clockSeconds, _videoFrameDuration, observation, reason);
     }
 
     /// <summary>
