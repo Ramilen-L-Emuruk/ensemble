@@ -82,18 +82,21 @@ public sealed class MediaEnginePlaybackTests : IClassFixture<TestMediaFixture>
         const int extraMs = 1000;
         int expectedBytesPerStep = output.BytesForMs(PumpStepMs);
 
+        // **読み出しは実時間に合わせる**（本番の音声出力と同じ速さ）。読み出しが速すぎると、供給が
+        // 追いつかない分が無音で埋まり（`PlaybackClock.OnSilenceWritten` はレート 0 でセグメントを積む）
+        // 位置の伸びが鈍る。読み出しの合間に `Thread.Sleep(1)` で譲るだけでは、その待ちがタイマー分解能で
+        // 決まるため、環境によって実時間の何倍で読むかが変わる（`EnginePump.For` の remarks と同じ理由）。
+        // **このテストが検出するのは「実時間で供給できるか」まで**で、それより速い読み出しへの余力は見ない
+        var paced = Stopwatch.StartNew();
         for (int consumed = 0; consumed < extraMs; consumed += PumpStepMs)
         {
+            while (paced.ElapsedMilliseconds < consumed + PumpStepMs) Thread.Sleep(1);
             // **これが確かめているのは配線だけ**——要求した量がミキサーへ渡り、同じ量が
             // 戻ってくること。**供給の遅れはここでは検出できない。** `MultiTrackMixer.Read` は
             // 無音で埋めた場合も要求量を丸ごと返すため、デコードが追いつかなくても
             // この値は変わらない。遅れを見ているのはループの後の `Assert.InRange` だけで、
             // **あちらの許容幅を緩めると検出手段が無くなる**
             Assert.Equal(expectedBytesPerStep, output.AdvanceMs(PumpStepMs));
-            // デコードスレッドに供給の機会を与える。譲らずに連打すると、供給が追いつかない分が
-            // 無音で埋まり（`PlaybackClock.OnSilenceWritten` はレート 0 でセグメントを積む）
-            // 位置の伸びが鈍る
-            Thread.Sleep(1);
         }
 
         TimeSpan advanced = engine.Position - before;
@@ -105,10 +108,9 @@ public sealed class MediaEnginePlaybackTests : IClassFixture<TestMediaFixture>
         // 7680 バイト（20ms 相当）で端数が無く、48kHz のフレーム換算でも割り切れるため、
         // 読み出した量がそのまま位置になる。±1ms は浮動小数の丸めぶんだけ。
         //
-        // 測った範囲（すべて期待値ちょうどで通った）:
-        // ・このテスト単独で 5 回。許容幅を ±0.0001ms に絞っても通る
-        // ・全テスト（クラス並列＋メディア生成の FFmpeg エンコード込み）で 8 回
-        // ・うち 4 回は Release の完全再ビルドと並行させて実行
+        // 測った範囲（読み出しを実時間に合わせた形で。すべて通った）:
+        // ・このテスト単独で 5 回
+        // ・全テスト（クラス並列＋メディア生成の FFmpeg エンコード込み）で 3 回
         // **共有 CI ランナーのような環境では測っていない**が、このプロジェクトの CI は
         // `dotnet publish` だけでテストを走らせないため、影響するのは手元の環境に限られる。
         //

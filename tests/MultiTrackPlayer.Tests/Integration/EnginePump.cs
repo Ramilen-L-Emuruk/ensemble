@@ -25,6 +25,11 @@ namespace MultiTrackPlayer.Tests.Integration;
 /// <b>リースは必ず返す。</b> 4 スロットしかないので、返し忘れると枯渇して映像が止まり、
 /// 症状が「テストの失敗」ではなく「タイムアウト」として出る。
 /// </para>
+/// <para>
+/// <b><see cref="Step"/> と <see cref="Until"/> は実時間に合わせない。</b> 条件が成り立つまで
+/// できるだけ速く進めるためのもので、再生が実時間の何倍で進むかは環境のタイマー分解能で変わる。
+/// <b>実時間との比に依存する検証（経過時間で判定する検出器を待つ等）は <see cref="For"/> を使う。</b>
+/// </para>
 /// </remarks>
 internal sealed class EnginePump(MediaEngine engine, FakeAudioOutput output)
 {
@@ -78,17 +83,37 @@ internal sealed class EnginePump(MediaEngine engine, FakeAudioOutput output)
     }
 
     /// <summary>
-    /// 実時間で <paramref name="realTime"/> ぶん進める。
+    /// 実時間で <paramref name="realTime"/> ぶん進める。<b>音声も実時間と同じ速さで読み出す。</b>
     /// </summary>
     /// <remarks>
     /// <b>滞留検出の閾値を待つためにある。</b> 検出器の基準は <c>Environment.TickCount64</c> で、
     /// 引いた量ではなく実際の経過時間を見る。<b>刻みの数で代用してはいけない</b>——
     /// 1 刻みに要する実時間は環境で変わる。
+    /// <para>
+    /// <b>音声の読み出しも経過した実時間ぶんだけにする（<see cref="Step"/> を回すのではない）。</b>
+    /// <see cref="Step"/> は 1 刻みで <see cref="StepMs"/> を読み、刻みの間は <c>Thread.Sleep(1)</c> しか
+    /// 待たない。その待ちはタイマー分解能で決まり、環境で大きく変わる（分解能が上がっている環境では
+    /// 平均 1.87ms で返ることを実測した。既定の分解能なら 15.6〜31ms）。前者では
+    /// <b>実時間の 5〜10 倍の速さで再生が進み</b>、閾値ぶんの実時間を待つ前に短いテスト用メディアを
+    /// 最後まで再生し終える。停止したエンジンでは検出器が判定をやめるので、滞留検出のテストが
+    /// 環境によって通ったり落ちたりする。本番の音声出力も実時間で読み出すので、こちらが本番に近い。
+    /// </para>
     /// </remarks>
     public void For(TimeSpan realTime)
     {
         var elapsed = Stopwatch.StartNew();
-        while (elapsed.Elapsed < realTime) Step();
+        long fedMs = 0;
+        while (elapsed.Elapsed < realTime)
+        {
+            // 経過した実時間に追いつくまで、StepMs 単位で読み出す
+            while ((long)elapsed.Elapsed.TotalMilliseconds - fedMs >= StepMs)
+            {
+                output.AdvanceMs(StepMs);
+                fedMs += StepMs;
+            }
+            if (PullVideo) PumpVideo();
+            Thread.Sleep(1);
+        }
     }
 
     /// <summary>
