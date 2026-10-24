@@ -259,7 +259,7 @@ git worktree add -b worktree/<type>/<次の名前> .claude/worktrees/<次の名�
 - 手順 9 の選択肢 1 で、マージを監視して自分で後片付けするとき
 - 上記「孤児のディレクトリをまとめて消すとき」
 - `release` スキルの手順 7、および手順 1 の残骸の回収（取りこぼし・放置されたワークツリー）
-- Codex 側は `AGENTS.md` の手順 8 と `.agents/skills/worktree-workflow` の手順 4 が同じ手順を持つ
+- Codex 側は `AGENTS.md` の手順 8 と `.agents/skills/worktree-workflow` の手順 4 が同じ手順を持つ。ただし手順 9 の選択肢 1 の監視からの後片付けは、`Monitor` を使う Claude Code だけの経路で、Codex 側には無い
 
 **Windows では、リポジトリのトップレベルで PowerShell から下のコマンドを実行する**（Windows PowerShell 5.1 で確かめてある。Claude Code なら PowerShell のツールで実行する。Bash からしか呼べない環境なら、自分で呼び出し方を組み立てずにユーザーへ実行を頼む）。ワークツリーの中のジャンクションをすべて外し、**外れたことを確かめてから**消す。**途中で何か 1 つでも失敗したら、消さずに止まる。** Windows 以外では外すものが無いので、`git worktree remove .claude/worktrees/<name>` で消してよい（git はシンボリックリンクをリンクとして消す、という前提。Windows 以外では確かめていない）。
 
