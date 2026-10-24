@@ -1,6 +1,7 @@
 using MultiTrackPlayer.Engine.Decoding;
 using MultiTrackPlayer.Engine.Video;
 using Sdcb.FFmpeg.Raw;
+using System.Diagnostics;
 using System.Linq;
 using static Sdcb.FFmpeg.Raw.ffmpeg;
 
@@ -78,6 +79,21 @@ public sealed unsafe class VideoDecodeThread
     // 記録の抑制もこの値で行うため、専用フラグは置かない
     private int _notProgressingStreak;
 
+    // シーク後のプリロールにかかった時間の内訳（診断ログ用。HandleFlush で数え始め、完了の記録に添える）。
+    // パケット待ち（demux から届かない）とパケット処理（届いたパケットの処理が遅い）を分けるのは、
+    // どちらが長いかで直す場所が変わるため。どちらもこのスレッドだけが触る。
+    // 起点は Flush 番兵の処理なので、シーク要求から番兵が届くまでは含まない（demux の seek 処理の行と突き合わせる）。
+    // パケット待ちは Flush 番兵を受け取った後の _queue.Get の待ち（EOF 番兵の待ちも入る）、パケット処理は
+    // HandlePacket の中の時間（送信・受信・読み捨て）。完了の記録は完了と判定した時点で書くので、
+    // 完了したパケットの変換・リング書き込みは含まない。両者の和は所要と一致しない
+    private long _prerollStartTimestamp;
+    private long _prerollQueueWaitTicks;
+    private long _prerollProcessTicks;
+    private long _prerollPacketStartTimestamp;
+    private bool _prerollPacketInFlight;
+    private int _prerollPackets;
+    private int _prerollDiscardedFrames;
+
     public VideoDecodeThread(VideoDecoder decoder, VideoPacketQueue queue, IVideoFrameSink sink,
         Func<double> getPtsSyncOffset, double frameDurationSeconds, Action<SeekEpoch>? onFirstFrameAfterFlush = null)
     {
@@ -107,7 +123,9 @@ public sealed unsafe class VideoDecodeThread
         {
             while (!_stopRequested)
             {
+                long getStart = Stopwatch.GetTimestamp();
                 if (!_queue.Get(out var item)) break; // Close 済み
+                if (_prerollActive) _prerollQueueWaitTicks += Stopwatch.GetTimestamp() - getStart;
 
                 switch (item.Kind)
                 {
@@ -119,8 +137,13 @@ public sealed unsafe class VideoDecodeThread
                         break;
                     case QueueItemKind.Data:
                         var pkt = (AVPacket*)item.Value;
+                        BeginPrerollPacket();
                         try { HandlePacket(pkt, frame); }
-                        finally { PacketOwnership.Release(pkt); }
+                        finally
+                        {
+                            PacketOwnership.Release(pkt);
+                            EndPrerollPacket();
+                        }
                         break;
                 }
             }
@@ -182,6 +205,7 @@ public sealed unsafe class VideoDecodeThread
         {
             _prerollActive = _pendingSeekTargets.Remove(epoch, out _prerollTarget);
             if (!_prerollActive) _prerollTarget = double.NaN;
+            else ResetPrerollCost();
             // この番兵より前の世代宛ての目標は、対応する番兵が Flush() の Clear() で
             // 消えて二度と来ない残骸。溜め続けると意味のない対応関係が残るので掃除する
             if (_pendingSeekTargets.Count > 0)
@@ -192,6 +216,45 @@ public sealed unsafe class VideoDecodeThread
         }
         Diagnostics.DiagnosticLog.Write("video", $"flush 処理 epoch={epoch} preroll={( _prerollActive ? _prerollTarget.ToString("F3") : "なし")}");
     }
+
+    private void ResetPrerollCost()
+    {
+        _prerollStartTimestamp = Stopwatch.GetTimestamp();
+        _prerollQueueWaitTicks = 0;
+        _prerollProcessTicks = 0;
+        _prerollPacketInFlight = false;
+        _prerollPackets = 0;
+        _prerollDiscardedFrames = 0;
+    }
+
+    // プリロール中のパケットだけを数える。完了の判定と記録は HandlePacket の中（EmitFrame）で起きるため、
+    // 処理途中のパケットの処理時間は DescribePrerollCost が経過分を足して扱う
+    private void BeginPrerollPacket()
+    {
+        _prerollPacketInFlight = _prerollActive;
+        if (!_prerollPacketInFlight) return;
+        _prerollPackets++;
+        _prerollPacketStartTimestamp = Stopwatch.GetTimestamp();
+    }
+
+    private void EndPrerollPacket()
+    {
+        if (!_prerollPacketInFlight) return;
+        _prerollPacketInFlight = false;
+        _prerollProcessTicks += Stopwatch.GetTimestamp() - _prerollPacketStartTimestamp;
+    }
+
+    /// <summary>プリロールの所要時間と内訳を記録用の文字列にする。</summary>
+    private string DescribePrerollCost()
+    {
+        long now = Stopwatch.GetTimestamp();
+        long processTicks = _prerollProcessTicks + (_prerollPacketInFlight ? now - _prerollPacketStartTimestamp : 0);
+        return $"Flush後の所要={TicksToMs(now - _prerollStartTimestamp):F0}ms 映像パケット={_prerollPackets} " +
+               $"読み捨てフレーム={_prerollDiscardedFrames} パケット待ち={TicksToMs(_prerollQueueWaitTicks):F0}ms " +
+               $"パケット処理={TicksToMs(processTicks):F0}ms";
+    }
+
+    private static double TicksToMs(long stopwatchTicks) => stopwatchTicks * 1000.0 / Stopwatch.Frequency;
 
     private void HandleEof(AVFrame* frame)
     {
@@ -268,7 +331,7 @@ public sealed unsafe class VideoDecodeThread
         _prerollActive = false;
         if (_queue.Epoch == _prerollEpoch)
         {
-            Diagnostics.DiagnosticLog.Write("video", $"{reason}のためプリロールを完了扱いにする target={_prerollTarget:F3}");
+            Diagnostics.DiagnosticLog.Write("video", $"{reason}のためプリロールを完了扱いにする target={_prerollTarget:F3} {DescribePrerollCost()}");
             _onFirstFrameAfterFlush?.Invoke(_prerollEpoch);
         }
     }
@@ -426,7 +489,10 @@ public sealed unsafe class VideoDecodeThread
         if (_prerollActive)
         {
             if (normalizedPts < _prerollTarget - _frameDurationSeconds / 2.0)
+            {
+                _prerollDiscardedFrames++;
                 return; // hw転送・sws変換前に破棄（4Kの33MB転送を丸ごと省く）
+            }
 
             // プリロール完了と判定できたが、その間に次のシークが割り込んでキューの世代が
             // 既に進んでいる場合、これは無効な世代の完了通知（このデコードスレッドがまだ
@@ -442,7 +508,7 @@ public sealed unsafe class VideoDecodeThread
             }
 
             _prerollActive = false;
-            Diagnostics.DiagnosticLog.Write("video", $"preroll 完了 firstPts={normalizedPts:F3} epoch={_prerollEpoch}");
+            Diagnostics.DiagnosticLog.Write("video", $"preroll 完了 firstPts={normalizedPts:F3} epoch={_prerollEpoch} {DescribePrerollCost()}");
             // シーク後、映像プリロールがここで完了する。MediaEngine 側はこれを合図に
             // ミキサーの音声出力保留（HoldOutput）を解除する（早送りバグの根治）
             _onFirstFrameAfterFlush?.Invoke(_prerollEpoch);

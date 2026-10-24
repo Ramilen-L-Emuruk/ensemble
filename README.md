@@ -46,12 +46,13 @@ src/
 │   ├── Audio/                マルチトラックミキサー・トラック状態
 │   ├── Thumbnails/           シークバー用サムネイル生成・キャッシュ
 │   ├── Utilities/            ハードウェアデバイス生成等のユーティリティ
-│   └── Diagnostics/          診断ログ・滞留検出（音声・映像の停止を経過時間で検出）
+│   └── Diagnostics/          診断ログ・滞留検出（音声・映像の停止を経過時間で検出）・映像のずれの検出（再生クロックとのずれが続くと記録）
 └── MultiTrackPlayer.UI/       WPF アプリ・MVVM ViewModel・XAML ビュー
     ├── Controls/              シークバー等のカスタムコントロール
     ├── Rendering/             D3DImage ブリッジ・映像子ウィンドウ（HwndHost）
     ├── ViewModels/            MVVM ViewModel
     ├── Windows/               ミキサー・プレイリスト・チャプター・ショートカット・デバッグ・透過オーバーレイ各ウィンドウ
+    ├── Diagnostics/           UI スレッドの応答遅れの検出（長引くと診断ログへ記録）
     └── Settings/              アプリ設定・キーバインド設定
 
 tests/

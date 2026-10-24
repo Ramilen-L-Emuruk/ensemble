@@ -8,6 +8,7 @@ using MultiTrackPlayer.Core.Models;
 using MultiTrackPlayer.Engine;
 using MultiTrackPlayer.Engine.Diagnostics;
 using MultiTrackPlayer.Engine.Thumbnails;
+using MultiTrackPlayer.UI.Diagnostics;
 using MultiTrackPlayer.UI.Settings;
 
 namespace MultiTrackPlayer.UI.ViewModels;
@@ -40,6 +41,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _osdText = string.Empty;
 
     private readonly DispatcherTimer _osdTimer = new() { Interval = TimeSpan.FromSeconds(1.2) };
+    // UI スレッドの応答遅れを診断ログへ残す（診断ログが無効の間は何もしない）。
+    // ViewModel は UI スレッドで作られるので、ここで掴む Dispatcher が UI スレッドのもの
+    private readonly UiResponsivenessProbe _uiResponsivenessProbe = new(Dispatcher.CurrentDispatcher);
     private int _currentChapterIndex = -1;
     // Dispose 後に Dispatcher へ積み残された継続（連続再生の次ファイル送り等）が
     // 破棄済みの Engine を触らないようにするためのガード
@@ -746,6 +750,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _isDisposed = true;
         // 破棄後にティックが後追いで発生し、閉じたウィンドウのバインド先を触るのを防ぐ
         _osdTimer.Stop();
+        _uiResponsivenessProbe.Dispose();
         // ネイティブ資源の解放を含むため例外を投げうる。ここで漏らすとウィンドウを
         // 閉じている最中にアプリが落ちるので、記録に留めて終了処理は続行する
         try { Engine.Dispose(); }

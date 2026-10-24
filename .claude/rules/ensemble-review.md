@@ -142,6 +142,7 @@
 
 - **映像を含むファイルも開ける。** 以前は共有 D3D11 デバイスを二重解放していて、1 プロセスで 2 つ目の `MediaEngine` が映像付きファイルを開くとプロセスごと落ちた（原因は §3 の「所有権が移るのか借りるだけなのか」）。参照数の釣り合いは `SharedGpuDeviceLifetimeTests` が見ている
 - 描画（`Rendering/`）は HWND を要するため対象外のまま
+- UI 側の `Diagnostics/`（`UiResponsivenessProbe`。UI スレッドの応答遅れの検出）は WPF の `Dispatcher` に依存するため対象外
 - **`dotnet test` には D3D11VA デコードできる GPU が要る。** 無い環境では `SharedGpuDeviceLifetimeTests` の 2 本が**意図的に失敗する**（Skip しないのは、黙って緑になると「検証したつもり」になるため）。CI はテストを走らせないので影響するのは手元だけ
 
 プレフィックスの無い行は `src/MultiTrackPlayer.Engine/` からの相対パス。他のプロジェクト由来のものはプロジェクトディレクトリ名から書く（`Core/Models/` は `src/MultiTrackPlayer.Core/Models/` を指す）。
@@ -154,7 +155,7 @@
 | `Sync/` | `PlaybackClock` / `PrerollGate` / `WasapiPositionSource` |
 | `Audio/` | `PrerollCalculator` / `MultiTrackMixer` / `ResampleFailureTracker` |
 | `Video/` | `FrameSelector` / `SlotSequencer` / `VideoFrameRing` |
-| `Diagnostics/` | `DiagnosticLog` / `StallDetector` |
+| `Diagnostics/` | `DiagnosticLog` / `StallDetector` / `VideoLagMonitor` |
 | `Thumbnails/` | `ThumbnailPlan` |
 | `Core/Models/` | `PlaylistCursor` / `ChapterMarkers` / `PlaybackStartDecision` / `MediaDurationResolver` |
 
