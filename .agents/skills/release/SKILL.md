@@ -18,14 +18,16 @@ Use this skill only when the user explicitly requests a release, merge, tag, or 
    - If the project has artifacts that a push does not deploy (a server running on another machine, firmware, separately distributed tools), record the remote default branch's commit before pushing; after a push it already points to the new commit, so comparing against it always shows no change. After a successful push, check whether those artifacts (and the shared files and dependency definitions they load) changed since the recorded commit. If they did, ask whether to deploy them now or later; record a deferred deployment as a follow-up task. Before deploying, confirm that the target has no changes that exist only there.
 6. Remove only confirmed, merged worktrees (detach Windows junctions first, as in `worktree-workflow`) or branches. Never use forced branch deletion or recursive removal against an unverified path.
 
-Use `release-manager` for release preflight and coordination. Preserve any project-specific release lock only when its mechanism is documented and usable in Codex.
+Use `release-manager` for release preflight and coordination.
+
+Codex takes no release lock of its own, and does not create or delete the Claude Code release lock. If `.claude/release.lock` exists at the repository root before you start, stop and report it; even if it looks stale, ask the user to check its owner instead of removing it (Codex cannot read the Claude Code session IDs it records). With a remote, the final safeguard is still the fetch right before push and the rejection of a non-fast-forward push.
 
 ## Repositories without a remote
 
 When the repository has no remote, a local branch named `released` stands in for the remote default branch: it points at the last released commit.
 
-- Check that `released` exists before taking any release lock. If it does not, stop and ask the user which commit counts as released; it must be the default branch itself or one of its ancestors. Do not create a tag with the same name.
+- Check that `released` exists before starting. If it does not, stop and ask the user which commit counts as released; it must be the default branch itself or one of its ancestors. Do not create a tag with the same name.
 - Read every reference to the remote default branch in this skill as `released`: skip fetching and compare against it.
 - Instead of pushing, advance it with `git branch -f released <default branch>` only after `git merge-base --is-ancestor released <default branch>` succeeds; if it fails, stop without moving it and report. When recording the commit before the release for artifacts a push does not deploy, record `released`.
-- Only the main checkout can release (the default branch cannot be checked out in two worktrees, and other clones share nothing), so only a release lock, if the project has a usable one, keeps two releases in that checkout apart. There is no push rejection to fall back on.
+- Only the main checkout can release (the default branch cannot be checked out in two worktrees, and other clones share nothing), and there is no push rejection to fall back on. Codex takes no lock, and checking for `.claude/release.lock` stops only Codex, not a Claude Code session that starts later, so do not release from Codex and Claude Code in that checkout at the same time.
 - Record this in the project's `AGENTS.md`. If a remote is added later, check the whole history for personal information before the first push.
