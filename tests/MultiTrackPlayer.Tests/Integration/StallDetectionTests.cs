@@ -136,8 +136,16 @@ public sealed class StallDetectionTests : IClassFixture<TestMediaFixture>
         var pump = new EnginePump(engine, harness.Output);
         pump.Until(() => pump.SeenPts.Count >= 3, "映像フレームが提示され始める");
 
-        // 記録を探す範囲をここから後ろに限る（理由は音声側のテストのコメント）
+        // 記録を探す範囲をここから後ろに限る（理由は音声側のテストのコメント）。
+        // **映像が尽きるのを待つ区間より前に取る。** 滞留の基準は最後の提示なので、その区間に
+        // 時間がかかる環境では「開始」の行が区間の途中で書かれうる。フレームが出ている間は
+        // 開始の行は出ないので、前に取っても偽の一致は増えない
         long mark = FatalLog.Bookmark();
+
+        // **映像が尽きたのを確かめてから実時間の待ちに入る。** 尽きるまでの時間を下の待ちに含めると、
+        // 閾値ぶんの停止に使える余裕がその分だけ削られる
+        pump.Until(() => engine.Position > TestMediaFixture.VideoEndsEarlyVideoDuration + TimeSpan.FromMilliseconds(100),
+            "再生位置が映像の終わりを越える");
 
         // **問いかけは続けたまま映像だけを枯らす。** 引くのをやめると
         // `CanObserveVideoStall` が「消費側が問いかけていない」と判断して観測自体をやめるため、

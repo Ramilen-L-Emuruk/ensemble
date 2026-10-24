@@ -48,7 +48,10 @@ public sealed class TestMediaFixture : IDisposable
     /// </remarks>
     public string VideoEndsEarly =>
         GetOrCreate("video-ends-early", TimeSpan.FromSeconds(6), audioTrackCount: 1,
-            videoDuration: TimeSpan.FromSeconds(0.4));
+            videoDuration: VideoEndsEarlyVideoDuration);
+
+    /// <summary><see cref="VideoEndsEarly"/> の映像の長さ。映像が尽きたことをテストが確かめるのに使う。</summary>
+    public static readonly TimeSpan VideoEndsEarlyVideoDuration = TimeSpan.FromSeconds(0.4);
 
     private string GetOrCreate(
         string key, TimeSpan duration, int audioTrackCount, bool includeVideo = true,
